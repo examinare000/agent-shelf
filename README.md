@@ -41,11 +41,19 @@ claude mcp add shelf -- uv run --directory /path/to/shelf shelf serve
 
 ### Codex CLI
 
-`~/.openai/config.toml`（またはプロジェクト内 `config.toml`）に以下を追加：
+`~/.codex/config.toml`（またはプロジェクト内 `config.toml`）に以下を追加：
+
+| Key | Value |
+|-----|-------|
+| `mcp_servers.shelf.command` | `uv` |
+| `mcp_servers.shelf.args` | `["run", "--directory", "/path/to/shelf", "shelf", "serve"]` |
+
+またはTOML形式：
 
 ```toml
-[mcp_servers]
-shelf = { command = "uv", args = ["run", "--directory", "/path/to/shelf", "shelf", "serve"] }
+[mcp_servers.shelf]
+command = "uv"
+args = ["run", "--directory", "/path/to/shelf", "shelf", "serve"]
 ```
 
 ### Gemini CLI
@@ -68,7 +76,7 @@ shelf = { command = "uv", args = ["run", "--directory", "/path/to/shelf", "shelf
 ### 1. ノートブック（カテゴリ）作成
 
 ```bash
-shelf notebook create "技術書" --description "プログラミング・システム設計に関する書籍"
+shelf new "技術書" --desc "プログラミング・システム設計に関する書籍"
 ```
 
 ### 2. 資料の追加
@@ -81,7 +89,7 @@ shelf add "技術書" ~/Documents/architecture.pdf
 ### 3. 埋め込みインデックスの構築
 
 ```bash
-shelf index
+shelf index "技術書"
 ```
 
 インデックスは `.catalog/shelf.db` へ保存されます（gitignore 対象）。
