@@ -8,6 +8,7 @@ monkeypatch.context() の with ブロック内で env を差し替えて importl
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -253,3 +254,80 @@ def test_shelve_backend_env_override(monkeypatch):
         importlib.reload(config)
         assert config.SHELVE_BACKEND == "codex"
     importlib.reload(config)
+
+
+class TestConfigFileLoader:
+    """~/.config/agent-shelf/config.env（SHELF_CONFIG で上書き可）の読み込み。
+
+    優先順位はプロセス環境変数 > config.env > ハードコード既定（設計書の
+    「プロセス環境変数が常に優先」要求）。setdefault ベースで適用するため、
+    この優先順位は自然に成り立つ（既に os.environ にあるキーは上書きしない）。
+    """
+
+    def test_resolve_config_path_defaults_to_home_dot_config(self, monkeypatch):
+        with monkeypatch.context() as m:
+            m.delenv("SHELF_CONFIG", raising=False)
+            importlib.reload(config)
+            assert config.resolve_config_path() == (
+                Path.home() / ".config" / "agent-shelf" / "config.env"
+            )
+        importlib.reload(config)
+
+    def test_resolve_config_path_env_override(self, monkeypatch, tmp_path):
+        custom = tmp_path / "custom.env"
+        with monkeypatch.context() as m:
+            m.setenv("SHELF_CONFIG", str(custom))
+            importlib.reload(config)
+            assert config.resolve_config_path() == custom
+        importlib.reload(config)
+
+    def test_parse_config_file_returns_empty_dict_when_file_missing(self, tmp_path):
+        missing = tmp_path / "does-not-exist.env"
+        assert config.parse_config_file(missing) == {}
+
+    def test_parse_config_file_reads_key_value_lines(self, tmp_path):
+        path = tmp_path / "config.env"
+        path.write_text("SHELF_TOP_K=7\nSHELF_DEFAULT_BACKEND=ollama\n", encoding="utf-8")
+        assert config.parse_config_file(path) == {
+            "SHELF_TOP_K": "7",
+            "SHELF_DEFAULT_BACKEND": "ollama",
+        }
+
+    def test_parse_config_file_ignores_comments_and_blank_lines(self, tmp_path):
+        path = tmp_path / "config.env"
+        path.write_text(
+            "# comment\n\nSHELF_TOP_K=7\n   \n# another comment\nSHELF_OLLAMA_MODEL=llama3\n",
+            encoding="utf-8",
+        )
+        assert config.parse_config_file(path) == {
+            "SHELF_TOP_K": "7",
+            "SHELF_OLLAMA_MODEL": "llama3",
+        }
+
+    def test_config_file_value_applied_when_process_env_not_set(self, monkeypatch, tmp_path):
+        config_file = tmp_path / "config.env"
+        config_file.write_text("SHELF_TOP_K=7\n", encoding="utf-8")
+        with monkeypatch.context() as m:
+            m.delenv("SHELF_TOP_K", raising=False)
+            m.setenv("SHELF_CONFIG", str(config_file))
+            importlib.reload(config)
+            assert config.TOP_K == 7
+        importlib.reload(config)
+
+    def test_process_env_overrides_config_file_value(self, monkeypatch, tmp_path):
+        config_file = tmp_path / "config.env"
+        config_file.write_text("SHELF_TOP_K=7\n", encoding="utf-8")
+        with monkeypatch.context() as m:
+            m.setenv("SHELF_TOP_K", "3")
+            m.setenv("SHELF_CONFIG", str(config_file))
+            importlib.reload(config)
+            assert config.TOP_K == 3
+        importlib.reload(config)
+
+    def test_missing_config_file_falls_back_to_hardcoded_default(self, monkeypatch, tmp_path):
+        with monkeypatch.context() as m:
+            m.delenv("SHELF_TOP_K", raising=False)
+            m.setenv("SHELF_CONFIG", str(tmp_path / "does-not-exist.env"))
+            importlib.reload(config)
+            assert config.TOP_K == 10
+        importlib.reload(config)

@@ -35,6 +35,57 @@ def _bool_env(key: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true")
 
 
+# config.env（`shelf setup` が書き出す永続設定）の場所を上書きする env 変数名。
+CONFIG_ENV_VAR = "SHELF_CONFIG"
+
+
+def resolve_config_path() -> Path:
+    """config.env の場所を解決する。既定は ~/.config/agent-shelf/config.env。
+
+    SHELF_CONFIG が設定されていればそれを優先する（テストで一時パスへ差し替える
+    ためにも使う）。
+    """
+    raw = os.environ.get(CONFIG_ENV_VAR)
+    return Path(raw) if raw else Path.home() / ".config" / "agent-shelf" / "config.env"
+
+
+def parse_config_file(path: Path) -> dict[str, str]:
+    """`KEY=VALUE` 形式の config.env をパースする（#コメント・空行は無視）。
+
+    ファイルが存在しない/読み取れない場合は空 dict を返す（config.env は任意の
+    永続設定であり、無くても既定値で動作を継続すべきため。他の *_env ヘルパと
+    同じフェイルソフト方針）。
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if key:
+            values[key] = value.strip()
+    return values
+
+
+def _apply_config_file_defaults() -> None:
+    """config.env の値を「未設定の環境変数にのみ」適用する。
+
+    os.environ.setdefault を使うことで、この関数を呼んだ時点で既にプロセス環境
+    変数として設定済みのキーは一切上書きしない。これにより下の各設定値の解決
+    （os.environ.get）より前に一度呼ぶだけで
+    「プロセス環境変数 > config.env > ハードコード既定」の優先順位が自然に成立する。
+    """
+    for key, value in parse_config_file(resolve_config_path()).items():
+        os.environ.setdefault(key, value)
+
+
+_apply_config_file_defaults()
+
 DB_PATH = Path(os.environ.get("SHELF_DB_PATH", PACKAGE_ROOT / ".catalog" / "shelf.db"))
 CORPUS_DIR = Path(os.environ.get("SHELF_CORPUS_DIR", PACKAGE_ROOT / "corpus"))
 EMBED_MODEL = os.environ.get(
