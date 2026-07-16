@@ -1852,12 +1852,6 @@ dependencies = [
     { name = "pymupdf4llm" },
 ]
 
-[package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -1872,10 +1866,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "pymupdf" },
     { name = "pymupdf4llm" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
 ]
-provides-extras = ["dev"]
 
 [package.metadata.requires-dev]
 dev = [
