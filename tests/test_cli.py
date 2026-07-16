@@ -10,6 +10,8 @@ main() 経由でここに含める。
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from shelf import cli
@@ -572,6 +574,75 @@ class TestShelveCommand:
         """--dry-run フラグが設定可能。"""
         args = build_parser().parse_args(["shelve", "/tmp/dir", "--dry-run"])
         assert args.dry_run is True
+
+
+class TestSetupCommand:
+    """setup サブコマンドの parser 解析テスト。"""
+
+    def test_parses_with_no_args(self):
+        args = build_parser().parse_args(["setup"])
+        assert args.command == "setup"
+        assert args.yes is False
+        assert args.answers_file is None
+
+    def test_yes_flag_can_be_set(self):
+        args = build_parser().parse_args(["setup", "--yes"])
+        assert args.yes is True
+
+    def test_answers_file_can_be_specified(self):
+        args = build_parser().parse_args(["setup", "--answers-file", "answers.json"])
+        assert args.answers_file == "answers.json"
+
+
+class TestSetupDispatch:
+    """setup コマンドの main() が shelf.setup の関数群を正しく橋渡しすることを検証する。
+
+    実 config.env には一切触れず、config.resolve_config_path を tmp_path 配下へ
+    差し替えて検証する(他コマンドと同じ「実ファイル/実DBに触れない」流儀)。
+    """
+
+    def test_answers_file_takes_precedence_and_writes_config_env(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        answers_path = tmp_path / "answers.json"
+        answers_path.write_text(json.dumps({"provider": "gemini"}), encoding="utf-8")
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--answers-file", str(answers_path), "--yes"])
+
+        written = config_path.read_text(encoding="utf-8")
+        assert "SHELF_DEFAULT_BACKEND=gemini" in written
+        captured = capsys.readouterr().out
+        assert str(config_path) in captured
+
+    def test_yes_without_answers_file_writes_hardcoded_defaults(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--yes"])
+
+        written = config_path.read_text(encoding="utf-8")
+        assert f"SHELF_DEFAULT_BACKEND={cli.config.DEFAULT_BACKEND}" in written
+
+    def test_interactive_path_used_when_neither_yes_nor_answers_file(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+        calls = []
+        monkeypatch.setattr(
+            cli.setup,
+            "collect_answers_interactively",
+            lambda: (calls.append("called") or cli.setup.default_answers()),
+        )
+
+        cli.main(["setup"])
+
+        assert calls == ["called"]
+        assert config_path.exists()
 
 
 class TestShelveDispatch:

@@ -14,8 +14,9 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from pathlib import Path
 
-from shelf import config
+from shelf import config, setup
 from shelf.server import build_transport_security, create_server
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
@@ -109,6 +110,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="計画のみを出力し、永続化しない",
     )
 
+    setup_parser = sub.add_parser("setup", help="対話式でbackendの初期設定(config.env)を生成する")
+    setup_parser.add_argument(
+        "--yes", action="store_true", help="全て既定値で非対話実行する"
+    )
+    setup_parser.add_argument(
+        "--answers-file",
+        dest="answers_file",
+        default=None,
+        help="回答をJSONファイルから注入する(テスト用の非対話経路)",
+    )
+
     persona_parser = sub.add_parser("persona", help="notebookの専門家ペルソナを表示・設定する")
     persona_parser.add_argument("notebook")
     persona_group = persona_parser.add_mutually_exclusive_group()
@@ -179,6 +191,26 @@ def _confirm(prompt: str, skip: bool) -> bool:
         return True
     answer = input(f"{prompt} [y/N]: ")
     return answer.strip().lower() == "y"
+
+
+def _cmd_setup(args: argparse.Namespace) -> None:
+    """--answers-file(テスト用注入) > --yes(全既定値) > 対話式 の優先順位で回答を
+    集め、config.env を書き出す。answers-file が最も具体的な指定であるため、
+    --yes と同時指定されても answers-file を優先する。
+    """
+    if args.answers_file is not None:
+        answers = setup.load_answers_file(Path(args.answers_file))
+    elif args.yes:
+        answers = setup.default_answers()
+    else:
+        answers = setup.collect_answers_interactively()
+
+    values = setup.answers_to_config_values(answers)
+    text = setup.build_config_env_text(values)
+    path = config.resolve_config_path()
+    setup.write_config_env(path, text)
+    print(f"設定を書き出しました: {path}")
+    print(text)
 
 
 def _cmd_rm(args: argparse.Namespace) -> None:
@@ -262,6 +294,8 @@ def main(argv: list[str] | None = None) -> None:
             auto_summary=not args.no_summary,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "setup":
+        _cmd_setup(args)
     elif args.command == "rm":
         _cmd_rm(args)
     elif args.command == "index":
