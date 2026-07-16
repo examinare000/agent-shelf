@@ -757,6 +757,32 @@ class TestIngestAutoShelveDispatch:
         assert kinds.count("shelve") == 1
         assert ("digest", "nb_a") in calls
 
+    def test_auto_shelve_with_file_path_reports_error_and_skips_shelve(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """--auto-shelve の path にファイルを渡すと、shelve() は directory を
+        rglob するためファイルには空(投入0件/エラー0件)を返し無処理のまま
+        正常終了して見えてしまう(重大指摘)。ファイルパスは shelve() に渡さず
+        明示エラーを出す。
+        """
+
+        class _FakeService:
+            def shelve(self, directory, *, dry_run=False):
+                raise AssertionError("ファイルパスは shelve() に渡されてはいけない")
+
+        store = Store(":memory:")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        file_path = tmp_path / "doc.md"
+        file_path.write_text("本文", encoding="utf-8")
+
+        cli.main(["ingest", str(file_path), "--auto-shelve", "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "--auto-shelve" in captured
+        assert "ディレクトリ単位" in captured
+
 
 class TestSelectNotebookInteractively:
     """_select_notebook_interactively(既存一覧を提示し対話選択・新規作成も可)。"""

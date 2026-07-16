@@ -286,6 +286,13 @@ def _cmd_ingest_auto_shelve(args: argparse.Namespace, service) -> None:
     """
     affected_notebooks: list[str] = []
     for path in args.paths:
+        if not Path(path).is_dir():
+            # shelve() は Path.rglob("*") でディレクトリ配下を走査するため、
+            # ファイルパスを渡すと子要素0件のまま「投入0件/エラー0件」の
+            # 正常風の結果を返してしまう(無処理のサイレント成功・重大指摘)。
+            # ここで事前に弾き、他の path の処理は続行する。
+            print(f"エラー: --auto-shelve はディレクトリ単位で指定してください: {path}")
+            continue
         result = service.shelve(path, dry_run=False)
         added = result.get("added", [])
         errors = result.get("errors", [])
