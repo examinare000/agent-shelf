@@ -256,6 +256,23 @@ def test_shelve_backend_env_override(monkeypatch):
     importlib.reload(config)
 
 
+class TestSessionWideConfigIsolation:
+    """tests/conftest.py の autouse フィクスチャによる SHELF_CONFIG 固定を検証する。
+
+    開発者の実 ~/.config/agent-shelf/config.env が既定値アサーションを汚染しない
+    よう、テストセッション全体で実在しない一時パスに固定されている前提を保証する。
+    """
+
+    def test_shelf_config_env_is_pinned_to_nonexistent_temp_path(self):
+        import os
+
+        configured = os.environ.get("SHELF_CONFIG")
+        assert configured is not None
+        pinned_path = Path(configured)
+        assert not pinned_path.exists()
+        assert pinned_path != Path.home() / ".config" / "agent-shelf" / "config.env"
+
+
 class TestConfigFileLoader:
     """~/.config/agent-shelf/config.env（SHELF_CONFIG で上書き可）の読み込み。
 
