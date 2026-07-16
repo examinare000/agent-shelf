@@ -781,6 +781,103 @@ class TestSelectNotebookInteractively:
         assert name == "newname"
 
 
+class TestEmitMcpCommand:
+    """emit-mcp サブコマンドの parser 解析テスト。"""
+
+    def test_parses_with_defaults(self):
+        args = build_parser().parse_args(["emit-mcp"])
+        assert args.command == "emit-mcp"
+        assert args.host == "all"
+        assert args.transport == "stdio"
+        assert args.url is None
+        assert args.output_dir == "./mcp-config"
+
+    def test_host_choices(self):
+        for host in ("claude", "codex", "gemini", "all"):
+            args = build_parser().parse_args(["emit-mcp", "--host", host])
+            assert args.host == host
+
+    def test_rejects_unknown_host(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["emit-mcp", "--host", "unknown"])
+
+    def test_transport_choices(self):
+        for transport in ("stdio", "http"):
+            args = build_parser().parse_args(["emit-mcp", "--transport", transport])
+            assert args.transport == transport
+
+    def test_url_and_output_dir_can_be_specified(self):
+        args = build_parser().parse_args(
+            [
+                "emit-mcp",
+                "--transport",
+                "http",
+                "--url",
+                "http://100.64.0.1:8765/mcp",
+                "-o",
+                "/tmp/out",
+            ]
+        )
+        assert args.url == "http://100.64.0.1:8765/mcp"
+        assert args.output_dir == "/tmp/out"
+
+
+class TestEmitMcpDispatch:
+    """emit-mcp コマンドの main() が shelf.emit_mcp.emit へ正しく橋渡しすることを検証する。"""
+
+    def test_dispatches_all_hosts_by_default(self, monkeypatch, tmp_path, capsys):
+        calls = []
+
+        def fake_emit(**kwargs):
+            calls.append(kwargs)
+            return {"claude": tmp_path / "claude.sh"}
+
+        monkeypatch.setattr(cli.emit_mcp, "emit", fake_emit)
+
+        cli.main(["emit-mcp", "-o", str(tmp_path)])
+
+        assert len(calls) == 1
+        assert set(calls[0]["hosts"]) == {"claude", "codex", "gemini"}
+        assert calls[0]["transport"] == "stdio"
+        assert calls[0]["url"] is None
+        assert calls[0]["output_dir"] == tmp_path
+
+    def test_dispatches_single_host(self, monkeypatch, tmp_path, capsys):
+        calls = []
+
+        def fake_emit(**kwargs):
+            calls.append(kwargs)
+            return {"codex": tmp_path / "codex.toml"}
+
+        monkeypatch.setattr(cli.emit_mcp, "emit", fake_emit)
+
+        cli.main(["emit-mcp", "--host", "codex", "-o", str(tmp_path)])
+
+        assert calls[0]["hosts"] == ["codex"]
+
+    def test_http_requires_url_reports_friendly_error_without_calling_emit(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        calls = []
+        monkeypatch.setattr(cli.emit_mcp, "emit", lambda **kwargs: calls.append(kwargs))
+
+        cli.main(["emit-mcp", "--transport", "http", "-o", str(tmp_path)])
+
+        assert calls == []
+        captured = capsys.readouterr().out
+        assert "--url" in captured
+
+    def test_prints_written_file_paths(self, monkeypatch, tmp_path, capsys):
+        written = {"claude": tmp_path / "claude.sh", "readme": tmp_path / "README.md"}
+        monkeypatch.setattr(cli.emit_mcp, "emit", lambda **kwargs: written)
+
+        cli.main(["emit-mcp", "--host", "claude", "-o", str(tmp_path)])
+
+        captured = capsys.readouterr().out
+        assert str(tmp_path / "claude.sh") in captured
+        assert str(tmp_path / "README.md") in captured
+
+
 class TestShelveCommand:
     """shelve サブコマンドの parser 解析テスト。"""
 

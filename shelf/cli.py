@@ -16,7 +16,7 @@ import json
 import shutil
 from pathlib import Path
 
-from shelf import config, setup
+from shelf import config, emit_mcp, setup
 from shelf.server import build_transport_security, create_server
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
@@ -128,6 +128,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest_parser.add_argument(
         "--yes", action="store_true", help="notebook選択の対話プロンプトをスキップする"
+    )
+
+    emit_mcp_parser = sub.add_parser(
+        "emit-mcp", help="claude/codex/gemini向けMCP設定ファイルを生成する(登録は行わない)"
+    )
+    emit_mcp_parser.add_argument(
+        "--host",
+        choices=["claude", "codex", "gemini", "all"],
+        default="all",
+        help="生成先ホスト(既定 all)",
+    )
+    emit_mcp_parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="接続方式(既定 stdio)",
+    )
+    emit_mcp_parser.add_argument(
+        "--url", default=None, help="--transport http の場合に必須の接続先URL"
+    )
+    emit_mcp_parser.add_argument(
+        "-o",
+        "--output-dir",
+        dest="output_dir",
+        default="./mcp-config",
+        help="生成先ディレクトリ(既定 ./mcp-config)",
     )
 
     setup_parser = sub.add_parser("setup", help="対話式でbackendの初期設定(config.env)を生成する")
@@ -323,6 +349,28 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
         print(json.dumps(digest_result, ensure_ascii=False, indent=2))
 
 
+def _cmd_emit_mcp(args: argparse.Namespace) -> None:
+    """--host all を実際の host 名リストへ展開し、shelf.emit_mcp.emit へ橋渡しする。
+
+    --transport http なのに --url が無い場合は emit() が ValueError を送出するが、
+    ここで先に検査して分かりやすい日本語メッセージを出す(emit() 側の副作用ゼロの
+    検証を汚さず、CLI 層の責務としてエラーメッセージ整形を留める)。
+    """
+    if args.transport == "http" and not args.url:
+        print("エラー: --transport http の場合は --url の指定が必須です")
+        return
+
+    hosts = list(emit_mcp.HOST_CHOICES) if args.host == "all" else [args.host]
+    written = emit_mcp.emit(
+        hosts=hosts,
+        transport=args.transport,
+        url=args.url,
+        output_dir=Path(args.output_dir),
+    )
+    for path in written.values():
+        print(f"生成しました: {path}")
+
+
 def _cmd_setup(args: argparse.Namespace) -> None:
     """--answers-file(テスト用注入) > --yes(全既定値) > 対話式 の優先順位で回答を
     集め、config.env を書き出す。answers-file が最も具体的な指定であるため、
@@ -426,6 +474,8 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "ingest":
         _cmd_ingest(args)
+    elif args.command == "emit-mcp":
+        _cmd_emit_mcp(args)
     elif args.command == "setup":
         _cmd_setup(args)
     elif args.command == "rm":

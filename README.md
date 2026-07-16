@@ -101,7 +101,7 @@ shelf index "技術書"
 | `SHELF_DB_PATH` | `.catalog/shelf.db` | SQLite ローカル DB パス |
 | `SHELF_CORPUS_DIR` | `./corpus` | コーパス投入ディレクトリ |
 | `SHELF_EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 埋め込みモデル |
-| `SHELF_DEFAULT_BACKEND` | `codex` | デフォルト LLM バックエンド（codex/gemini/anthropic/ollama） |
+| `SHELF_DEFAULT_BACKEND` | `codex` | デフォルト LLM バックエンド（codex/gemini/agy/ollama） |
 | `SHELF_TOP_K` | `10` | 検索結果の上位 K 件 |
 | `SHELF_ANSWER_TIMEOUT` | `300` | LLM 応答タイムアウト（秒） |
 | `SHELF_DEEP_DIVE` | `false` | 深掘り検索有効化（true/1） |
