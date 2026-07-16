@@ -110,6 +110,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="計画のみを出力し、永続化しない",
     )
 
+    ingest_parser = sub.add_parser(
+        "ingest", help="複数資料を一括投入する(new→add→index→[digest]のオーケストレーション)"
+    )
+    ingest_parser.add_argument("paths", nargs="+", help="投入するファイル・ディレクトリのパス")
+    ingest_parser.add_argument(
+        "--notebook", dest="notebook", default=None, help="投入先notebook(省略時は対話選択)"
+    )
+    ingest_parser.add_argument(
+        "--auto-shelve",
+        dest="auto_shelve",
+        action="store_true",
+        help="既存のshelve機能で自動分類する(pathはディレクトリ単位)",
+    )
+    ingest_parser.add_argument(
+        "--digest", action="store_true", help="投入後に対象notebookのdigestを実行する"
+    )
+    ingest_parser.add_argument(
+        "--yes", action="store_true", help="notebook選択の対話プロンプトをスキップする"
+    )
+
     setup_parser = sub.add_parser("setup", help="対話式でbackendの初期設定(config.env)を生成する")
     setup_parser.add_argument(
         "--yes", action="store_true", help="全て既定値で非対話実行する"
@@ -191,6 +211,116 @@ def _confirm(prompt: str, skip: bool) -> bool:
         return True
     answer = input(f"{prompt} [y/N]: ")
     return answer.strip().lower() == "y"
+
+
+def _select_notebook_interactively(
+    existing: list[str],
+    *,
+    input_func=input,
+    print_func=print,
+) -> str:
+    """既存 notebook 一覧を提示して番号選択、または新規作成名の入力を受け付ける
+    (ingest --notebook 省略時の対話選択)。既存 notebook が無ければ番号選択を
+    省略しそのまま新規作成名の入力に進む。
+    """
+    if existing:
+        print_func("既存の notebook:")
+        for i, name in enumerate(existing, start=1):
+            print_func(f"  {i}) {name}")
+        print_func("  0) 新規作成")
+        choice = input_func("notebook を選択してください(番号または新しい名前): ").strip()
+    else:
+        print_func("既存の notebook がありません。新規作成します。")
+        choice = "0"
+
+    if choice.isdigit():
+        idx = int(choice)
+        if idx == 0:
+            return input_func("新しい notebook 名: ").strip()
+        if 1 <= idx <= len(existing):
+            return existing[idx - 1]
+    # 数字以外、または範囲外の番号はそのまま notebook 名として扱う
+    # (直接名前を打ち込むショートカット。不正名は下流の validate_notebook_name が弾く)。
+    return choice
+
+
+def _print_index_stats(stats) -> None:
+    print(
+        f"indexed={stats.indexed} skipped={stats.skipped} pruned={stats.pruned} "
+        f"chunks_written={stats.chunks_written} errors={stats.errors}"
+    )
+
+
+def _cmd_ingest_auto_shelve(args: argparse.Namespace, service) -> None:
+    """--auto-shelve: 各 path をそのまま既存 shelve() へ委譲する（ロジック重複禁止）。
+
+    shelve() はディレクトリ単位の自動分類機能のため、path は各々ディレクトリ
+    として扱われる。--digest 指定時は shelve() の結果から実際に投入された
+    notebook 群を集約し、重複なく1回ずつ digest する。
+    """
+    affected_notebooks: list[str] = []
+    for path in args.paths:
+        result = service.shelve(path, dry_run=False)
+        added = result.get("added", [])
+        errors = result.get("errors", [])
+        print(f"shelve: {path} -> 投入 {len(added)}件 / エラー {len(errors)}件")
+        for entry in added:
+            if entry["notebook"] not in affected_notebooks:
+                affected_notebooks.append(entry["notebook"])
+
+    if args.digest:
+        for notebook in affected_notebooks:
+            digest_result = service.digest(notebook)
+            print(json.dumps(digest_result, ensure_ascii=False, indent=2))
+
+
+def _cmd_ingest(args: argparse.Namespace) -> None:
+    """既存の new/add/index/digest(単機能CLI)を呼ぶオーケストレーション層。
+
+    フロー: (必要なら new) → add(各パス) → index(対象notebook) → --digest時のみ
+    digest。--auto-shelve 指定時はこのフロー全体を既存 shelve() に委譲する
+    (通常フローとは非対話性の前提が異なるため分岐。詳細は _cmd_ingest_auto_shelve)。
+    add は auto_summary=False で呼ぶ: ingest は複数資料の一括投入が主目的であり、
+    ファイルごとの要約自動生成(LLM呼び出し)はコスト・レイテンシの観点で既定オフに
+    留め、必要なら利用者が個別に `shelf digest`/`shelf add --desc` を使う設計とする。
+    """
+    service = _build_service()
+
+    if args.auto_shelve:
+        _cmd_ingest_auto_shelve(args, service)
+        return
+
+    store = _build_store()
+    notebook = args.notebook
+    if notebook is None:
+        if args.yes:
+            print("エラー: --yes 使用時は --notebook の指定が必須です(--auto-shelve 未指定時)")
+            return
+        existing = [nb["name"] for nb in store.list_notebooks()]
+        notebook = _select_notebook_interactively(existing)
+
+    if store.get_notebook(notebook) is None:
+        service.create_notebook(notebook)
+        print(f"notebook を作成しました: {notebook}")
+
+    added = 0
+    failed: list[dict] = []
+    for path in args.paths:
+        result = service.add_source(notebook, path, auto_summary=False)
+        if "error" in result:
+            failed.append(result)
+        else:
+            added += 1
+    print(f"投入: {added}件 / エラー {len(failed)}件")
+    for failure in failed:
+        print(f"  エラー: {failure['error']}")
+
+    stats = service.index(notebook)
+    _print_index_stats(stats)
+
+    if args.digest:
+        digest_result = service.digest(notebook)
+        print(json.dumps(digest_result, ensure_ascii=False, indent=2))
 
 
 def _cmd_setup(args: argparse.Namespace) -> None:
@@ -294,16 +424,15 @@ def main(argv: list[str] | None = None) -> None:
             auto_summary=not args.no_summary,
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
+    elif args.command == "ingest":
+        _cmd_ingest(args)
     elif args.command == "setup":
         _cmd_setup(args)
     elif args.command == "rm":
         _cmd_rm(args)
     elif args.command == "index":
         stats = _build_service().index(args.notebook, full=args.all)
-        print(
-            f"indexed={stats.indexed} skipped={stats.skipped} pruned={stats.pruned} "
-            f"chunks_written={stats.chunks_written} errors={stats.errors}"
-        )
+        _print_index_stats(stats)
     elif args.command == "ask":
         result = _build_service().ask(args.notebook, args.question)
         print(json.dumps(result, ensure_ascii=False, indent=2))
