@@ -382,9 +382,20 @@ def _cmd_setup(args: argparse.Namespace) -> None:
     """--answers-file(テスト用注入) > --yes(全既定値) > 対話式 の優先順位で回答を
     集め、config.env を書き出す。answers-file が最も具体的な指定であるため、
     --yes と同時指定されても answers-file を優先する。
+
+    不正 JSON・存在しない answers-file・書込み不可ディレクトリで生の例外を
+    ユーザーに露出させず、main() 内 persona ディスパッチの既存作法(例外を
+    catch し日本語メッセージを print して打ち切る)と同じ流儀で整形する。
     """
     if args.answers_file is not None:
-        answers = setup.load_answers_file(Path(args.answers_file))
+        try:
+            answers = setup.load_answers_file(Path(args.answers_file))
+        except FileNotFoundError:
+            print(f"エラー: answers-file が見つかりません: {args.answers_file}")
+            return
+        except json.JSONDecodeError as e:
+            print(f"エラー: answers-file の JSON 解析に失敗しました: {args.answers_file} ({e})")
+            return
     elif args.yes:
         answers = setup.default_answers()
     else:
@@ -393,7 +404,11 @@ def _cmd_setup(args: argparse.Namespace) -> None:
     values = setup.answers_to_config_values(answers)
     text = setup.build_config_env_text(values)
     path = config.resolve_config_path()
-    setup.write_config_env(path, text)
+    try:
+        setup.write_config_env(path, text)
+    except OSError as e:
+        print(f"エラー: 設定の書き込みに失敗しました: {path} ({e})")
+        return
     print(f"設定を書き出しました: {path}")
     print(text)
 

@@ -998,6 +998,53 @@ class TestSetupDispatch:
         assert config_path.exists()
 
 
+class TestSetupDispatchErrors:
+    """setup の異常系(不正JSON・存在しないanswers-file・書込み不可)を、persona
+    コマンドの既存作法(cli.py:501付近)に合わせて日本語エラーメッセージへ整形し、
+    生の例外をユーザーに露出させないことを検証する。
+    """
+
+    def test_invalid_json_answers_file_reports_japanese_error(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        answers_path = tmp_path / "answers.json"
+        answers_path.write_text("{ この JSON は壊れている", encoding="utf-8")
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--answers-file", str(answers_path), "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
+        assert not config_path.exists()
+
+    def test_missing_answers_file_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        answers_path = tmp_path / "does-not-exist.json"
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--answers-file", str(answers_path), "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
+        assert not config_path.exists()
+
+    def test_unwritable_config_dir_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        readonly_dir = tmp_path / "readonly"
+        readonly_dir.mkdir()
+        readonly_dir.chmod(0o000)
+        config_path = readonly_dir / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        try:
+            cli.main(["setup", "--yes"])
+        finally:
+            readonly_dir.chmod(0o755)
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
+
+
 class TestShelveDispatch:
     """shelve コマンドの main() が service.shelve へ directory/dry_run を正しく
     橋渡しすることを、_build_service を fake に差し替えて検証する。
