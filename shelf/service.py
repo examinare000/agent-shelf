@@ -23,9 +23,12 @@ from urllib.parse import urlparse
 from shelf import convert as _default_converter
 from shelf.convert import ConversionError, pick_converter
 from shelf.digests import (
+    MAP_DEFAULT_NOTES,
     MAP_SCHEMA,
+    REDUCE_DEFAULT_NOTES,
     REDUCE_INPUT_MAX_CHARS,
     REDUCE_SCHEMA,
+    WINDOW_DEFAULT_CHARS,
     build_map_prompt,
     build_reduce_prompt,
     group_into_windows,
@@ -199,9 +202,9 @@ class ShelfService:
         router_backend: str = "",
         route_top_n: int = 1,
         route_fallback: str = "",
-        digest_max_notes: int = 20,
-        digest_map_notes: int = 5,
-        digest_map_window_chars: int = 8000,
+        digest_max_notes: int = REDUCE_DEFAULT_NOTES,
+        digest_map_notes: int = MAP_DEFAULT_NOTES,
+        digest_map_window_chars: int = WINDOW_DEFAULT_CHARS,
         digest_backend: str = "",
         librarian: Librarian | None = None,
         shelve_backend: str = "ollama",
@@ -234,14 +237,17 @@ class ShelfService:
         self._route_fallback = route_fallback
         # config.DIGEST_MAX_NOTES(env SHELF_DIGEST_MAX_NOTES)。reduce フェーズ後・
         # 文書全体で保持する学びノート数の上限（digests.build_reduce_prompt/parse_reduce
-        # へ渡す）。既定 20 は digests.py の同関数群のローカル既定値と同値にして矛盾を避ける。
+        # へ渡す）。既定値は digests.REDUCE_DEFAULT_NOTES を唯一の情報源とする
+        # （コードレビュー指摘 P13）。
         self._digest_max_notes = digest_max_notes
         # config.DIGEST_MAP_NOTES(env SHELF_DIGEST_MAP_NOTES)。map フェーズで
         # 1 ウィンドウあたり抽出する学びノート数の上限（digests.build_map_prompt/
-        # parse_map へ渡す）。digest_max_notes とは独立した控えめな既定値。
+        # parse_map へ渡す）。digest_max_notes とは独立した控えめな既定値
+        # （既定値は digests.MAP_DEFAULT_NOTES を唯一の情報源とする）。
         self._digest_map_notes = digest_map_notes
         # config.DIGEST_MAP_WINDOW_CHARS(env SHELF_DIGEST_MAP_WINDOW_CHARS)。
-        # digests.group_into_windows(..., window_chars=...) へ渡すウィンドウ文字数上限。
+        # digests.group_into_windows(..., window_chars=...) へ渡すウィンドウ文字数上限
+        # （既定値は digests.WINDOW_DEFAULT_CHARS を唯一の情報源とする）。
         self._digest_map_window_chars = digest_map_window_chars
         # config.DIGEST_BACKEND(env SHELF_DIGEST_BACKEND)。空文字列(既定)=未指定なら
         # notebook 自体の backend にフォールバックする(router_backend と同じ流儀。

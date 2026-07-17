@@ -44,6 +44,14 @@ def _parse_json_object(text: str) -> dict | None:
 # 旧単発生成方式の入力上限（4000字）よりやや広めに取る。
 WINDOW_DEFAULT_CHARS = 8000
 
+# map フェーズ（1 ウィンドウあたり）・reduce フェーズ（文書全体・reduce 後）で
+# 抽出する学びノート数の既定上限。config.py（DIGEST_MAP_NOTES/DIGEST_MAX_NOTES）・
+# service.py（コンストラクタ既定値）は裸リテラルを持たずここから import する
+# （コードレビュー指摘 P13: 従来は3ファイルへ同じ数値がコメントでの目視同期のみで
+# 重複しており、値がずれても検知できなかった）。
+MAP_DEFAULT_NOTES = 5
+REDUCE_DEFAULT_NOTES = 20
+
 
 def group_into_windows(
     chunks: list[dict], *, window_chars: int = WINDOW_DEFAULT_CHARS
@@ -118,7 +126,7 @@ def build_map_prompt(
     *,
     persona: str | None = None,
     title: str | None = None,
-    max_notes: int = 5,
+    max_notes: int = MAP_DEFAULT_NOTES,
 ) -> str:
     """1 ウィンドウ（group_into_windows の要素）から map フェーズのプロンプトを組み立てる。
 
@@ -156,7 +164,9 @@ def _format_window_chunk(index: int, chunk: dict) -> str:
     return f"{header}\n{chunk['text']}"
 
 
-def parse_map(text: str, window: list[dict], *, max_notes: int = 5) -> list[StudyNote]:
+def parse_map(
+    text: str, window: list[dict], *, max_notes: int = MAP_DEFAULT_NOTES
+) -> list[StudyNote]:
     """map フェーズのエンジン生出力を、window 内チャンクへ接地した StudyNote 列へ変換する。
 
     chunks 配列（1 起点の [C番号]）を window[index-1] の id/section/page へ機械解決する。
@@ -281,7 +291,7 @@ def build_reduce_prompt(
     tag_catalog: tuple[str, ...] = (),
     persona: str | None = None,
     title: str | None = None,
-    max_notes: int = 20,
+    max_notes: int = REDUCE_DEFAULT_NOTES,
 ) -> str:
     """map フェーズの StudyNote 列全体から reduce フェーズのプロンプトを組み立てる。
 
@@ -318,7 +328,7 @@ def build_reduce_prompt(
 
 
 def parse_reduce(
-    text: str, map_notes: list[StudyNote], *, max_notes: int = 20
+    text: str, map_notes: list[StudyNote], *, max_notes: int = REDUCE_DEFAULT_NOTES
 ) -> tuple[list[StudyNote], list[str]]:
     """reduce フェーズのエンジン生出力を、統合済み StudyNote 列 + 正規化タグ列へ変換する。
 

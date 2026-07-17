@@ -11,14 +11,23 @@ service.py が要求する convert_file/convert_url の2メソッド構成とは
 from __future__ import annotations
 
 import hashlib
+import importlib
+import inspect
 import json
 from pathlib import Path
 
 import pytest
 
+import shelf.digests as digests
 import shelf.service
 from shelf.convert import ConversionError, ConvertResult
-from shelf.digests import MAP_SCHEMA, REDUCE_SCHEMA
+from shelf.digests import (
+    MAP_DEFAULT_NOTES,
+    MAP_SCHEMA,
+    REDUCE_DEFAULT_NOTES,
+    REDUCE_SCHEMA,
+    WINDOW_DEFAULT_CHARS,
+)
 from shelf.indexer import index_notebook
 from shelf.ports import RawAnswer, RouteTarget
 from shelf.prompts import ANSWER_SCHEMA, SUMMARY_SCHEMA
@@ -1978,6 +1987,35 @@ def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     assert routed["answer"] == ""
     assert routed["citations"] == []
     assert routed["insights"] == []
+
+
+def test_shelf_service_digest_constructor_defaults_share_digests_constants():
+    """コードレビュー指摘 P13: digest_max_notes/digest_map_notes/
+    digest_map_window_chars のコンストラクタ既定値が digests.py の
+    named constant を唯一の情報源とし、裸リテラルの重複を持たないことを固定する。"""
+    params = inspect.signature(ShelfService.__init__).parameters
+    assert params["digest_max_notes"].default == REDUCE_DEFAULT_NOTES
+    assert params["digest_map_notes"].default == MAP_DEFAULT_NOTES
+    assert params["digest_map_window_chars"].default == WINDOW_DEFAULT_CHARS
+
+
+def test_shelf_service_digest_constructor_defaults_are_sourced_from_digests_module(
+    monkeypatch,
+):
+    # 上のテストは値の一致(20/5/8000)しか見ておらず、service.py が裸リテラルを
+    # 持っていても偶然一致で通ってしまう。digests.py の定数を実際に差し替えて
+    # shelf.service を再読込し、コンストラクタ既定値が追従することで
+    # 実際の import 依存を固定する（config.py 側と対称のテスト）。
+    with monkeypatch.context() as m:
+        m.setattr(digests, "REDUCE_DEFAULT_NOTES", 91)
+        m.setattr(digests, "MAP_DEFAULT_NOTES", 92)
+        m.setattr(digests, "WINDOW_DEFAULT_CHARS", 93)
+        importlib.reload(shelf.service)
+        params = inspect.signature(shelf.service.ShelfService.__init__).parameters
+        assert params["digest_max_notes"].default == 91
+        assert params["digest_map_notes"].default == 92
+        assert params["digest_map_window_chars"].default == 93
+    importlib.reload(shelf.service)
 
 
 # -- digest（学びノート生成・map-reduce パイプライン・設計書 §7-B） -------------

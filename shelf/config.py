@@ -14,6 +14,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# digests.py は json/unicodedata/shelf.ports のみに依存する外部SDKゼロの
+# leaf モジュール（config.py を import しない）ため、ここから import しても
+# 循環importにはならない。既定値5/20/8000の唯一の情報源とすることで、
+# コメントでの目視同期（コードレビュー指摘 P13）を廃止する。
+from shelf.digests import MAP_DEFAULT_NOTES, REDUCE_DEFAULT_NOTES, WINDOW_DEFAULT_CHARS
+
 # shelf/shelf/config.py から見て shelf/ プロジェクトルート（.catalog/・corpus/ の基準）。
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -122,22 +128,21 @@ ROUTE_FALLBACK = os.environ.get("SHELF_ROUTE_FALLBACK", "")
 # shelf digest の reduce フェーズ後に 1 資料あたり保持する学びノート数の既定上限。
 # digests.py は config を import しない設計（§3 依存方向）のため呼び出し側の
 # service.py が build_reduce_prompt(..., max_notes=config.DIGEST_MAX_NOTES) として
-# 明示的に渡す。map-reduce パイプライン化に伴い、単発生成時代の既定 5
-# （digests.py 旧 DIGEST_DEFAULT_MAX_NOTES）から文書全体を俯瞰できる 20 へ拡大した
+# 明示的に渡す。既定値は digests.REDUCE_DEFAULT_NOTES を唯一の情報源とする
 # （env 変数名 SHELF_DIGEST_MAX_NOTES は既存呼び出し・運用設定との互換のため維持）。
-DIGEST_MAX_NOTES = _int_env("SHELF_DIGEST_MAX_NOTES", 20)
+DIGEST_MAX_NOTES = _int_env("SHELF_DIGEST_MAX_NOTES", REDUCE_DEFAULT_NOTES)
 
 # shelf digest の map フェーズで 1 ウィンドウ（1 回の map LLM 呼び出し入力）あたり
 # 抽出する学びノート数の既定上限。digests.build_map_prompt(..., max_notes=...) へ
 # service.py が明示的に渡す。DIGEST_MAX_NOTES（reduce 後・文書全体の上限）とは
 # 独立した控えめな値にする（1 ウィンドウから DIGEST_MAX_NOTES 件も学びが出るのは
-# 過剰なため）。digests.py 側の呼び出し規定値と同値。
-DIGEST_MAP_NOTES = _int_env("SHELF_DIGEST_MAP_NOTES", 5)
+# 過剰なため）。既定値は digests.MAP_DEFAULT_NOTES を唯一の情報源とする。
+DIGEST_MAP_NOTES = _int_env("SHELF_DIGEST_MAP_NOTES", MAP_DEFAULT_NOTES)
 
 # shelf digest の map フェーズで body チャンク列を分割する 1 ウィンドウあたりの
 # 既定文字数上限。digests.group_into_windows(..., window_chars=...) へ渡す。
-# digests.WINDOW_DEFAULT_CHARS と同値にして矛盾を避ける。
-DIGEST_MAP_WINDOW_CHARS = _int_env("SHELF_DIGEST_MAP_WINDOW_CHARS", 8000)
+# 既定値は digests.WINDOW_DEFAULT_CHARS を唯一の情報源とする。
+DIGEST_MAP_WINDOW_CHARS = _int_env("SHELF_DIGEST_MAP_WINDOW_CHARS", WINDOW_DEFAULT_CHARS)
 
 # shelf digest（map/reduce 両フェーズ）専用の推論バックエンド名。既定は空文字列
 # （未指定）で、この場合 service.py は notebook 自体の backend にフォールバックする

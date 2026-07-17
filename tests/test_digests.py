@@ -3,11 +3,15 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 
 from shelf.digests import (
+    MAP_DEFAULT_NOTES,
     MAP_SCHEMA,
+    REDUCE_DEFAULT_NOTES,
     REDUCE_SCHEMA,
+    WINDOW_DEFAULT_CHARS,
     build_map_prompt,
     build_reduce_prompt,
     group_into_windows,
@@ -97,6 +101,57 @@ class TestGroupIntoWindows:
             [chunks[0], chunks[1]],
             [chunks[2]],
         ]
+
+    def test_many_small_sections_pack_into_few_windows_bounded_by_window_chars(self):
+        # 見出し密度が高い文書（見出しごとに1節=1チャンク）でも、window は
+        # window_chars 予算のみで決まるため、節数に比例して window 数が
+        # 増えることはない（P5 の核心: 150見出し文書が150 map 呼び出しになる
+        # 問題の再発防止）。
+        chunks = [
+            _chunk(f"nb/doc#{i}", section=f"§{i}", page=None, seq=i, text="あ" * 10)
+            for i in range(20)
+        ]
+
+        windows = group_into_windows(chunks, window_chars=100)
+
+        assert len(windows) == 2
+        assert [len(w) for w in windows] == [10, 10]
+
+
+class TestSharedDefaultConstants:
+    """既定値5/20/8000がdigests.py・config.py・service.pyで裸リテラル重複しないよう、
+    named constant を唯一の情報源として signature が参照していることを固定する
+    （P13: 従来はコメントでの「同値にして矛盾を避ける」目視同期しかなかった）。"""
+
+    def test_map_default_notes_is_five(self):
+        assert MAP_DEFAULT_NOTES == 5
+
+    def test_reduce_default_notes_is_twenty(self):
+        assert REDUCE_DEFAULT_NOTES == 20
+
+    def test_build_map_prompt_and_parse_map_default_max_notes_share_constant(self):
+        assert (
+            inspect.signature(build_map_prompt).parameters["max_notes"].default
+            == MAP_DEFAULT_NOTES
+        )
+        assert inspect.signature(parse_map).parameters["max_notes"].default == MAP_DEFAULT_NOTES
+
+    def test_build_reduce_prompt_and_parse_reduce_default_max_notes_share_constant(self):
+        assert (
+            inspect.signature(build_reduce_prompt).parameters["max_notes"].default
+            == REDUCE_DEFAULT_NOTES
+        )
+        assert (
+            inspect.signature(parse_reduce).parameters["max_notes"].default
+            == REDUCE_DEFAULT_NOTES
+        )
+
+    def test_group_into_windows_default_window_chars_is_eight_thousand(self):
+        assert WINDOW_DEFAULT_CHARS == 8000
+        assert (
+            inspect.signature(group_into_windows).parameters["window_chars"].default
+            == WINDOW_DEFAULT_CHARS
+        )
 
 
 class TestBuildMapPrompt:
