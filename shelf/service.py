@@ -1387,11 +1387,16 @@ class ShelfService:
         ごとに map 抽出 → 文書全体で reduce 統合＋タグ付与 → mask 適用 →
         replace_study_notes/replace_document_tags。
 
-        tag_catalog は digest() のループ前に1回だけ list_tags_by_notebook を
+        reduce フェーズの失敗（backend 例外・ok=False・有効なノート0件のいずれか）は
+        atomic error semantics: この資料については何も永続化せず、既存の
+        study_notes/tags をそのまま残してエラー文言を返す（コードレビュー指摘#1。
+        map ノートでの劣化継続フォールバックは廃止した）。
+
+        tag_catalog は digest() のループ前に1回だけ list_notebook_tags を
         引いた結果（呼び出し元と共有するミュータブルな list）。文書ごとに
-        notebook 横断 GROUP BY を引き直す N+1（コードレビュー指摘#3）を避けつつ、
-        「後続文書の reduce プロンプトに先行文書のタグが反映される」実質挙動は
-        このメソッドが新規タグを都度 tag_catalog に追記することで保つ。
+        クエリを引き直す N+1（コードレビュー指摘#3）を避けつつ、「後続文書の
+        reduce プロンプトに先行文書のタグが反映される」実質挙動はこのメソッドが
+        新規タグを都度 tag_catalog に追記することで保つ。
         """
         doc_id = doc["id"]
         path = self._corpus_dir / notebook / f"{doc_id}.md"
@@ -1418,6 +1423,13 @@ class ShelfService:
         chunks = self._store.list_chunks(notebook, doc_id, kind="body")
         windows = group_into_windows(chunks, window_chars=self._digest_map_window_chars)
 
+        if not windows:
+            # 索引未生成・本文が実質空などで body チャンクが1件も無い場合は、
+            # LLM を一度も呼ばずに原因を特定しやすい専用メッセージを返す
+            # （コードレビュー指摘#9。汎用の「生成に失敗しました」では「そもそも
+            # 入力が無かった」のか「LLM が失敗した」のか呼び出し元が区別できない）。
+            return "本文チャンクが見つかりません（インデックス未生成または空文書）"
+
         backend = self._backend_factory(backend_name)
         title = doc.get("title")
         workdir = self._corpus_dir / notebook
@@ -1426,21 +1438,32 @@ class ShelfService:
         # ok=False・parse失敗＝空リスト）は他のウィンドウを止めず継続する。全ウィンドウが
         # 失敗/ゼロ件（= 合計 map_notes が空）の場合のみ、この資料をエラー扱いにする
         # （brief §5「1ウィンドウの失敗は継続・全ウィンドウ全滅のみ doc エラー」）。
-        # last_backend_error は observability のため、map/reduce 各フェーズで最後に
-        # 観測した backend の raw.error 文言を保持する（コードレビュー指摘#5。
-        # backend.answer() が例外を送出した経路は raw を得られないため対象外）。
+        # last_backend_error は observability のため、map フェーズで最初に観測した
+        # 失敗（backend 例外は raw を持たないため repr(exc) で代替）を保持する。
+        # 「最初に観測した失敗を保持し、以降の失敗で上書きしない」という一貫ルールに
+        # する（コードレビュー指摘#9・以前は ok=False の度に最後の値で上書きしていた）。
         map_notes: list[StudyNote] = []
         last_backend_error: str | None = None
-        for window in windows:
+        for index, window in enumerate(windows):
             map_prompt = build_map_prompt(
                 window, persona=persona, title=title, max_notes=self._digest_map_notes
             )
             try:
                 map_raw = backend.answer(map_prompt, workdir=workdir, schema=MAP_SCHEMA)
-            except Exception:  # noqa: BLE001 - 1ウィンドウの例外で他ウィンドウを止めない
+            except Exception as exc:  # noqa: BLE001 - 1ウィンドウの例外で他ウィンドウを止めない
+                # コードレビュー指摘#9: これまで無言で continue しており、map フェーズの
+                # 例外は観測不能だった。observability のため warning ログを残す。
+                _logger.warning(
+                    "digest map フェーズでウィンドウの処理が例外により失敗しました: "
+                    "notebook=%s doc_id=%s window_index=%d error=%r",
+                    notebook, doc_id, index, exc,
+                )
+                if last_backend_error is None:
+                    last_backend_error = repr(exc)
                 continue
             if not map_raw.ok:
-                last_backend_error = map_raw.error
+                if last_backend_error is None:
+                    last_backend_error = map_raw.error
                 continue
             map_notes.extend(parse_map(map_raw.text, window, max_notes=self._digest_map_notes))
 
@@ -1462,35 +1485,27 @@ class ShelfService:
         )
         try:
             reduce_raw = backend.answer(reduce_prompt, workdir=workdir, schema=REDUCE_SCHEMA)
-        except Exception:  # noqa: BLE001 - reduce 失敗も doc 全体は落とさず劣化継続
-            reduce_raw = None
+        except Exception as exc:  # noqa: BLE001 - reduce 失敗は doc 単位のエラーとして
+            # 呼び出し元へ返し、何も永続化しない（コードレビュー指摘#1: 以前は劣化継続
+            # として map ノートを現在の content_hash+pipeline=2 で保存するフォールバック
+            # を持っていたが、これにより次回の skip 判定 (source_hash+pipeline 一致) が
+            # この劣化結果にマッチしてしまい、--force なしでは二度と再生成されず、
+            # タグも空のまま残る恒久劣化バグだった。何も書かなければ既存の
+            # study_notes/tags は変わらず、次回呼び出しでも自然に再試行される）。
+            return f"reduce失敗: {exc}"
 
-        if reduce_raw is not None and not reduce_raw.ok:
-            last_backend_error = reduce_raw.error
+        if not reduce_raw.ok:
+            return f"reduce失敗: {reduce_raw.error}"
 
-        if reduce_raw is not None and reduce_raw.ok:
-            reduced_notes, tags = parse_reduce(
-                reduce_raw.text, map_notes, max_notes=self._digest_max_notes
-            )
-        else:
-            reduced_notes, tags = [], []
-
-        if reduced_notes:
-            final_notes = reduced_notes
-        else:
-            # reduce 失敗（backend 例外・ok=False・parse失敗で notes が空）時は、
-            # 文書全体としての統合・重複除去こそ得られないが、map フェーズの学び自体は
-            # 有効なため丸ごと捨てず、map ノートを digest_max_notes にクランプして
-            # そのまま採用する（劣化継続）。この場合タグは reduce 専用の付与物のため空。
-            # observability のため、最後に観測した backend エラー文言を含めて
-            # warning ログを残す（コードレビュー指摘#5。戻り値スキーマは変えない）。
-            _logger.warning(
-                "digest reduce フェーズが失敗したため map ノートで劣化継続します: "
-                "notebook=%s doc_id=%s last_backend_error=%s",
-                notebook, doc_id, last_backend_error,
-            )
-            final_notes = map_notes[: self._digest_max_notes]
-            tags = []
+        reduced_notes, tags = parse_reduce(
+            reduce_raw.text, map_notes, max_notes=self._digest_max_notes
+        )
+        if not reduced_notes:
+            # reduce 応答が ok=True でも、JSON解析失敗や有効なノート0件は実質的な
+            # 失敗として扱い、何も永続化しない（コードレビュー指摘#1と同じ atomic
+            # error semantics）。正当に notes があり tags だけ空、というケースは
+            # ここを通らず下の通常の保存経路に進む。
+            return "reduce失敗: 応答から有効な学びノートを抽出できませんでした"
 
         note_dicts = [
             {
@@ -1507,10 +1522,18 @@ class ShelfService:
                 "source_chunk_ids": list(note.chunk_ids),
                 "pipeline": DIGEST_PIPELINE_VERSION,
             }
-            for note in final_notes
+            for note in reduced_notes
         ]
         self._store.replace_study_notes(notebook, doc_id, note_dicts)
-        masked_tags = [self._mask(tag) if self._mask is not None else tag for tag in tags]
+        raw_masked_tags = [self._mask(tag) if self._mask is not None else tag for tag in tags]
+        # 順序維持の重複除去。マスクの結果 空文字列/None になった要素は除外する
+        # （コードレビュー指摘#2: 別々のタグがマスク後に同一文字列へ衝突する場合
+        # （例: token:abc1/token:xyz2 が共に token=<REDACTED> になる）、
+        # store.replace_document_tags は (doc_id, tag) が PRIMARY KEY のプレーンな
+        # INSERT のため、重複したまま渡すと sqlite3.IntegrityError で digest
+        # ループ全体が落ちてしまう。normalize_tags のタグ重複除去はマスク適用前
+        # にしか働かないため、ここで改めてマスク後の重複除去が必要）。
+        masked_tags = list(dict.fromkeys(tag for tag in raw_masked_tags if tag))
         self._store.replace_document_tags(notebook, doc_id, masked_tags)
         # 後続文書の reduce プロンプトにこの文書のタグを反映させるため、
         # 呼び出し元と共有する tag_catalog にその場で追記する（DB再問い合わせなし）。

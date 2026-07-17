@@ -2232,70 +2232,322 @@ def test_digest_all_windows_failing_includes_last_backend_error_text_in_doc_erro
     assert "rate limited" in result["errors"][0]["error"]
 
 
-def test_digest_reduce_failure_falls_back_to_clamped_map_notes_with_empty_tags(
-    store: Store, embedder: FakeEmbedder, tmp_path: Path
+def test_digest_map_window_exception_logs_warning_and_keeps_first_error_text(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, caplog
 ) -> None:
+    """コードレビュー指摘#9: mapフェーズの1ウィンドウ例外はこれまで無言でcontinueして
+    おり、ログもlast_backend_errorへの反映も無かった（観測不能）。warningログに
+    doc_id・window_index・例外のreprを残し、doc全滅時のエラー文言にも反映する。
+    最初に観測した失敗のテキストを保持し、後続のok=False失敗で上書きしない
+    （brief指定の「set last_backend_error if it is None」ルール）。"""
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
     nb_dir.mkdir(parents=True)
-    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    (nb_dir / "doc.md").write_text(
+        "# Doc\n\n## 鯨\n\nwhale content in section one.\n\n"
+        "## アザラシ\n\nseal content in section two.\n",
+        encoding="utf-8",
+    )
     store.upsert_document(
         id="doc", notebook="nb", origin="doc.md", origin_type="md",
         normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
     )
     backend = FakeAnswerBackend(
         canned=[
-            _map_answer(
-                [
-                    {"text": "1件目の学び", "chunks": [1]},
-                    {"text": "2件目の学び", "chunks": [1]},
-                ]
-            ),
-            RawAnswer(text="", ok=False, error="timeout"),
+            ValueError("map boom"),
+            RawAnswer(text="", ok=False, error="second window failed"),
         ]
     )
+    # digest_map_window_chars を各チャンク単体より小さくし、節の異同ではなく
+    # 文字数予算だけで1チャンク=1windowへ分割させ、2windowで両方失敗する
+    # シナリオを再現する（P5: group_into_windows は節では強制分割しなくなったため）。
     service = ShelfService(
-        store, embedder, lambda name: backend, corpus_dir, digest_max_notes=1
+        store, embedder, lambda name: backend, corpus_dir, digest_map_window_chars=20
     )
+
+    with caplog.at_level("WARNING"):
+        result = service.digest("nb")
+
+    assert result["generated"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["doc_id"] == "doc"
+    assert "map boom" in result["errors"][0]["error"]
+    assert "second window failed" not in result["errors"][0]["error"]
+    assert any(
+        "doc_id=doc" in record.message
+        and "window_index=0" in record.message
+        and "map boom" in record.message
+        for record in caplog.records
+    )
+
+
+def test_digest_zero_chunk_document_reports_missing_body_chunks_message(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch
+) -> None:
+    """コードレビュー指摘#9: 索引未生成・空文書などでbodyチャンクが1件も無い場合、
+    windows=[] となり従来は map ループが1度も回らないまま汎用文言
+    「学びノート生成に失敗しました」を返していた。LLM呼び出し前に判別できる
+    ケースのため、原因を特定しやすい専用メッセージを返し、LLM も一度も呼ばない。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nsome content.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    original_list_chunks = store.list_chunks
+
+    def empty_body_chunks(notebook, doc_id, *, kind="body"):
+        if doc_id == "doc" and kind == "body":
+            return []
+        return original_list_chunks(notebook, doc_id, kind=kind)
+
+    monkeypatch.setattr(store, "list_chunks", empty_body_chunks)
+    backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="should not be called"))
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
 
     result = service.digest("nb")
 
-    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
-    notes = store.list_study_notes("nb", "doc")
-    assert len(notes) == 1
-    assert notes[0]["text"] == "1件目の学び"
-    assert notes[0]["pipeline"] == 2
-    assert store.list_document_tags("nb", "doc") == []
+    assert result["generated"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["doc_id"] == "doc"
+    assert "本文チャンクが見つかりません" in result["errors"][0]["error"]
+    assert backend.calls == []
 
 
-def test_digest_reduce_failure_logs_warning_with_last_backend_error_text(
-    store: Store, embedder: FakeEmbedder, tmp_path: Path, caplog
+def test_digest_reduce_exception_leaves_previous_notes_and_tags_untouched_and_retries(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
-    """コードレビュー指摘#5: reduce 失敗（劣化継続）時に、最後に観測した backend の
-    raw.error 文言を含む warning ログを残す（observability。戻り値スキーマ・
-    ログ以外の既存挙動は変えない）。"""
+    """コードレビュー指摘#1: reduce フェーズの失敗（backend 例外）時に旧実装は
+    map ノートを現在の content_hash + pipeline=2 で保存する劣化継続フォールバックを
+    持っていた。これにより次回呼び出しの skip 判定（source_hash+pipeline一致）が
+    この劣化結果にマッチしてしまい、--force なしでは二度と再生成されなくなり、
+    タグも空で上書きされたままになる恒久劣化バグだった。新実装は reduce 失敗時に
+    何も永続化せず、既存の study_notes/tags をそのまま残して doc を errors に
+    記録するだけにする。これにより次回呼び出しでも自然に再試行される。"""
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
     nb_dir.mkdir(parents=True)
-    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    markdown = "# Doc\n\nwhale content here.\n"
+    (nb_dir / "doc.md").write_text(markdown, encoding="utf-8")
     store.upsert_document(
         id="doc", notebook="nb", origin="doc.md", origin_type="md",
         normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
     )
+    content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    # 「前回の正常な結果」を旧パイプライン(pipeline=1)で用意する。pipeline不一致
+    # のため skip 判定に一致せず、この digest() 呼び出しで再生成が試みられる。
+    store.replace_study_notes(
+        "nb", "doc",
+        [{"text": "既存の学び", "source_hash": content_hash, "pipeline": 1}],
+    )
+    store.replace_document_tags("nb", "doc", ["既存タグ"])
     backend = FakeAnswerBackend(
         canned=[
-            _map_answer([{"text": "1件目の学び", "chunks": [1]}]),
+            _map_answer([{"text": "新しい学び", "chunks": [1]}]),
+            ValueError("reduce boom"),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result["generated"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["doc_id"] == "doc"
+    assert "reduce boom" in result["errors"][0]["error"]
+    notes = store.list_study_notes("nb", "doc")
+    assert len(notes) == 1
+    assert notes[0]["text"] == "既存の学び"
+    assert notes[0]["pipeline"] == 1
+    assert store.list_document_tags("nb", "doc") == ["既存タグ"]
+
+    # 次回呼び出しでも skip されず再試行される(--force なしで復旧できる)。
+    retry_backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "新しい学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "新しい学び", "sources": [1]}]),
+        ]
+    )
+    retry_service = ShelfService(store, embedder, lambda name: retry_backend, corpus_dir)
+
+    retry_result = retry_service.digest("nb")
+
+    assert retry_result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    assert len(retry_backend.calls) == 2
+    assert store.list_study_notes("nb", "doc")[0]["text"] == "新しい学び"
+
+
+def test_digest_reduce_ok_false_leaves_previous_notes_and_tags_untouched_and_retries(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """コードレビュー指摘#1: reduce が ok=False で失敗した場合も、例外の場合と同じ
+    atomic error semantics（何も永続化しない）にする。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    markdown = "# Doc\n\nwhale content here.\n"
+    (nb_dir / "doc.md").write_text(markdown, encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    store.replace_study_notes(
+        "nb", "doc",
+        [{"text": "既存の学び", "source_hash": content_hash, "pipeline": 1}],
+    )
+    store.replace_document_tags("nb", "doc", ["既存タグ"])
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "新しい学び", "chunks": [1]}]),
             RawAnswer(text="", ok=False, error="reduce timeout"),
         ]
     )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
 
-    with caplog.at_level("WARNING"):
-        service.digest("nb")
+    result = service.digest("nb")
 
-    assert any("reduce timeout" in record.message for record in caplog.records)
+    assert result["generated"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["doc_id"] == "doc"
+    assert "reduce timeout" in result["errors"][0]["error"]
+    notes = store.list_study_notes("nb", "doc")
+    assert len(notes) == 1
+    assert notes[0]["text"] == "既存の学び"
+    assert store.list_document_tags("nb", "doc") == ["既存タグ"]
+
+    retry_backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "新しい学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "新しい学び", "sources": [1]}]),
+        ]
+    )
+    retry_service = ShelfService(store, embedder, lambda name: retry_backend, corpus_dir)
+
+    retry_result = retry_service.digest("nb")
+
+    assert retry_result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    assert len(retry_backend.calls) == 2
+
+
+def test_digest_reduce_parse_failure_leaves_previous_notes_and_tags_untouched(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """reduce応答が ok=True でも JSON として解析できず有効なノートが0件の場合も、
+    実質的な reduce 失敗として扱い、何も永続化しない（コードレビュー指摘#1と同じ
+    atomic error semantics）。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    markdown = "# Doc\n\nwhale content here.\n"
+    (nb_dir / "doc.md").write_text(markdown, encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    store.replace_study_notes(
+        "nb", "doc",
+        [{"text": "既存の学び", "source_hash": content_hash, "pipeline": 1}],
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "新しい学び", "chunks": [1]}]),
+            RawAnswer(text="not json", ok=True, error=None),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result["generated"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["doc_id"] == "doc"
+    notes = store.list_study_notes("nb", "doc")
+    assert len(notes) == 1
+    assert notes[0]["text"] == "既存の学び"
+
+
+def test_digest_reduce_success_with_empty_tags_persists_notes_and_clears_tags(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """reduce が正常応答かつタグが正当に0件の場合は失敗ではない。ノートは保存され、
+    タグは（前回値があっても）空で置き換えられる。reduce 失敗時の atomic な
+    未保存（このファイルの他テスト）とは明確に区別する仕様（brief 指定）。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    store.replace_document_tags("nb", "doc", ["古いタグ"])
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}], tags=[]),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    notes = store.list_study_notes("nb", "doc")
+    assert notes[0]["text"] == "学び"
+    assert store.list_document_tags("nb", "doc") == []
+
+
+def test_digest_dedups_tags_that_collapse_to_same_string_after_masking(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """コードレビュー指摘#2: normalize_tags のタグ重複除去はマスク適用前にしか
+    働かない。マスク後に別々のタグが同一文字列へ衝突する場合
+    （例: token-abc1/token-xyz2 が共に token=<REDACTED> になる・extract.py の
+    マスク規則）、store.replace_document_tags は (doc_id, tag) が PRIMARY KEY の
+    プレーンな INSERT のため sqlite3.IntegrityError で digest ループ全体が
+    落ちてしまう。マスク後に順序維持で重複除去し、1行だけ保存されることを検証する。
+    タグにハイフンを使うのは、コードレビュー指摘#8で normalize_tag が文字種
+    許可リスト外の記号（コロン等）をマスク適用より前に除去するようになった
+    ため、コロンでは本テストが検証したい「マスク後の衝突」を再現できなく
+    なったため（ハイフンは許可リストに残る）。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer(
+                [{"text": "学び", "sources": [1]}],
+                tags=["token-abc1", "token-xyz2"],
+            ),
+        ]
+    )
+
+    def fake_mask(text: str) -> str:
+        return "token=<REDACTED>" if text.startswith("token-") else text
+
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir, mask=fake_mask)
+
+    result = service.digest("nb")
+
+    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    assert store.list_document_tags("nb", "doc") == ["token=<REDACTED>"]
 
 
 def test_digest_reduce_prompt_includes_existing_notebook_tag_catalog(
