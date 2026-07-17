@@ -8,6 +8,7 @@ Thank you for your interest in contributing! We welcome all contributions — bu
 - Issue や PR は日本語・英語どちらでも歓迎です。
 
 ### Before Submitting
+- Direct pushes to `main` are not allowed — changes must go through a PR with a green CI.
 - Changes must pass all tests:
   ```bash
   uv run pytest

@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # このリポジトリは pyproject.toml + uv.lock で依存管理しており、"pip" エコシステムは
+  # uv.lock を追従しないため PR がロックファイルと不整合になり得る。dependabot-core に
+  # uv 専用エコシステムが存在するためこちらを使う。
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
