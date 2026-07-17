@@ -2751,12 +2751,52 @@ def test_digest_reduce_prompt_includes_existing_notebook_tag_catalog(
     assert reduce_call["schema"] == REDUCE_SCHEMA
 
 
-def test_digest_calls_list_tags_by_notebook_once_per_run_not_per_document(
+def test_digest_reduce_prompt_includes_more_than_15_existing_notebook_tags(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """コードレビュー指摘#14: digest() の reduce タグカタログが
+    list_tags_by_notebook の UI一覧用15件capを暗黙継承していた不具合の解消を
+    検証する。16件以上の既存タグを持つ notebook で digest() を呼び、全件が
+    list_notebook_tags（上限なし）経由で reduce プロンプトへ渡ることを確認する。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc1.md").write_text("# Doc1\n\ncontent one.\n", encoding="utf-8")
+    (nb_dir / "doc2.md").write_text("# Doc2\n\ncontent two.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc1", notebook="nb", origin="doc1.md", origin_type="md",
+        normalized_path="nb/doc1.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    store.upsert_document(
+        id="doc2", notebook="nb", origin="doc2.md", origin_type="md",
+        normalized_path="nb/doc2.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    tags = [f"タグ{i:02d}" for i in range(20)]
+    store.replace_document_tags("nb", "doc1", tags)
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}], tags=[]),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    service.digest("nb", doc_id="doc2")
+
+    reduce_call = backend.calls[-1]
+    for tag in tags:
+        assert tag in reduce_call["prompt"]
+
+
+def test_digest_calls_list_notebook_tags_once_per_run_not_per_document(
     store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch
 ) -> None:
-    """コードレビュー指摘#3: _digest_one が文書ごとに notebook 横断 GROUP BY の
-    list_tags_by_notebook を呼んでいたN+1を解消し、digest() のループ前に1回だけ
-    引く。2文書のnotebookでも呼び出しは1回に留まることを検証する。"""
+    """コードレビュー指摘#3: _digest_one が文書ごとにタグカタログ取得クエリを
+    呼んでいたN+1を解消し、digest() のループ前に1回だけ引く。2文書のnotebook
+    でも呼び出しは1回に留まることを検証する（コードレビュー指摘#14でタグ
+    カタログの取得先が list_tags_by_notebook から list_notebook_tags へ変わった
+    ため、監視対象メソッドもそれに合わせる）。"""
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
@@ -2781,14 +2821,14 @@ def test_digest_calls_list_tags_by_notebook_once_per_run_not_per_document(
     )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
     call_count = 0
-    original = store.list_tags_by_notebook
+    original = store.list_notebook_tags
 
     def counting(*args, **kwargs):
         nonlocal call_count
         call_count += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(store, "list_tags_by_notebook", counting)
+    monkeypatch.setattr(store, "list_notebook_tags", counting)
 
     result = service.digest("nb")
 

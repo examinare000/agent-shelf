@@ -1330,11 +1330,15 @@ class ShelfService:
         skipped: list[str] = []
         errors: list[dict] = []
 
-        # notebook 横断 GROUP BY の list_tags_by_notebook はループ前に1回だけ引き、
+        # notebook 単位の list_notebook_tags はループ前に1回だけ引き、
         # _digest_one には共有ミュータブルリストとして渡す（コードレビュー指摘#3の
         # N+1解消。_digest_one 側が新規タグをその場で追記するため、後続文書の
         # reduce プロンプトに先行文書のタグが反映される実質挙動は変わらない）。
-        tag_catalog = list(self._store.list_tags_by_notebook().get(notebook, ()))
+        # list_tags_by_notebook（doc_count降順・notebook横断GROUP BY・UI一覧用に
+        # limit_per_notebook=15が既定）ではなく list_notebook_tags を使うのは、
+        # UI表示用のcapを reduce のタグ再利用カタログへ黙って継承させないため
+        # （コードレビュー指摘#14。15件超のタグが暗黙に切り捨てられていた）。
+        tag_catalog = list(self._store.list_notebook_tags(notebook))
 
         for doc in targets:
             outcome = self._digest_one(

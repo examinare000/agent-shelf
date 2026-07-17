@@ -1197,6 +1197,41 @@ class TestDocumentTags:
 
         assert store.list_tags_by_notebook() == {}
 
+    def test_list_notebook_tags_returns_more_than_15_tags_uncapped(self, store):
+        # コードレビュー指摘#14: list_tags_by_notebook の limit_per_notebook=15 は
+        # UI一覧用のcapで、digest reduce の再利用タグカタログには不適切に流用
+        # されていた。list_notebook_tags は同じcapを継承しない専用APIにする。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="physics", origin="doc2.pdf",
+                        normalized_path="corpus/physics/doc2.md")
+        _make_document(store, id_="doc3", notebook="physics", origin="doc3.pdf",
+                        normalized_path="corpus/physics/doc3.md")
+        tags = [f"tag{i:02d}" for i in range(20)]
+        store.replace_document_tags("physics", "doc1", tags[0:7])
+        store.replace_document_tags("physics", "doc2", tags[7:14])
+        store.replace_document_tags("physics", "doc3", tags[14:20])
+
+        result = store.list_notebook_tags("physics")
+
+        assert result == tags
+
+    def test_list_notebook_tags_excludes_other_notebooks(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="math", origin="doc2.pdf",
+                        normalized_path="corpus/math/doc2.md")
+        store.replace_document_tags("physics", "doc1", ["物理タグ"])
+        store.replace_document_tags("math", "doc2", ["数学タグ"])
+
+        assert store.list_notebook_tags("physics") == ["物理タグ"]
+
+    def test_list_notebook_tags_returns_empty_list_when_no_tags(self, store):
+        _make_notebook(store, name="physics")
+
+        assert store.list_notebook_tags("physics") == []
+
 
 class TestListChunks:
     """doc 単位・kind 別のチャンク一覧取得（map-reduce 学び抽出の入力用）。"""

@@ -728,6 +728,22 @@ class Store:
                 bucket.append(row["tag"])
         return result
 
+    def list_notebook_tags(self, notebook: str) -> list[str]:
+        """notebook 内の distinct タグ名をタグ名昇順で、上限なしで返す。
+
+        list_tags_by_notebook の limit_per_notebook=15 は UI 一覧表示専用の
+        docstring 契約であり、digest() の reduce プロンプトへ渡すタグ再利用
+        カタログにこれを流用すると15件超のタグが暗黙に切り捨てられる不具合
+        だった（コードレビュー指摘#14）。専用APIとして分離し、呼び出し元は
+        用途に応じて list_tags_by_notebook（UI/カタログ）とこちら
+        （reduce タグカタログ）を使い分ける。
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT tag FROM document_tags WHERE notebook = ? ORDER BY tag",
+            (notebook,),
+        ).fetchall()
+        return [row["tag"] for row in rows]
+
     # -- study_notes（学びノート・source-of-truth。indexer が kind='digest' チャンク化） ----
 
     def replace_study_notes(self, notebook: str, doc_id: str, notes: list[dict]) -> None:
