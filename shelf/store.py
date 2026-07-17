@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,15 +78,23 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 -- 検索対象化は indexer が本テーブルを読み、kind='digest' チャンクとして chunks に
 -- upsert する（study_notes 自体は embedding を持たない = ここではただの記録）。
 CREATE TABLE IF NOT EXISTS study_notes (
-  id          TEXT PRIMARY KEY,          -- {notebook}/{doc_id}#d{n}
-  notebook    TEXT NOT NULL,
-  doc_id      TEXT NOT NULL,
-  seq         INTEGER NOT NULL,          -- doc 内の学び連番（0 起点）
-  text        TEXT NOT NULL,             -- 学び本文（mask 適用済み）
-  source_span TEXT,                      -- 由来（節・ページ範囲等）任意
-  source_hash TEXT,                      -- 生成時点の正規化 md ハッシュ（陳腐化検出）
-  model       TEXT,                      -- 生成に使ったモデル名（例 qwen3:8b）
-  created_at  TEXT NOT NULL,
+  id               TEXT PRIMARY KEY,     -- {notebook}/{doc_id}#d{n}
+  notebook         TEXT NOT NULL,
+  doc_id           TEXT NOT NULL,
+  seq              INTEGER NOT NULL,     -- doc 内の学び連番（0 起点）
+  text             TEXT NOT NULL,        -- 学び本文（mask 適用済み）
+  source_span      TEXT,                 -- 由来（節・ページ範囲等）任意
+  source_hash      TEXT,                 -- 生成時点の正規化 md ハッシュ（陳腐化検出）
+  model            TEXT,                 -- 生成に使ったモデル名（例 qwen3:8b）
+  created_at       TEXT NOT NULL,
+  -- 代表チャンクの節パンくず・ページ（全文グラウンディング改良: 接地元の人間可読表示）。
+  section          TEXT,
+  page             INTEGER,
+  -- 接地元チャンク id の JSON 配列文字列（例 '["nb/doc#3","nb/doc#5"]'）。
+  -- store 層は JSON 文字列で永続化し、list_study_notes で list に復元して返す。
+  source_chunk_ids TEXT,
+  -- 生成パイプライン版数。旧=1（単発生成・既定）、map-reduce=2。
+  pipeline         INTEGER NOT NULL DEFAULT 1,
   UNIQUE(notebook, doc_id, seq)
 );
 """
@@ -114,6 +123,7 @@ class Store:
         self._migrate_documents_columns()
         self._migrate_notebooks_columns()
         self._migrate_chunks_columns()
+        self._migrate_study_notes_columns()
         # notebook 単位のベクトル行列キャッシュ: {notebook: (generation, ids, matrix)}。
         # generation が現在値と一致する間は SQLite に再クエリしない（§ ベクタキャッシュ）。
         self._vector_cache: dict[str, tuple[int, list[str], np.ndarray]] = {}
@@ -148,6 +158,21 @@ class Store:
         # SQLite の ALTER TABLE ... DEFAULT は既存行にも遡って値を埋めるため、
         # 追加直後から既存行を含めて NOT NULL 制約と既定値が両立する。
         self._add_missing_columns("chunks", {"kind": "TEXT NOT NULL DEFAULT 'body'"})
+
+    def _migrate_study_notes_columns(self) -> None:
+        # 旧スキーマ DB（section/page/source_chunk_ids/pipeline 列なし）を開いても
+        # チャンク接地・パイプライン版数付き学びノートが使えるようにする。
+        # pipeline は kind と同様、ALTER TABLE ... DEFAULT 1 で既存行にも遡って
+        # 値を補完する（旧形式=単発生成パイプラインは常に 1）。
+        self._add_missing_columns(
+            "study_notes",
+            {
+                "section": "TEXT",
+                "page": "INTEGER",
+                "source_chunk_ids": "TEXT",
+                "pipeline": "INTEGER NOT NULL DEFAULT 1",
+            },
+        )
 
     # -- generation（ベクタキャッシュ無効化用カウンタ） ---------------------------
 
@@ -395,8 +420,12 @@ class Store:
         `shelf digest --force` の再生成や失敗リトライで「前回分が残ったまま重複する」
         ことを避けるため、insert-or-update ではなく delete-then-insert で「今の状態」
         を過不足なく反映する。notes の各 dict は text が必須、source_span/source_hash/
-        model は省略可。id は "{notebook}/{doc_id}#d{n}"（n は 0 起点連番）で決定的に
-        生成する（§4-A）。
+        model/section/page/source_chunk_ids/pipeline は省略可（既存呼び出し元は
+        section 以降を渡さない旧形式 dict のままでよい＝後方互換）。id は
+        "{notebook}/{doc_id}#d{n}"（n は 0 起点連番）で決定的に生成する（§4-A）。
+        source_chunk_ids は接地元チャンク id の list[str] を渡す（store 層で
+        JSON 文字列に変換して永続化する。呼び出し側=service は list のまま
+        扱えばよい）。
         """
         self._conn.execute(
             "DELETE FROM study_notes WHERE notebook = ? AND doc_id = ?", (notebook, doc_id)
@@ -413,6 +442,12 @@ class Store:
                 note.get("source_hash"),
                 note.get("model"),
                 created_at,
+                note.get("section"),
+                note.get("page"),
+                json.dumps(note["source_chunk_ids"])
+                if note.get("source_chunk_ids") is not None
+                else None,
+                note.get("pipeline") if note.get("pipeline") is not None else 1,
             )
             for seq, note in enumerate(notes)
         ]
@@ -421,8 +456,8 @@ class Store:
                 """
                 INSERT INTO study_notes
                     (id, notebook, doc_id, seq, text, source_span, source_hash, model,
-                     created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, section, page, source_chunk_ids, pipeline)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -431,7 +466,8 @@ class Store:
     def list_study_notes(self, notebook: str, doc_id: str | None = None) -> list[dict]:
         query = (
             "SELECT id, notebook, doc_id, seq, text, source_span, source_hash, model, "
-            "created_at FROM study_notes WHERE notebook = ?"
+            "created_at, section, page, source_chunk_ids, pipeline "
+            "FROM study_notes WHERE notebook = ?"
         )
         params: tuple[str, ...] = (notebook,)
         if doc_id is not None:
@@ -439,7 +475,15 @@ class Store:
             params += (doc_id,)
         query += " ORDER BY doc_id, seq"
         rows = self._conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+        notes = []
+        for row in rows:
+            note = dict(row)
+            # DB 上は JSON 文字列で持つ（sqlite3 が list を直接扱えないため）。
+            # 呼び出し側は list[str] | None として素直に扱えるようここで復元する。
+            raw_chunk_ids = note["source_chunk_ids"]
+            note["source_chunk_ids"] = json.loads(raw_chunk_ids) if raw_chunk_ids else None
+            notes.append(note)
+        return notes
 
     def load_vectors(self, notebook: str) -> tuple[list[str], np.ndarray]:
         """cosine 検索用に notebook 内の全ベクトルを1つの行列としてロードする。

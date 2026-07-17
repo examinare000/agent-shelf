@@ -849,3 +849,176 @@ class TestMeta:
         store.set_meta("model", "old")
         store.set_meta("model", "new")
         assert store.get_meta("model") == "new"
+
+
+class TestStudyNotesGrounding:
+    """学びノートのチャンク接地（section/page/source_chunk_ids）とパイプライン版数。
+
+    「学び抽出の全文グラウンディング改良」第1ステップ（永続層のみ）。
+    """
+
+    def test_replace_study_notes_round_trips_grounding_fields(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes(
+            "physics",
+            "doc1",
+            [
+                {
+                    "text": "学び1",
+                    "section": "§3.2",
+                    "page": 42,
+                    "source_chunk_ids": ["physics/doc1#3", "physics/doc1#5"],
+                    "pipeline": 2,
+                }
+            ],
+        )
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["section"] == "§3.2"
+        assert note["page"] == 42
+        assert note["source_chunk_ids"] == ["physics/doc1#3", "physics/doc1#5"]
+        assert note["pipeline"] == 2
+
+    def test_replace_study_notes_defaults_pipeline_to_1_when_omitted(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes("physics", "doc1", [{"text": "学び1"}])
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["pipeline"] == 1
+
+    def test_replace_study_notes_defaults_pipeline_to_1_when_explicitly_none(self, store):
+        # コードレビュー指摘#4: note.get("pipeline", 1) は明示的な None を素通しし、
+        # pipeline 列は NOT NULL 制約なので IntegrityError になっていた。
+        # source_chunk_ids と同じ「is not None」パターンに揃え、None を渡した場合も
+        # 省略時と同じ既定値1にフォールバックする。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes("physics", "doc1", [{"text": "学び1", "pipeline": None}])
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["pipeline"] == 1
+
+    def test_replace_study_notes_with_legacy_dict_without_new_keys_still_works(self, store):
+        # service.py の既存呼び出し元は section/page/source_chunk_ids/pipeline を
+        # 渡さない（旧形式 dict）。互換性が壊れていないことを確認する。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes(
+            "physics",
+            "doc1",
+            [{"text": "学び1", "source_span": "§1", "source_hash": "h1", "model": "qwen3:8b"}],
+        )
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["text"] == "学び1"
+        assert note["section"] is None
+        assert note["page"] is None
+        assert note["source_chunk_ids"] is None
+        assert note["pipeline"] == 1
+
+    def test_list_study_notes_source_chunk_ids_defaults_to_none_when_absent(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_study_notes("physics", "doc1", [{"text": "学び1"}])
+
+        note = store.list_study_notes("physics", "doc1")[0]
+
+        assert note["source_chunk_ids"] is None
+
+
+class TestStudyNotesGroundingSchemaMigration:
+    """旧スキーマ DB（study_notes に section/page/source_chunk_ids/pipeline 列を
+    欠く）を開いた際の冪等マイグレーションを検証する。
+    """
+
+    def _create_legacy_db(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE notebooks (
+              name        TEXT PRIMARY KEY,
+              description TEXT,
+              backend     TEXT NOT NULL DEFAULT 'codex',
+              created_at  TEXT NOT NULL,
+              persona     TEXT
+            );
+            CREATE TABLE documents (
+              id              TEXT PRIMARY KEY,
+              notebook        TEXT NOT NULL REFERENCES notebooks(name),
+              origin          TEXT NOT NULL,
+              origin_type     TEXT NOT NULL,
+              normalized_path TEXT NOT NULL,
+              title           TEXT,
+              converter       TEXT NOT NULL,
+              content_hash    TEXT,
+              added_at        TEXT NOT NULL,
+              fetched_at      TEXT,
+              description        TEXT,
+              description_source TEXT,
+              UNIQUE(notebook, origin)
+            );
+            CREATE TABLE study_notes (
+              id          TEXT PRIMARY KEY,
+              notebook    TEXT NOT NULL,
+              doc_id      TEXT NOT NULL,
+              seq         INTEGER NOT NULL,
+              text        TEXT NOT NULL,
+              source_span TEXT,
+              source_hash TEXT,
+              model       TEXT,
+              created_at  TEXT NOT NULL,
+              UNIQUE(notebook, doc_id, seq)
+            );
+            INSERT INTO notebooks (name, description, backend, created_at)
+                VALUES ('physics', '物理の論文', 'codex', '2026-01-01T00:00:00Z');
+            INSERT INTO documents
+                (id, notebook, origin, origin_type, normalized_path, converter, added_at)
+                VALUES ('doc1', 'physics', 'feynman.pdf', 'pdf', 'corpus/physics/doc1.md',
+                        'pymupdf4llm', '2026-01-01T00:00:00Z');
+            INSERT INTO study_notes
+                (id, notebook, doc_id, seq, text, created_at)
+                VALUES ('physics/doc1#d0', 'physics', 'doc1', 0, '既存の学び',
+                        '2026-01-01T00:00:00Z');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def test_init_migrates_columns_and_existing_rows_default_pipeline_to_1(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        self._create_legacy_db(db_path)
+
+        store = Store(db_path)
+        try:
+            note = store.list_study_notes("physics", "doc1")[0]
+            assert note["text"] == "既存の学び"
+            assert note["section"] is None
+            assert note["page"] is None
+            assert note["source_chunk_ids"] is None
+            # ALTER TABLE ... DEFAULT 1 は既存行にも遡って値を入れる。
+            assert note["pipeline"] == 1
+        finally:
+            store.close()
+
+    def test_init_migration_is_idempotent_across_two_opens(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        self._create_legacy_db(db_path)
+
+        store1 = Store(db_path)
+        store1.close()
+        store2 = Store(db_path)  # 2回目の open で ALTER TABLE の重複エラーが出ないことを確認
+        try:
+            note = store2.list_study_notes("physics", "doc1")[0]
+            assert note["pipeline"] == 1
+            store2.replace_study_notes(
+                "physics", "doc1", [{"text": "新しい学び", "pipeline": 2}]
+            )
+            assert store2.list_study_notes("physics", "doc1")[0]["pipeline"] == 2
+        finally:
+            store2.close()
