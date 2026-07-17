@@ -558,6 +558,82 @@ class TestChunkCRUD:
         assert ids == ["doc2#0"]
 
 
+class TestGetChunks:
+    """コードレビュー指摘#11: service._load_chunks が get_chunk を id ごとに
+    N回呼ぶ N+1 の解消用。get_chunks はまとめて1クエリ（大量ID時は500件区切り）
+    で取得し、結果を入力 ids の順序へ並べ替えて返す。"""
+
+    def _seed(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", seq=0, text="第0"),
+                _chunk_row(id_="doc1#1", seq=1, text="第1"),
+                _chunk_row(id_="doc1#2", seq=2, text="第2"),
+            ]
+        )
+
+    def test_returns_rows_reordered_to_match_input_id_order(self, store):
+        self._seed(store)
+
+        rows = store.get_chunks(["doc1#2", "doc1#0", "doc1#1"])
+
+        assert [row["id"] for row in rows] == ["doc1#2", "doc1#0", "doc1#1"]
+
+    def test_skips_missing_ids_while_preserving_order_of_the_rest(self, store):
+        self._seed(store)
+
+        rows = store.get_chunks(["doc1#0", "does-not-exist", "doc1#2"])
+
+        assert [row["id"] for row in rows] == ["doc1#0", "doc1#2"]
+
+    class _CountingConnProxy:
+        """sqlite3.Connection は C拡張型で execute の直接差し替えができないため
+        （test_keyword_topk_degrades_and_disables_fts_on_broken_read_state の
+        コメント参照）、Store._conn 自体を execute 呼び出し回数を数える薄い
+        プロキシへ差し替える。execute 以外は実接続へそのまま委譲する。"""
+
+        def __init__(self, real_conn):
+            self._real = real_conn
+            self.calls = 0
+
+        def execute(self, *args, **kwargs):
+            self.calls += 1
+            return self._real.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def test_empty_id_list_returns_empty_list_without_querying(self, store, monkeypatch):
+        proxy = self._CountingConnProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+
+        assert store.get_chunks([]) == []
+        assert proxy.calls == 0
+
+    def test_issues_a_single_query_for_many_ids(self, store, monkeypatch):
+        self._seed(store)
+        proxy = self._CountingConnProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+
+        store.get_chunks(["doc1#0", "doc1#1", "doc1#2"])
+
+        assert proxy.calls == 1
+
+    def test_batches_queries_at_500_ids_per_statement(self, store, monkeypatch):
+        # SQLite バインドパラメータ上限を踏まえた分割。存在しないIDでも
+        # クエリの発行回数だけを検証すれば十分なため、実データは作らない。
+        proxy = self._CountingConnProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+        ids = [f"missing#{i}" for i in range(501)]
+
+        result = store.get_chunks(ids)
+
+        assert result == []
+        assert proxy.calls == 2
+
+
 class TestChunkKind:
     def test_upsert_chunks_defaults_kind_to_body(self, store):
         _make_notebook(store, name="physics")

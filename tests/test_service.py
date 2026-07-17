@@ -625,6 +625,59 @@ def test_ask_hybrid_search_clamps_digest_overrepresentation_and_promotes_body(
     }
 
 
+def test_ask_loads_retrieved_chunks_via_a_single_get_chunks_call(
+    store: Store, tmp_path: Path, monkeypatch
+) -> None:
+    """コードレビュー指摘#11: _load_chunks が id ごとに store.get_chunk を N 回
+    呼ぶ N+1（ハイブリッド検索プールで最大2倍化）を解消し、store.get_chunks への
+    1回のまとめ取得に集約したことを検証する。同点スコアの複数チャンクが
+    取得対象になるよう、全チャンクへ同一の embedding を与える。"""
+    store.create_notebook("nb_load", backend="codex")
+    chunks = [
+        {
+            "id": f"nb_load/doc#{i}", "notebook": "nb_load", "doc_id": "doc",
+            "source_path": "nb_load/doc.md", "section": None, "page": i,
+            "seq": i, "text": f"body chunk {i}",
+            "embedding": [1.0, 0.0, 0.0, 0.0],
+            "kind": "body",
+        }
+        for i in range(4)
+    ]
+    store.upsert_chunks(chunks)
+    local_embedder = FakeEmbedder(dim=4, known={"anchor": [1.0, 0.0, 0.0, 0.0]})
+    payload = {"answer": "ok", "citations": [], "insights": [], "confident": True}
+    backend = FakeAnswerBackend(
+        canned=RawAnswer(text=json.dumps(payload), ok=True, error=None)
+    )
+    service = ShelfService(
+        store, local_embedder, lambda name: backend, tmp_path,
+        top_k=10, hybrid_search=False,
+    )
+    get_chunk_calls = 0
+    original_get_chunk = store.get_chunk
+
+    def counting_get_chunk(*args, **kwargs):
+        nonlocal get_chunk_calls
+        get_chunk_calls += 1
+        return original_get_chunk(*args, **kwargs)
+
+    monkeypatch.setattr(store, "get_chunk", counting_get_chunk)
+    get_chunks_calls = 0
+    original_get_chunks = store.get_chunks
+
+    def counting_get_chunks(*args, **kwargs):
+        nonlocal get_chunks_calls
+        get_chunks_calls += 1
+        return original_get_chunks(*args, **kwargs)
+
+    monkeypatch.setattr(store, "get_chunks", counting_get_chunks)
+
+    service.ask("nb_load", "anchor")
+
+    assert get_chunk_calls == 0
+    assert get_chunks_calls == 1
+
+
 # -- list_notebooks -----------------------------------------------------------
 
 

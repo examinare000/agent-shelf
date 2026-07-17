@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -604,6 +605,33 @@ class Store:
         return None if row is None else dict(row)
 
     _GET_CHUNKS_BATCH_SIZE = 500  # SQLite バインドパラメータ上限を踏まえた分割単位。
+
+    def get_chunks(self, ids: Sequence[str]) -> list[dict]:
+        """ids に対応するチャンクをまとめて取得し、入力 ids の順序へ並べ替えて返す
+        （存在しない id はスキップ）。
+
+        service._load_chunks が get_chunk を id ごとに N 回呼ぶ N+1（ハイブリッド
+        検索の候補プールは最大 2×top_k 件あり2倍化する）を1クエリへ集約する
+        （コードレビュー指摘#11）。SQLite のバインドパラメータ数には上限がある
+        ため _GET_CHUNKS_BATCH_SIZE 件ごとにクエリを分割する（呼び出し実態の
+        プールは小さいため通常は1回で完結する）。
+        """
+        if not ids:
+            return []
+        rows_by_id: dict[str, dict] = {}
+        for start in range(0, len(ids), self._GET_CHUNKS_BATCH_SIZE):
+            batch = ids[start : start + self._GET_CHUNKS_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                f"""
+                SELECT id, notebook, doc_id, source_path, section, page, seq, text, kind
+                FROM chunks WHERE id IN ({placeholders})
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                rows_by_id[row["id"]] = dict(row)
+        return [rows_by_id[id_] for id_ in ids if id_ in rows_by_id]
 
     def list_chunks(self, notebook: str, doc_id: str, *, kind: str = "body") -> list[dict]:
         """doc_id 内の指定 kind のチャンクを seq 昇順で返す（map-reduce 学び抽出の入力用）。

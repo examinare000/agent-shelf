@@ -423,23 +423,23 @@ class ShelfService:
         return merged, True
 
     def _load_chunks(self, ids: list[str]) -> list[RetrievedChunk]:
-        chunks: list[RetrievedChunk] = []
-        for chunk_id in ids:
-            row = self._store.get_chunk(chunk_id)
-            if row is None:  # 検索後に削除された等のレースは無視して結果から除く
-                continue
-            chunks.append(
-                RetrievedChunk(
-                    id=row["id"],
-                    doc_id=row["doc_id"],
-                    source_path=row["source_path"],
-                    section=row["section"],
-                    page=row["page"],
-                    text=row["text"],
-                    kind=row["kind"],
-                )
+        # store.get_chunk を id ごとに N 回呼ぶと N+1 になる（ハイブリッド検索の
+        # 候補プールは最大 2×top_k 件で2倍化する）ため、store.get_chunks で
+        # 1クエリへまとめて取得する（コードレビュー指摘#11）。get_chunks は
+        # 入力 ids の順序へ並べ替え済み・存在しない id はスキップ済みで返すため、
+        # ここでの再整列・None チェックは不要。
+        return [
+            RetrievedChunk(
+                id=row["id"],
+                doc_id=row["doc_id"],
+                source_path=row["source_path"],
+                section=row["section"],
+                page=row["page"],
+                text=row["text"],
+                kind=row["kind"],
             )
-        return chunks
+            for row in self._store.get_chunks(ids)
+        ]
 
     @staticmethod
     def _clamp_digest_kind(
