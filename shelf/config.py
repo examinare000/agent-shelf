@@ -119,19 +119,48 @@ ROUTE_TOP_N = _int_env("SHELF_ROUTE_TOP_N", 1)
 # レイテンシ保護優先のデフォルト）。
 ROUTE_FALLBACK = os.environ.get("SHELF_ROUTE_FALLBACK", "")
 
-# shelf digest が 1 資料あたり生成する学びノート数の既定上限。digests.py は
-# config を import しない設計（§3 依存方向）のため呼び出し側の service.py が
-# parse_digest(..., max_notes=config.DIGEST_MAX_NOTES) として明示的に渡す。
-# digests.DIGEST_DEFAULT_MAX_NOTES と同値にして矛盾を避ける。
-DIGEST_MAX_NOTES = _int_env("SHELF_DIGEST_MAX_NOTES", 5)
+# shelf digest の reduce フェーズ後に 1 資料あたり保持する学びノート数の既定上限。
+# digests.py は config を import しない設計（§3 依存方向）のため呼び出し側の
+# service.py が build_reduce_prompt(..., max_notes=config.DIGEST_MAX_NOTES) として
+# 明示的に渡す。map-reduce パイプライン化に伴い、単発生成時代の既定 5
+# （digests.py 旧 DIGEST_DEFAULT_MAX_NOTES）から文書全体を俯瞰できる 20 へ拡大した
+# （env 変数名 SHELF_DIGEST_MAX_NOTES は既存呼び出し・運用設定との互換のため維持）。
+DIGEST_MAX_NOTES = _int_env("SHELF_DIGEST_MAX_NOTES", 20)
 
 # shelf digest が LLM へ渡す資料本文の先頭何文字までを入力とするかの上限。
 # digests.py はローカル定数 DIGEST_INPUT_MAX_CHARS=4000 を独立に持つ（config非依存の
 # 制約上）が、service.py 側で config 値を渡す運用に備え同値をここにも定義する。
 DIGEST_INPUT_MAX_CHARS = _int_env("SHELF_DIGEST_INPUT_MAX_CHARS", 4000)
 
+# shelf digest の map フェーズで 1 ウィンドウ（1 回の map LLM 呼び出し入力）あたり
+# 抽出する学びノート数の既定上限。digests.build_map_prompt(..., max_notes=...) へ
+# service.py が明示的に渡す。DIGEST_MAX_NOTES（reduce 後・文書全体の上限）とは
+# 独立した控えめな値にする（1 ウィンドウから DIGEST_MAX_NOTES 件も学びが出るのは
+# 過剰なため）。digests.py 側の呼び出し規定値と同値。
+DIGEST_MAP_NOTES = _int_env("SHELF_DIGEST_MAP_NOTES", 5)
+
+# shelf digest の map フェーズで body チャンク列を分割する 1 ウィンドウあたりの
+# 既定文字数上限。digests.group_into_windows(..., window_chars=...) へ渡す。
+# digests.WINDOW_DEFAULT_CHARS と同値にして矛盾を避ける。
+DIGEST_MAP_WINDOW_CHARS = _int_env("SHELF_DIGEST_MAP_WINDOW_CHARS", 8000)
+
+# shelf digest（map/reduce 両フェーズ）専用の推論バックエンド名。既定は空文字列
+# （未指定）で、この場合 service.py は notebook 自体の backend にフォールバックする
+# （ROUTER_BACKEND と同じ「空=呼び出し側でフォールバック」流儀）。専門家の回答生成
+# （ask/consult）とは別バックエンドで学び抽出だけ回す運用へのドアを開けておく。
+DIGEST_BACKEND = os.environ.get("SHELF_DIGEST_BACKEND", "")
+
 # shelf shelve（自動分類投入）の要約・分類推論、および新規作成する notebook の
 # backend 列に使うバックエンド名。全体既定 DEFAULT_BACKEND（codex・クラウド）とは
 # 独立に、既定をローカル ollama（qwen3:8b）へ倒す。分類は多数回・低単価推論のため
 # クラウド課金を避け、かつ実効コンテキストが小さいモデル前提の設計（設計書 §13.1 決定6）。
 SHELVE_BACKEND = os.environ.get("SHELF_SHELVE_BACKEND", "ollama")
+
+# ask/consult のチャンク検索を、cosine ベクトル検索単体ではなく FTS5 キーワード
+# 検索（BM25）との RRF（Reciprocal Rank Fusion）併用にするかどうか。既定 true:
+# ベクトル検索は意味的に近いが語彙が一致しない文を拾える一方、固有名詞・型番・
+# エラーコードのような表記ゆれの少ない語の完全一致取りこぼしに弱いため、
+# キーワード検索を併用したほうが実運用の grounding 精度が高いと判断した。
+# fts5/trigram tokenizer が使えない環境では store.fts_enabled=False により
+# 自動的にベクトル単体へ劣化する（このフラグは「使うかどうかの意図」のみを表す）。
+HYBRID_SEARCH = _bool_env("SHELF_HYBRID_SEARCH", True)
