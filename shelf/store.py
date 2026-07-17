@@ -483,6 +483,25 @@ class Store:
         ).fetchone()
         return None if row is None else dict(row)
 
+    def list_chunks(self, notebook: str, doc_id: str, *, kind: str = "body") -> list[dict]:
+        """doc_id 内の指定 kind のチャンクを seq 昇順で返す（map-reduce 学び抽出の入力用）。
+
+        id 辞書順ではなく seq 昇順で返す必要がある: digests.group_into_windows が
+        隣接チャンクの連続性（同じ節が固まっていること）を前提にウィンドウ境界を
+        判定するため、chunker.py が付与した元の並び順を保つ（get_chunk が単一 id
+        取得なのに対し、こちらは 1 doc 分をまとめて読む用途）。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, section, page, seq, text
+            FROM chunks
+            WHERE notebook = ? AND doc_id = ? AND kind = ?
+            ORDER BY seq
+            """,
+            (notebook, doc_id, kind),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def keyword_topk(self, notebook: str, fts_query: str, limit: int) -> list[tuple[str, float]]:
         """全文グラウンディング改良のハイブリッド検索用キーワード索引。
 

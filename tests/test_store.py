@@ -1121,6 +1121,83 @@ class TestDocumentTags:
         assert store.list_tags_by_notebook() == {}
 
 
+class TestListChunks:
+    """doc 単位・kind 別のチャンク一覧取得（map-reduce 学び抽出の入力用）。"""
+
+    def test_list_chunks_returns_rows_in_seq_order(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#1", seq=1, text="2番目"),
+                _chunk_row(id_="doc1#0", seq=0, text="1番目"),
+            ]
+        )
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert [r["text"] for r in rows] == ["1番目", "2番目"]
+        assert [r["id"] for r in rows] == ["doc1#0", "doc1#1"]
+
+    def test_list_chunks_returns_id_section_page_seq_text(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [_chunk_row(id_="doc1#0", section="§3.2", page=42, text="本文")]
+        )
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert rows == [
+            {"id": "doc1#0", "section": "§3.2", "page": 42, "seq": 0, "text": "本文"}
+        ]
+
+    def test_list_chunks_defaults_to_kind_body_and_excludes_other_kinds(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        body_row = _chunk_row(id_="doc1#0", seq=0, text="本文")
+        digest_row = _chunk_row(id_="doc1#-2", seq=-2, text="学び")
+        digest_row["kind"] = "digest"
+        store.upsert_chunks([body_row, digest_row])
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert [r["id"] for r in rows] == ["doc1#0"]
+
+    def test_list_chunks_respects_explicit_kind(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        digest_row = _chunk_row(id_="doc1#-2", seq=-2, text="学び")
+        digest_row["kind"] = "digest"
+        store.upsert_chunks([digest_row])
+
+        rows = store.list_chunks("physics", "doc1", kind="digest")
+
+        assert [r["id"] for r in rows] == ["doc1#-2"]
+
+    def test_list_chunks_scopes_to_notebook_and_doc_id(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="physics", origin="doc2.pdf",
+                        normalized_path="corpus/physics/doc2.md")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", doc_id="doc1", source_path="corpus/physics/doc1.md"),
+                _chunk_row(id_="doc2#0", doc_id="doc2", source_path="corpus/physics/doc2.md"),
+            ]
+        )
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert [r["id"] for r in rows] == ["doc1#0"]
+
+    def test_list_chunks_returns_empty_list_when_no_chunks(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        assert store.list_chunks("physics", "doc1") == []
+
+
 class TestKeywordTopK:
     """FTS5（trigram tokenizer）によるキーワード検索索引 chunks_fts。"""
 
