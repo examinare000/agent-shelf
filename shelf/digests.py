@@ -50,31 +50,33 @@ def group_into_windows(
 ) -> list[list[dict]]:
     """store.list_chunks 由来のチャンク dict 列（seq 昇順）を map 入力ウィンドウへ分割する。
 
-    節（section）が変わる位置を優先境界として扱う: ウィンドウ内文字数がまだ
-    window_chars 未満でも、節が変わったら新しいウィンドウを開始する（節をまたいだ
-    学び抽出はコンテキストが混ざり品質が落ちるため）。同一節内では window_chars を
-    超えない範囲で貪欲にパックし、超える直前で新しいウィンドウへ切る。
+    window_chars の文字数予算のみで境界を決める: 次のチャンクを足すと予算を
+    超え、かつ現在の window が非空であれば、そこで新しい window を開始する。
+    節（section）が変わっても強制的には分割しない（コードレビュー指摘 P5:
+    見出しレベルを問わず見出しごとに節を切る chunker.py の仕様と組み合わさると、
+    見出し密度に比例して map LLM 呼び出し数が増え（例: 150見出し文書で150回）、
+    window_chars による総量抑制が効かなくなっていたため撤去した）。
+    チャンクは id 単位で section/page メタデータを保ったまま同一 window に混在できる
+    ——学びの接地（grounding）はチャンク id 単位で行われ、_format_window_chunk が
+    window 内の各チャンクを個別に節・ページ付きで提示するため、節をまたいだ
+    packing でも接地精度は落ちない。
     単一チャンクが window_chars を超える場合はチャンク自体を分割せず単独ウィンドウにする
     （チャンクは chunker.py が既に上限管理済みという既存契約を尊重する）。
     """
     windows: list[list[dict]] = []
     current: list[dict] = []
     current_chars = 0
-    current_section: str | None = None
 
     for chunk in chunks:
         text_len = len(chunk["text"])
-        section = chunk.get("section")
-        section_changed = current and section != current_section
         exceeds_limit = current and current_chars + text_len > window_chars
-        if section_changed or exceeds_limit:
+        if exceeds_limit:
             windows.append(current)
             current = []
             current_chars = 0
 
         current.append(chunk)
         current_chars += text_len
-        current_section = section
 
     if current:
         windows.append(current)

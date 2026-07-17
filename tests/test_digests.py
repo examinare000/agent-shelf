@@ -44,14 +44,17 @@ class TestGroupIntoWindows:
 
         assert windows == [chunks]
 
-    def test_breaks_window_at_section_boundary_even_under_char_limit(self):
-        # 文字数はまだ余裕があっても、節が変われば優先境界として window を分ける。
+    def test_packs_different_section_chunks_under_char_limit_into_one_window(self):
+        # 節が変わっても、window_chars の予算内であれば window を分けない
+        # （P5: 見出し密度に比例して map 呼び出しが増える強制分割を廃止した）。
+        # チャンクは section/page メタデータを保持したまま同一 window に混在できる
+        # （接地はチャンク単位であり、prompt 整形も各チャンクを個別に節・ページ付きで表示する）。
         first = _chunk("nb/doc#0", section="§1", page=1, seq=0, text="あ" * 10)
         second = _chunk("nb/doc#1", section="§2", page=2, seq=1, text="い" * 10)
 
         windows = group_into_windows([first, second], window_chars=1000)
 
-        assert windows == [[first], [second]]
+        assert windows == [[first, second]]
 
     def test_breaks_window_when_char_limit_exceeded_within_same_section(self):
         first = _chunk("nb/doc#0", section="§1", page=1, seq=0, text="あ" * 60)
@@ -78,13 +81,16 @@ class TestGroupIntoWindows:
         assert windows == [[first, second]]
 
     def test_preserves_chunk_order_within_and_across_windows(self):
+        # window_chars=25: 先頭2チャンク(計20字)は収まるが、3チャンク目を足すと
+        # 30字で超過するため、そこで window を分ける（節が変わったからではなく、
+        # 純粋に文字数予算のみが境界を決めることを確認する）。
         chunks = [
             _chunk("nb/doc#0", section="§1", page=1, seq=0, text="あ" * 10),
             _chunk("nb/doc#1", section="§1", page=1, seq=1, text="い" * 10),
             _chunk("nb/doc#2", section="§2", page=2, seq=2, text="う" * 10),
         ]
 
-        windows = group_into_windows(chunks, window_chars=1000)
+        windows = group_into_windows(chunks, window_chars=25)
 
         assert windows == [
             [chunks[0], chunks[1]],

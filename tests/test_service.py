@@ -2105,8 +2105,10 @@ def test_digest_uses_notebook_persona_and_document_title_in_map_and_reduce_promp
 def test_digest_multi_window_doc_merges_map_notes_via_reduce_with_chunk_id_union(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
-    """節が変わると group_into_windows が新ウィンドウを開始する（digests.py §設計）ため、
-    2節の doc は map が2回・reduce が1回呼ばれる。reduce の sources 参照は
+    """window_chars 予算を各チャンク単体でも超える小さな値にすると、節の異同に
+    関わらず1チャンク=1windowへ分割される（group_into_windows は節では強制分割
+    しなくなったため P5、window 数を制御するのは digest_map_window_chars のみ）。
+    2チャンクの doc は map が2回・reduce が1回呼ばれる。reduce の sources 参照は
     parse_reduce により両ウィンドウの chunk_ids 和集合へ解決される。"""
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
@@ -2130,7 +2132,9 @@ def test_digest_multi_window_doc_merges_map_notes_via_reduce_with_chunk_id_union
             ),
         ]
     )
-    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+    service = ShelfService(
+        store, embedder, lambda name: backend, corpus_dir, digest_map_window_chars=20
+    )
 
     result = service.digest("nb")
 
@@ -2147,6 +2151,9 @@ def test_digest_multi_window_doc_merges_map_notes_via_reduce_with_chunk_id_union
 def test_digest_single_window_failure_continues_to_other_windows_within_doc(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
+    # digest_map_window_chars を各チャンク単体より小さくし、節の異同ではなく
+    # 文字数予算だけで1チャンク=1windowへ分割させる（P5: group_into_windows は
+    # 節では強制分割しなくなったため）。
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
@@ -2167,7 +2174,9 @@ def test_digest_single_window_failure_continues_to_other_windows_within_doc(
             _reduce_answer([{"text": "アザラシは哺乳類", "sources": [1]}]),
         ]
     )
-    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+    service = ShelfService(
+        store, embedder, lambda name: backend, corpus_dir, digest_map_window_chars=20
+    )
 
     result = service.digest("nb")
 
@@ -2179,6 +2188,9 @@ def test_digest_single_window_failure_continues_to_other_windows_within_doc(
 def test_digest_all_windows_failing_records_doc_error_without_calling_reduce(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
+    # digest_map_window_chars を各チャンク単体より小さくし、節の異同ではなく
+    # 文字数予算だけで1チャンク=1windowへ分割させる（P5: group_into_windows は
+    # 節では強制分割しなくなったため）。
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
@@ -2198,7 +2210,9 @@ def test_digest_all_windows_failing_records_doc_error_without_calling_reduce(
             RawAnswer(text="", ok=False, error="timeout"),
         ]
     )
-    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+    service = ShelfService(
+        store, embedder, lambda name: backend, corpus_dir, digest_map_window_chars=20
+    )
 
     result = service.digest("nb")
 
