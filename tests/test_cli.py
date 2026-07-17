@@ -10,11 +10,16 @@ main() 経由でここに含める。
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from shelf import cli
 from shelf.cli import build_parser
+from shelf.indexer import IndexStats
+from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
+from tests.fakes import FakeEmbedder
 
 
 class TestServeCommand:
@@ -549,6 +554,356 @@ class TestRmDocNotebookMismatch:
         assert store.get_document("doc1") is None
 
 
+class TestIngestCommand:
+    """ingest サブコマンドの parser 解析テスト。"""
+
+    def test_parses_paths_as_list(self):
+        args = build_parser().parse_args(["ingest", "a.md", "b.md"])
+        assert args.command == "ingest"
+        assert args.paths == ["a.md", "b.md"]
+
+    def test_requires_at_least_one_path(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["ingest"])
+
+    def test_notebook_defaults_to_none(self):
+        args = build_parser().parse_args(["ingest", "a.md"])
+        assert args.notebook is None
+
+    def test_notebook_can_be_specified(self):
+        args = build_parser().parse_args(["ingest", "a.md", "--notebook", "physics"])
+        assert args.notebook == "physics"
+
+    def test_auto_shelve_defaults_to_false(self):
+        args = build_parser().parse_args(["ingest", "a.md"])
+        assert args.auto_shelve is False
+
+    def test_auto_shelve_can_be_set(self):
+        args = build_parser().parse_args(["ingest", "a.md", "--auto-shelve"])
+        assert args.auto_shelve is True
+
+    def test_digest_defaults_to_false(self):
+        args = build_parser().parse_args(["ingest", "a.md"])
+        assert args.digest is False
+
+    def test_digest_can_be_set(self):
+        args = build_parser().parse_args(["ingest", "a.md", "--digest"])
+        assert args.digest is True
+
+    def test_yes_defaults_to_false(self):
+        args = build_parser().parse_args(["ingest", "a.md"])
+        assert args.yes is False
+
+    def test_yes_can_be_set(self):
+        args = build_parser().parse_args(["ingest", "a.md", "--yes"])
+        assert args.yes is True
+
+
+class TestIngestOrchestrationRealAddAndIndex:
+    """LLM を一切呼ばずに add→index までを実データ(実 .md ファイル)で検証する。
+
+    ingest は各 add を auto_summary=False で呼ぶ設計にし(要約自動生成には LLM が
+    要るため)、backend_factory が一度でも呼ばれたら AssertionError で即座に
+    検出する。convert.py の raw コンバータ(.md はネットワーク・重依存なしで
+    そのまま読める)+ FakeEmbedder のみで完結する現実的な統合テスト。
+    """
+
+    @staticmethod
+    def _never_call_backend(name):
+        raise AssertionError(f"backend_factory は呼ばれてはいけない (name={name})")
+
+    def _build_real_service(self, tmp_path):
+        store = Store(":memory:")
+        corpus_dir = tmp_path / "corpus"
+        service = ShelfService(
+            store,
+            FakeEmbedder(),
+            self._never_call_backend,
+            corpus_dir,
+        )
+        return store, service
+
+    def test_creates_notebook_adds_files_and_indexes(self, monkeypatch, tmp_path, capsys):
+        store, service = self._build_real_service(tmp_path)
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: service)
+
+        doc1 = tmp_path / "doc1.md"
+        doc1.write_text("# タイトル1\n" + "本文1" * 60, encoding="utf-8")
+        doc2 = tmp_path / "doc2.md"
+        doc2.write_text("# タイトル2\n" + "本文2" * 60, encoding="utf-8")
+
+        cli.main(["ingest", str(doc1), str(doc2), "--notebook", "test", "--yes"])
+
+        assert store.get_notebook("test") is not None
+        assert len(store.list_documents("test")) == 2
+        captured = capsys.readouterr().out
+        assert "test" in captured
+        assert "indexed=" in captured
+
+    def test_reuses_existing_notebook_without_recreating(self, monkeypatch, tmp_path, capsys):
+        store, service = self._build_real_service(tmp_path)
+        store.create_notebook("test")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: service)
+
+        doc1 = tmp_path / "doc1.md"
+        doc1.write_text("本文" * 60, encoding="utf-8")
+
+        cli.main(["ingest", str(doc1), "--notebook", "test", "--yes"])
+
+        assert len(store.list_documents("test")) == 1
+
+    def test_yes_without_notebook_and_without_auto_shelve_reports_error(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        store, service = self._build_real_service(tmp_path)
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: service)
+
+        doc1 = tmp_path / "doc1.md"
+        doc1.write_text("本文" * 60, encoding="utf-8")
+
+        cli.main(["ingest", str(doc1), "--yes"])
+
+        assert store.list_notebooks() == []
+        captured = capsys.readouterr().out
+        assert "--notebook" in captured
+
+
+class TestIngestDigestDispatch:
+    """--digest が index の後に service.digest(notebook) を1回呼ぶことを検証する。"""
+
+    def test_digest_flag_calls_service_digest_after_index(self, monkeypatch, tmp_path, capsys):
+        calls = []
+
+        class _FakeService:
+            def create_notebook(self, name, description=None, backend=None):
+                calls.append(("create_notebook", name))
+
+            def add_source(self, notebook, origin, *, description=None, auto_summary=True):
+                calls.append(("add_source", notebook, origin, auto_summary))
+                return {"doc_id": "doc1"}
+
+            def index(self, notebook, full=False):
+                calls.append(("index", notebook))
+                return IndexStats(indexed=1, skipped=0, pruned=0, chunks_written=1, errors=0)
+
+            def digest(self, notebook, doc_id=None, *, force=False):
+                calls.append(("digest", notebook))
+                return {"result": "ok"}
+
+        store = Store(":memory:")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        doc1 = tmp_path / "doc1.md"
+        doc1.write_text("本文" * 60, encoding="utf-8")
+
+        cli.main(["ingest", str(doc1), "--notebook", "test", "--yes", "--digest"])
+
+        kinds = [c[0] for c in calls]
+        assert kinds == ["create_notebook", "add_source", "index", "digest"]
+        assert calls[1] == ("add_source", "test", str(doc1), False)
+
+
+class TestIngestAutoShelveDispatch:
+    """--auto-shelve は既存 shelve() を各 path に対して呼び、add/index を経由しない。"""
+
+    def test_auto_shelve_calls_service_shelve_per_path_and_skips_add_index(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        calls = []
+
+        class _FakeService:
+            def shelve(self, directory, *, dry_run=False):
+                calls.append(("shelve", directory, dry_run))
+                return {"directory": directory, "dry_run": dry_run, "added": [], "errors": []}
+
+        store = Store(":memory:")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["ingest", str(tmp_path), "--auto-shelve", "--yes"])
+
+        assert calls == [("shelve", str(tmp_path), False)]
+
+    def test_auto_shelve_with_digest_digests_each_affected_notebook(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        calls = []
+
+        class _FakeService:
+            def shelve(self, directory, *, dry_run=False):
+                calls.append(("shelve", directory))
+                return {
+                    "directory": directory,
+                    "dry_run": dry_run,
+                    "added": [{"doc_id": "d1", "origin": "a.md", "notebook": "nb_a"}],
+                    "errors": [],
+                }
+
+            def digest(self, notebook, doc_id=None, *, force=False):
+                calls.append(("digest", notebook))
+                return {"result": "ok"}
+
+        store = Store(":memory:")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["ingest", str(tmp_path), "--auto-shelve", "--yes", "--digest"])
+
+        kinds = [c[0] for c in calls]
+        assert kinds.count("shelve") == 1
+        assert ("digest", "nb_a") in calls
+
+    def test_auto_shelve_with_file_path_reports_error_and_skips_shelve(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """--auto-shelve の path にファイルを渡すと、shelve() は directory を
+        rglob するためファイルには空(投入0件/エラー0件)を返し無処理のまま
+        正常終了して見えてしまう(重大指摘)。ファイルパスは shelve() に渡さず
+        明示エラーを出す。
+        """
+
+        class _FakeService:
+            def shelve(self, directory, *, dry_run=False):
+                raise AssertionError("ファイルパスは shelve() に渡されてはいけない")
+
+        store = Store(":memory:")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        file_path = tmp_path / "doc.md"
+        file_path.write_text("本文", encoding="utf-8")
+
+        cli.main(["ingest", str(file_path), "--auto-shelve", "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "--auto-shelve" in captured
+        assert "ディレクトリ単位" in captured
+
+
+class TestSelectNotebookInteractively:
+    """_select_notebook_interactively(既存一覧を提示し対話選択・新規作成も可)。"""
+
+    def test_selects_existing_notebook_by_number(self):
+        scripted = iter(["2"])
+        name = cli._select_notebook_interactively(
+            ["physics", "biology"], input_func=lambda _p: next(scripted)
+        )
+        assert name == "biology"
+
+    def test_creates_new_notebook_when_zero_chosen(self):
+        scripted = iter(["0", "chemistry"])
+        name = cli._select_notebook_interactively(
+            ["physics"], input_func=lambda _p: next(scripted)
+        )
+        assert name == "chemistry"
+
+    def test_typed_name_is_used_directly_when_no_existing_notebooks(self):
+        scripted = iter(["newname"])
+        name = cli._select_notebook_interactively([], input_func=lambda _p: next(scripted))
+        assert name == "newname"
+
+
+class TestEmitMcpCommand:
+    """emit-mcp サブコマンドの parser 解析テスト。"""
+
+    def test_parses_with_defaults(self):
+        args = build_parser().parse_args(["emit-mcp"])
+        assert args.command == "emit-mcp"
+        assert args.host == "all"
+        assert args.transport == "stdio"
+        assert args.url is None
+        assert args.output_dir == "./mcp-config"
+
+    def test_host_choices(self):
+        for host in ("claude", "codex", "gemini", "all"):
+            args = build_parser().parse_args(["emit-mcp", "--host", host])
+            assert args.host == host
+
+    def test_rejects_unknown_host(self):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["emit-mcp", "--host", "unknown"])
+
+    def test_transport_choices(self):
+        for transport in ("stdio", "http"):
+            args = build_parser().parse_args(["emit-mcp", "--transport", transport])
+            assert args.transport == transport
+
+    def test_url_and_output_dir_can_be_specified(self):
+        args = build_parser().parse_args(
+            [
+                "emit-mcp",
+                "--transport",
+                "http",
+                "--url",
+                "http://100.64.0.1:8765/mcp",
+                "-o",
+                "/tmp/out",
+            ]
+        )
+        assert args.url == "http://100.64.0.1:8765/mcp"
+        assert args.output_dir == "/tmp/out"
+
+
+class TestEmitMcpDispatch:
+    """emit-mcp コマンドの main() が shelf.emit_mcp.emit へ正しく橋渡しすることを検証する。"""
+
+    def test_dispatches_all_hosts_by_default(self, monkeypatch, tmp_path, capsys):
+        calls = []
+
+        def fake_emit(**kwargs):
+            calls.append(kwargs)
+            return {"claude": tmp_path / "claude.sh"}
+
+        monkeypatch.setattr(cli.emit_mcp, "emit", fake_emit)
+
+        cli.main(["emit-mcp", "-o", str(tmp_path)])
+
+        assert len(calls) == 1
+        assert set(calls[0]["hosts"]) == {"claude", "codex", "gemini"}
+        assert calls[0]["transport"] == "stdio"
+        assert calls[0]["url"] is None
+        assert calls[0]["output_dir"] == tmp_path
+
+    def test_dispatches_single_host(self, monkeypatch, tmp_path, capsys):
+        calls = []
+
+        def fake_emit(**kwargs):
+            calls.append(kwargs)
+            return {"codex": tmp_path / "codex.toml"}
+
+        monkeypatch.setattr(cli.emit_mcp, "emit", fake_emit)
+
+        cli.main(["emit-mcp", "--host", "codex", "-o", str(tmp_path)])
+
+        assert calls[0]["hosts"] == ["codex"]
+
+    def test_http_requires_url_reports_friendly_error_without_calling_emit(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        calls = []
+        monkeypatch.setattr(cli.emit_mcp, "emit", lambda **kwargs: calls.append(kwargs))
+
+        cli.main(["emit-mcp", "--transport", "http", "-o", str(tmp_path)])
+
+        assert calls == []
+        captured = capsys.readouterr().out
+        assert "--url" in captured
+
+    def test_prints_written_file_paths(self, monkeypatch, tmp_path, capsys):
+        written = {"claude": tmp_path / "claude.sh", "readme": tmp_path / "README.md"}
+        monkeypatch.setattr(cli.emit_mcp, "emit", lambda **kwargs: written)
+
+        cli.main(["emit-mcp", "--host", "claude", "-o", str(tmp_path)])
+
+        captured = capsys.readouterr().out
+        assert str(tmp_path / "claude.sh") in captured
+        assert str(tmp_path / "README.md") in captured
+
+
 class TestShelveCommand:
     """shelve サブコマンドの parser 解析テスト。"""
 
@@ -572,6 +927,122 @@ class TestShelveCommand:
         """--dry-run フラグが設定可能。"""
         args = build_parser().parse_args(["shelve", "/tmp/dir", "--dry-run"])
         assert args.dry_run is True
+
+
+class TestSetupCommand:
+    """setup サブコマンドの parser 解析テスト。"""
+
+    def test_parses_with_no_args(self):
+        args = build_parser().parse_args(["setup"])
+        assert args.command == "setup"
+        assert args.yes is False
+        assert args.answers_file is None
+
+    def test_yes_flag_can_be_set(self):
+        args = build_parser().parse_args(["setup", "--yes"])
+        assert args.yes is True
+
+    def test_answers_file_can_be_specified(self):
+        args = build_parser().parse_args(["setup", "--answers-file", "answers.json"])
+        assert args.answers_file == "answers.json"
+
+
+class TestSetupDispatch:
+    """setup コマンドの main() が shelf.setup の関数群を正しく橋渡しすることを検証する。
+
+    実 config.env には一切触れず、config.resolve_config_path を tmp_path 配下へ
+    差し替えて検証する(他コマンドと同じ「実ファイル/実DBに触れない」流儀)。
+    """
+
+    def test_answers_file_takes_precedence_and_writes_config_env(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        answers_path = tmp_path / "answers.json"
+        answers_path.write_text(json.dumps({"provider": "gemini"}), encoding="utf-8")
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--answers-file", str(answers_path), "--yes"])
+
+        written = config_path.read_text(encoding="utf-8")
+        assert "SHELF_DEFAULT_BACKEND=gemini" in written
+        captured = capsys.readouterr().out
+        assert str(config_path) in captured
+
+    def test_yes_without_answers_file_writes_hardcoded_defaults(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--yes"])
+
+        written = config_path.read_text(encoding="utf-8")
+        assert f"SHELF_DEFAULT_BACKEND={cli.config.DEFAULT_BACKEND}" in written
+
+    def test_interactive_path_used_when_neither_yes_nor_answers_file(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+        calls = []
+        monkeypatch.setattr(
+            cli.setup,
+            "collect_answers_interactively",
+            lambda: (calls.append("called") or cli.setup.default_answers()),
+        )
+
+        cli.main(["setup"])
+
+        assert calls == ["called"]
+        assert config_path.exists()
+
+
+class TestSetupDispatchErrors:
+    """setup の異常系(不正JSON・存在しないanswers-file・書込み不可)を、persona
+    コマンドの既存作法(cli.py:501付近)に合わせて日本語エラーメッセージへ整形し、
+    生の例外をユーザーに露出させないことを検証する。
+    """
+
+    def test_invalid_json_answers_file_reports_japanese_error(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        answers_path = tmp_path / "answers.json"
+        answers_path.write_text("{ この JSON は壊れている", encoding="utf-8")
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--answers-file", str(answers_path), "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
+        assert not config_path.exists()
+
+    def test_missing_answers_file_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        answers_path = tmp_path / "does-not-exist.json"
+        config_path = tmp_path / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--answers-file", str(answers_path), "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
+        assert not config_path.exists()
+
+    def test_unwritable_config_dir_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        readonly_dir = tmp_path / "readonly"
+        readonly_dir.mkdir()
+        readonly_dir.chmod(0o000)
+        config_path = readonly_dir / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        try:
+            cli.main(["setup", "--yes"])
+        finally:
+            readonly_dir.chmod(0o755)
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
 
 
 class TestShelveDispatch:

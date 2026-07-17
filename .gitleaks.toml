@@ -1,0 +1,12 @@
+# gitleaks 設定。tests/ 配下の検知はマスキング機能を検証するための
+# 意図的なダミー秘密情報（sk-ABCDEF... 等の架空値）であり、実際の資格情報ではない。
+# 本体コード（shelf/）は allowlist に含めない — そちらでの検知は本物の混入として扱う。
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "マスキング検証用のダミー秘密情報（テストフィクスチャ）"
+paths = [
+  '''tests/.*\.py$''',
+]

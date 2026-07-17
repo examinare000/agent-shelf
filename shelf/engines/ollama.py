@@ -47,6 +47,22 @@ def build_payload(prompt: str, model: str, schema: dict | None) -> dict:
     return payload
 
 
+def is_reachable(url: str, *, timeout: float = 1.0) -> bool:
+    """指定 URL の Ollama デーモンに HTTP 疎通できるかを確認する（`shelf setup` の
+    ローカル LLM 自動検出用）。
+
+    urllib.request の import は本ファイル（design doc §9-C の import ガード）に
+    限定されるため、shelf/setup.py はこの関数を経由してのみ HTTP 疎通確認できる。
+    /api/tags はモデル一覧取得用の軽量エンドポイントで、応答の中身は見ない
+    （疎通確認だけが目的で、レスポンス本文の解釈はここでは不要なため）。
+    """
+    try:
+        with urlopen(Request(f"{url}/api/tags"), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 class OllamaBackend:
     """Ollama /api/chat を使用するローカル LLM エンジン実装（RTX 4060 8GB 実機想定）。
 

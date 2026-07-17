@@ -376,6 +376,47 @@ class TestOllamaBackendAnswer:
         assert backend.name == "ollama"
 
 
+class TestIsReachable:
+    """is_reachable(url)（shelf setup のローカル LLM 自動検出が使う）のテスト。
+
+    urlopen をモンキーパッチし、実ネットワークには一切触れない
+    （TestOllamaBackendAnswer と同じ作法）。urllib.request の import は本ファイル
+    （ollama.py）に限定されるため（test_boundaries.py）、shelf/setup.py はここを
+    経由してのみ HTTP 疎通を確認できる。
+    """
+
+    def test_returns_true_when_urlopen_succeeds(self, monkeypatch):
+        def fake_urlopen(req, timeout=None):
+            return _FakeHTTPResponse(b"{}")
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        assert ollama_module.is_reachable("http://127.0.0.1:11434") is True
+
+    def test_returns_false_when_urlopen_raises(self, monkeypatch):
+        def fake_urlopen(req, timeout=None):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        assert ollama_module.is_reachable("http://127.0.0.1:11434") is False
+
+    def test_passes_timeout_and_tags_endpoint_to_urlopen(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["timeout"] = timeout
+            return _FakeHTTPResponse(b"{}")
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        ollama_module.is_reachable("http://127.0.0.1:11434", timeout=2.5)
+
+        assert captured["url"] == "http://127.0.0.1:11434/api/tags"
+        assert captured["timeout"] == 2.5
+
+
 class TestCreateBackend:
     """create_backend（factory）のテスト。"""
 
