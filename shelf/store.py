@@ -246,8 +246,9 @@ class Store:
         ).fetchone()
 
     def _rebuild_fts(self) -> None:
-        # keyword_topk 冒頭の遅延同期フックからのみ呼ぶ（§ 遅延 rebuild）。content=
-        # 外部コンテンツテーブルなのでトリガーではなくこの明示 rebuild で追従させる
+        # _init_fts の一度きりの移行バックフィル専用（コードレビュー指摘#10により
+        # keyword_topk からの read-time 遅延呼び出しは廃止）。content= 外部
+        # コンテンツテーブルなのでトリガーではなくこの明示 rebuild で追従させる
         # （設計判断: トリガーは使わない方針）。呼び出し元の commit に相乗りする
         # ため、ここ自体ではコミットしない。
         if self.fts_enabled:
@@ -262,22 +263,88 @@ class Store:
         _logger.warning("chunks_fts の%sに失敗したためキーワード検索を無効化します: %r", context, exc)
         self.fts_enabled = False
 
-    def _sync_fts_if_stale(self) -> None:
-        # chunks への書き込みごとに rebuild していた旧実装は、indexer.py の
-        # delete_by_source_file→upsert_chunks（1ファイルにつき2回）や一括投入で
-        # O(N^2) 的コストになっていた（コードレビュー指摘#2）。書き込み側の
-        # _bump_generation は既に全ての chunks 変更経路を網羅しているため、
-        # ここでは「chunks_fts が最後に同期された generation」を meta に永続化し、
-        # 現在の generation とズレていれば読み取り時に1回だけ rebuild する
-        # （プロセス内キャッシュの generation 無効化と同じ発想を read-time
-        # rebuild に転用）。meta 永続なのでプロセス跨ぎ・再起動後も正しく検知できる
-        # （初回・fts_generation 未記録時は必ず rebuild する）。
-        current = self._current_generation()
-        synced = self.get_meta("fts_generation")
-        if synced is not None and int(synced) == current:
+    def _fts_capture_rows(self, where_clause: str, params: tuple) -> list[tuple[int, str]]:
+        """外部コンテンツ FTS の 'delete' コマンドに必要な (rowid, text) を、
+        chunks の上書き/削除より前に退避する（delete コマンドは索引時と同じ
+        テキストを渡す必要があるため、上書き後では取得できない）。where_clause は
+        呼び出し元（Store 内部メソッド）が固定文字列で渡す内部専用引数であり、
+        値は全て params 経由のバインドパラメータになるため f-string 直書きでも
+        injection の懸念はない（_add_missing_columns と同様の設計判断）。
+        """
+        if not self.fts_enabled:
+            return []
+        try:
+            rows = self._conn.execute(
+                f"SELECT rowid, text FROM chunks WHERE {where_clause}", params
+            ).fetchall()
+        except sqlite3.Error as exc:
+            self._fts_disable_after_failure("退避読み取り", exc)
+            return []
+        return [(row["rowid"], row["text"]) for row in rows]
+
+    def _fts_capture_rows_by_ids(self, ids: list[str]) -> list[tuple[int, str]]:
+        """id 群に対応する chunks_fts delete 用 (rowid, text) を退避する。
+        get_chunks（_GET_CHUNKS_BATCH_SIZE）と同じ分割単位で IN 句を分割する
+        （コードレビュー指摘: 無分割の IN (...) は1ファイルのチャンクが多い場合に
+        SQLite のバインドパラメータ上限（環境依存）を超えて sqlite3.Error となり、
+        _fts_disable_after_failure でキーワード検索全体が静かに停止していた）。
+        """
+        if not ids:
+            return []
+        rows: list[tuple[int, str]] = []
+        for start in range(0, len(ids), self._GET_CHUNKS_BATCH_SIZE):
+            batch = ids[start : start + self._GET_CHUNKS_BATCH_SIZE]
+            rows.extend(
+                self._fts_capture_rows(f"id IN ({','.join('?' for _ in batch)})", tuple(batch))
+            )
+        return rows
+
+    def _fts_delete_rows(self, rows: list[tuple[int, str]]) -> None:
+        """_fts_capture_rows で退避した (rowid, text) を chunks_fts から削除する。"""
+        if not self.fts_enabled or not rows:
             return
-        self._rebuild_fts()
-        self.set_meta("fts_generation", str(current))
+        try:
+            self._conn.executemany(
+                "INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', ?, ?)",
+                rows,
+            )
+        except sqlite3.Error as exc:
+            self._fts_disable_after_failure("削除同期", exc)
+
+    def _fts_insert_rows(self, ids: list[str]) -> None:
+        """id 群に対応する現在の (rowid, text) を chunks から読み直し、
+        chunks_fts へ挿入する（upsert 直後に呼ぶことで、新規行・更新行の
+        双方を一括で反映できる。更新行は ON CONFLICT DO UPDATE で rowid が
+        据え置かれるため、_fts_delete_rows の削除対象と同じ rowid に
+        insert し直すことになる）。get_chunks と同じ _GET_CHUNKS_BATCH_SIZE 件
+        ごとにバッチ分割する（コードレビュー指摘: IN句バッチ分割欠如）。
+        """
+        if not self.fts_enabled or not ids:
+            return
+        for start in range(0, len(ids), self._GET_CHUNKS_BATCH_SIZE):
+            if not self.fts_enabled:
+                # 前バッチの失敗で _fts_disable_after_failure により既に
+                # 無効化されている場合、以降のバッチは実行しない。
+                return
+            batch = ids[start : start + self._GET_CHUNKS_BATCH_SIZE]
+            self._fts_insert_rows_batch(batch)
+
+    def _fts_insert_rows_batch(self, ids: list[str]) -> None:
+        """_fts_insert_rows の1バッチ分（最大 _GET_CHUNKS_BATCH_SIZE 件）を処理する。"""
+        # placeholders は "?" の個数分の定型文字列で、実データ(ids)は全て
+        # 後続のバインドパラメータとして渡すため f-string 直書きでも
+        # injection の懸念はない。
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            rows = self._conn.execute(
+                f"SELECT rowid, text FROM chunks WHERE id IN ({placeholders})", ids
+            ).fetchall()
+            self._conn.executemany(
+                "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+                [(row["rowid"], row["text"]) for row in rows],
+            )
+        except sqlite3.Error as exc:
+            self._fts_disable_after_failure("挿入同期", exc)
 
     # -- generation（ベクタキャッシュ無効化用カウンタ） ---------------------------
 
@@ -347,6 +414,9 @@ class Store:
                 "SELECT DISTINCT source_path FROM chunks WHERE notebook = ?", (name,)
             ).fetchall()
         ]
+        # コードレビュー指摘#10: notebook 削除でも chunks_fts の該当行を行単位で
+        # 削除する（他の chunk 削除経路と同様、上書き前に (rowid, text) を退避）。
+        old_fts_rows = self._fts_capture_rows("notebook = ?", (name,))
         self._conn.execute("DELETE FROM chunks WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM study_notes WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM document_tags WHERE notebook = ?", (name,))
@@ -355,6 +425,7 @@ class Store:
         for source_path in source_paths:
             self._conn.execute("DELETE FROM file_state WHERE source_file = ?", (source_path,))
         self._bump_generation()
+        self._fts_delete_rows(old_fts_rows)
         self._conn.commit()
 
     # -- document --------------------------------------------------------------
@@ -465,6 +536,13 @@ class Store:
     def upsert_chunks(self, rows: list[dict]) -> None:
         """rows の各 dict は id/notebook/doc_id/source_path/seq/text/embedding が必須、
         section/page/kind は省略可（kind 既定 'body'）。dim は embedding の長さから自動算出する。"""
+        ids = [row["id"] for row in rows]
+        # コードレビュー指摘#10: 書き込み時に chunks_fts を行単位で同期することで、
+        # 読み取りパス（keyword_topk）での全コーパス再構築を不要にする。既存 id への
+        # 上書き（ON CONFLICT DO UPDATE）は旧テキストの索引を残さないよう、上書き前に
+        # (rowid, text) を退避しておく（新規 id は何もヒットせず、退避は空になる）。
+        # _fts_capture_rows_by_ids が get_chunks と同じ単位で IN 句を分割する。
+        old_fts_rows = self._fts_capture_rows_by_ids(ids)
         values = [
             (
                 row["id"],
@@ -502,11 +580,17 @@ class Store:
             values,
         )
         self._bump_generation()
+        # 上書き前の旧索引を消してから、上書き後の現在値で入れ直す。新規 id は
+        # old_fts_rows に含まれないため単純追加になる。
+        self._fts_delete_rows(old_fts_rows)
+        self._fts_insert_rows(ids)
         self._conn.commit()
 
     def delete_by_source_file(self, source_path: str) -> None:
+        old_fts_rows = self._fts_capture_rows("source_path = ?", (source_path,))
         self._conn.execute("DELETE FROM chunks WHERE source_path = ?", (source_path,))
         self._bump_generation()
+        self._fts_delete_rows(old_fts_rows)
         self._conn.commit()
 
     def get_chunk(self, id: str) -> dict | None:
@@ -518,6 +602,8 @@ class Store:
             (id,),
         ).fetchone()
         return None if row is None else dict(row)
+
+    _GET_CHUNKS_BATCH_SIZE = 500  # SQLite バインドパラメータ上限を踏まえた分割単位。
 
     def list_chunks(self, notebook: str, doc_id: str, *, kind: str = "body") -> list[dict]:
         """doc_id 内の指定 kind のチャンクを seq 昇順で返す（map-reduce 学び抽出の入力用）。
@@ -544,12 +630,14 @@ class Store:
         `(chunk_id, bm25スコア)` のリストを bm25 昇順（値が小さいほど良い一致＝
         fts5 の仕様）で返す。fts_enabled=False（fts5/trigram 非対応環境）・
         空/空白のみのクエリ・不正な MATCH 構文（ユーザー由来の生クエリなので
-        例外にせず劣化させる）は全て `[]` を返す（呼び出し側=search.py が
-        キーワード検索を諦めてベクタ検索のみにフォールバックできるように）。
+        例外にせず劣化させる）・read-only DB やモジュール消失等の実行時エラーは
+        全て `[]` を返す（呼び出し側=search.py がキーワード検索を諦めてベクタ検索
+        のみにフォールバックできるように）。chunks_fts の同期は upsert_chunks 等の
+        書き込み経路側で完了済みのため、ここでは読み取りのみを行う（コードレビュー
+        指摘#10）。
         """
         if not self.fts_enabled:
             return []
-        self._sync_fts_if_stale()
         if not fts_query.strip():
             return []
         try:
@@ -564,7 +652,11 @@ class Store:
                 """,
                 (fts_query, notebook, limit),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.Error as exc:
+            # コードレビュー指摘#1: MATCH SELECT 自体の失敗（read-only DB・
+            # fts5 モジュール消失等）も例外にせず劣化させる。以前は書き込みを
+            # 伴う遅延同期がこの try/except の外側にあり、この契約を破っていた。
+            self._fts_disable_after_failure("読み取り", exc)
             return []
         return [(row["id"], row["score"]) for row in rows]
 
