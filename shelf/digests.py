@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 
 from shelf.ports import StudyNote
@@ -386,21 +387,36 @@ def _union_chunk_ids(notes: list[StudyNote]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def normalize_tag(raw: object) -> str | None:
-    """タグ 1 件を正規化する: NFKC 正規化 → strip → lower → 連続空白を "-" に置換。
+_TAG_DISALLOWED_CHARS = re.compile(r"[^\w\-]", re.UNICODE)
+_TAG_REPEATED_HYPHENS = re.compile(r"-+")
 
-    unicodedata は json と並ぶ標準ライブラリであり、test_boundaries.py の
+
+def normalize_tag(raw: object) -> str | None:
+    """タグ 1 件を正規化する: NFKC 正規化 → strip → lower → 連続空白を "-" に置換
+    → 文字種許可リストで記号を除去 → 連続ハイフン圧縮・前後ハイフン除去。
+
+    unicodedata/re は json と並ぶ標準ライブラリであり、test_boundaries.py の
     _RESTRICTED_TO_OWNER（sqlite3/subprocess/fastembed 等の外部 SDK 限定）には
     含まれないため digests.py からの import 制約に抵触しない
     （モジュール冒頭の「json + ports.py のみ」は外部 SDK ゼロという意図であり、
     stdlib 全般を禁止する制約ではないと判断した）。
-    非 str・正規化後に空・30 字超はいずれもタグとして無効なため None を返す
+
+    文字種許可リストを設けるのはコードレビュー指摘#8対応: LLM が抽出したタグは
+    service._build_catalog 経由で司書ルーティングのプロンプトに常時混入する
+    （routing.py _format_card）ため、引用符・コロン・角括弧等でプロンプト構造を
+    乱そうとする間接プロンプト注入の経路になり得る。\\w（Unicode対応、CJK・かな
+    を含む）とハイフンのみを残すことで、空白正規化後に紛れ込む記号を落とす
+    （改行は空白置換で既に混入不可能）。アンダースコアは \\w に含まれるが無害な
+    ため許可のまま維持する。
+    非 str・記号除去後に空・30 字超はいずれもタグとして無効なため None を返す
     （呼び出し側 normalize_tags がまとめて除外する）。
     """
     if not isinstance(raw, str):
         return None
     normalized = unicodedata.normalize("NFKC", raw).strip().lower()
     normalized = "-".join(normalized.split())
+    normalized = _TAG_DISALLOWED_CHARS.sub("", normalized)
+    normalized = _TAG_REPEATED_HYPHENS.sub("-", normalized).strip("-")
     if not normalized or len(normalized) > 30:
         return None
     return normalized

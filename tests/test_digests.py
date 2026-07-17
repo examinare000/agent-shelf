@@ -653,6 +653,17 @@ class TestNormalizeTag:
     def test_returns_none_for_31_chars(self):
         assert normalize_tag("あ" * 31) is None
 
+    def test_strips_quotes_colons_and_brackets(self):
+        # コードレビュー指摘#8: LLM生成タグは司書ルーティングのカタログ経由で
+        # プロンプトに混入するため、記号を落として間接プロンプト注入を緩和する。
+        assert normalize_tag('quantum`: [inject]"') == "quantum-inject"
+
+    def test_returns_none_when_only_symbols_remain(self):
+        assert normalize_tag("!!!") is None
+
+    def test_preserves_japanese_while_stripping_surrounding_brackets(self):
+        assert normalize_tag("「量子力学」") == "量子力学"
+
 
 class TestNormalizeTags:
     def test_drops_none_results(self):
