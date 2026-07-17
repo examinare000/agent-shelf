@@ -461,6 +461,10 @@ class ShelfService:
                     "note_id": chunk.id,
                     "source": chunk.source_path,
                     "text": chunk.text[:QUOTE_MAX_LEN],
+                    # additive: map-reduce パイプライン(§7-B)が付与した代表節・
+                    # ページを、既存キー・トップレベル形状を変えずに追加する。
+                    "section": chunk.section,
+                    "page": chunk.page,
                 }
             )
         return insights

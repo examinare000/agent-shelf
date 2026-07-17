@@ -1560,12 +1560,58 @@ def test_ask_returns_insights_built_from_retrieved_digest_chunks(
             "note_id": "nb_digest/doc#-2",
             "source": "nb_digest/doc.md",
             "text": "whales migrate long distances",
+            "section": None,
+            "page": None,
         }
     ]
     assert result["citations"] == [
         {
             "n": 1, "chunk_id": "nb_digest/doc#0", "source": "nb_digest/doc.md",
             "section": None, "page": None, "quote": _CHUNK_TEXT,
+        }
+    ]
+
+
+def test_ask_insight_includes_section_and_page_from_digest_chunk(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """insights エントリは additive に section/page を持つ（既存キーは不変・§7-B）。"""
+    store.create_notebook("nb_digest", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_digest/doc#0", "notebook": "nb_digest", "doc_id": "doc",
+                "source_path": "nb_digest/doc.md", "section": None, "page": None,
+                "seq": 0, "text": _CHUNK_TEXT, "embedding": _KNOWN_VEC, "kind": "body",
+            },
+            {
+                "id": "nb_digest/doc#-2", "notebook": "nb_digest", "doc_id": "doc",
+                "source_path": "nb_digest/doc.md", "section": "§2.3", "page": 7,
+                "seq": -2, "text": "whales migrate long distances", "embedding": _KNOWN_VEC,
+                "kind": "digest",
+            },
+        ]
+    )
+    local_embedder = FakeEmbedder(dim=8, known={_QUERY_TEXT: _KNOWN_VEC})
+    payload = {
+        "answer": "whales eat krill [S1] and migrate [L1]",
+        "citations": [{"s": 1}],
+        "insights": [{"l": 1}],
+        "confident": True,
+    }
+    backend = FakeAnswerBackend(canned=RawAnswer(text=json.dumps(payload), ok=True, error=None))
+    service = ShelfService(store, local_embedder, lambda name: backend, tmp_path)
+
+    result = service.ask("nb_digest", _QUERY_TEXT)
+
+    assert result["insights"] == [
+        {
+            "l": 1,
+            "note_id": "nb_digest/doc#-2",
+            "source": "nb_digest/doc.md",
+            "text": "whales migrate long distances",
+            "section": "§2.3",
+            "page": 7,
         }
     ]
 
