@@ -1091,3 +1091,66 @@ class TestShelveDispatch:
         cli.main(["shelve", "/tmp/dir"])
 
         assert calls == [("/tmp/dir", False)]
+
+
+class TestBuildServiceWiring:
+    """_build_service() が config.py の値を ShelfService コンストラクタへ正しく
+    橋渡しすることを検証する。実 ONNX モデルの読み込み(FastEmbedEmbedder)だけを
+    軽量フェイクに差し替え、DB は _build_store を ":memory:" に差し替えて実ファイルに
+    触れない（TestRmDocNotebookMismatch と同じ「_build_store 差し替え」作法）。
+    ShelfService 自体は cli.ShelfService を fake に差し替えて kwargs を記録する
+    （backend_factory/mask/convert 等は呼び出し時まで実行されないクロージャ/軽量な
+    純粋関数のため差し替え不要）。
+    """
+
+    def test_wires_hybrid_search_from_config(self, monkeypatch):
+        import shelf.embedder as embedder_module
+
+        captured_kwargs: dict = {}
+
+        class _FakeEmbedder:
+            def __init__(self, model_name: str) -> None:
+                self.model_name = model_name
+
+        class _FakeShelfService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(embedder_module, "FastEmbedEmbedder", _FakeEmbedder)
+        monkeypatch.setattr(cli, "_build_store", lambda: Store(":memory:"))
+        monkeypatch.setattr(cli, "ShelfService", _FakeShelfService)
+        monkeypatch.setattr(cli.config, "HYBRID_SEARCH", False)
+
+        cli._build_service()
+
+        assert captured_kwargs["hybrid_search"] is False
+
+    def test_wires_digest_settings_from_config(self, monkeypatch):
+        # コードレビュー指摘#7: _build_service() が config.py の digest 関連設定
+        # (digest_map_notes/digest_map_window_chars/digest_backend) を ShelfService
+        # へ正しく橋渡ししていることのテスト補完(既存の hybrid_search 配線テストと
+        # 同じ「_build_store/_build_service 差し替え」作法)。
+        import shelf.embedder as embedder_module
+
+        captured_kwargs: dict = {}
+
+        class _FakeEmbedder:
+            def __init__(self, model_name: str) -> None:
+                self.model_name = model_name
+
+        class _FakeShelfService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(embedder_module, "FastEmbedEmbedder", _FakeEmbedder)
+        monkeypatch.setattr(cli, "_build_store", lambda: Store(":memory:"))
+        monkeypatch.setattr(cli, "ShelfService", _FakeShelfService)
+        monkeypatch.setattr(cli.config, "DIGEST_MAP_NOTES", 7)
+        monkeypatch.setattr(cli.config, "DIGEST_MAP_WINDOW_CHARS", 1234)
+        monkeypatch.setattr(cli.config, "DIGEST_BACKEND", "gemini")
+
+        cli._build_service()
+
+        assert captured_kwargs["digest_map_notes"] == 7
+        assert captured_kwargs["digest_map_window_chars"] == 1234
+        assert captured_kwargs["digest_backend"] == "gemini"

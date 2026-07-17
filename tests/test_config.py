@@ -199,10 +199,11 @@ def test_route_fallback_env_override(monkeypatch):
     importlib.reload(config)
 
 
-def test_digest_max_notes_default_matches_digests_module_default():
-    # digests.py は config を import しない設計（§3 依存方向）なので値を直接埋め込むが、
-    # 現物の digests.DIGEST_DEFAULT_MAX_NOTES と矛盾しないことをここで固定する。
-    assert config.DIGEST_MAX_NOTES == 5
+def test_digest_max_notes_default_matches_reduce_phase_default():
+    # map-reduce パイプライン化(digests.build_reduce_prompt の既定 max_notes=20)に伴い、
+    # reduce 後に1資料あたり保持する学びノート数の既定上限を単発生成時代の5から20へ
+    # 拡大した(旧 digests.DIGEST_DEFAULT_MAX_NOTES=5 は単発生成向けの控えめな値だった)。
+    assert config.DIGEST_MAX_NOTES == 20
 
 
 def test_digest_max_notes_env_override(monkeypatch):
@@ -217,28 +218,64 @@ def test_digest_max_notes_invalid_value_falls_back_to_default(monkeypatch):
     with monkeypatch.context() as m:
         m.setenv("SHELF_DIGEST_MAX_NOTES", "not-a-number")
         importlib.reload(config)
-        assert config.DIGEST_MAX_NOTES == 5
+        assert config.DIGEST_MAX_NOTES == 20
     importlib.reload(config)
 
 
-def test_digest_input_max_chars_default_matches_digests_module_default():
-    # digests.DIGEST_INPUT_MAX_CHARS(4000) と矛盾しない既定値であることを固定する。
-    assert config.DIGEST_INPUT_MAX_CHARS == 4000
+def test_digest_map_notes_default_is_five():
+    # map フェーズは1ウィンドウあたりの上限であり、reduce 後の DIGEST_MAX_NOTES(20)
+    # とは独立した控えめな既定値にする(1ウィンドウから20件も学びが出るのは過剰)。
+    assert config.DIGEST_MAP_NOTES == 5
 
 
-def test_digest_input_max_chars_env_override(monkeypatch):
+def test_digest_map_notes_env_override(monkeypatch):
     with monkeypatch.context() as m:
-        m.setenv("SHELF_DIGEST_INPUT_MAX_CHARS", "2000")
+        m.setenv("SHELF_DIGEST_MAP_NOTES", "3")
         importlib.reload(config)
-        assert config.DIGEST_INPUT_MAX_CHARS == 2000
+        assert config.DIGEST_MAP_NOTES == 3
     importlib.reload(config)
 
 
-def test_digest_input_max_chars_invalid_value_falls_back_to_default(monkeypatch):
+def test_digest_map_notes_invalid_value_falls_back_to_default(monkeypatch):
     with monkeypatch.context() as m:
-        m.setenv("SHELF_DIGEST_INPUT_MAX_CHARS", "abc")
+        m.setenv("SHELF_DIGEST_MAP_NOTES", "abc")
         importlib.reload(config)
-        assert config.DIGEST_INPUT_MAX_CHARS == 4000
+        assert config.DIGEST_MAP_NOTES == 5
+    importlib.reload(config)
+
+
+def test_digest_map_window_chars_default_matches_digests_module_default():
+    # digests.WINDOW_DEFAULT_CHARS(8000)と矛盾しない既定値であることをここで固定する。
+    assert config.DIGEST_MAP_WINDOW_CHARS == 8000
+
+
+def test_digest_map_window_chars_env_override(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_DIGEST_MAP_WINDOW_CHARS", "4000")
+        importlib.reload(config)
+        assert config.DIGEST_MAP_WINDOW_CHARS == 4000
+    importlib.reload(config)
+
+
+def test_digest_map_window_chars_invalid_value_falls_back_to_default(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_DIGEST_MAP_WINDOW_CHARS", "abc")
+        importlib.reload(config)
+        assert config.DIGEST_MAP_WINDOW_CHARS == 8000
+    importlib.reload(config)
+
+
+def test_digest_backend_default_is_empty_string():
+    # 空文字列 = 未指定。ROUTER_BACKEND と同じ「空=呼び出し側(service.py)が
+    # notebook backend へフォールバックする」流儀。
+    assert config.DIGEST_BACKEND == ""
+
+
+def test_digest_backend_env_override(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_DIGEST_BACKEND", "ollama")
+        importlib.reload(config)
+        assert config.DIGEST_BACKEND == "ollama"
     importlib.reload(config)
 
 
@@ -253,6 +290,30 @@ def test_shelve_backend_env_override(monkeypatch):
         m.setenv("SHELF_SHELVE_BACKEND", "codex")
         importlib.reload(config)
         assert config.SHELVE_BACKEND == "codex"
+    importlib.reload(config)
+
+
+def test_hybrid_search_default_is_true():
+    # ベクトル検索単体では拾えないキーワード一致を取りこぼさないよう、既定で
+    # ベクトル＋FTS5キーワードのハイブリッド検索を有効にする（brief既定値）。
+    assert config.HYBRID_SEARCH is True
+
+
+@pytest.mark.parametrize("value", ["1", "true", "True", "TRUE"])
+def test_hybrid_search_env_truthy_values(monkeypatch, value):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_HYBRID_SEARCH", value)
+        importlib.reload(config)
+        assert config.HYBRID_SEARCH is True
+    importlib.reload(config)
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", ""])
+def test_hybrid_search_env_falsy_values(monkeypatch, value):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_HYBRID_SEARCH", value)
+        importlib.reload(config)
+        assert config.HYBRID_SEARCH is False
     importlib.reload(config)
 
 

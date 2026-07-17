@@ -86,6 +86,22 @@ class TestNotebookCard:
         with pytest.raises(dataclasses.FrozenInstanceError):
             card.name = "other"
 
+    def test_tags_defaults_to_empty_tuple(self):
+        """既存呼び出し箇所（旧 _build_catalog）は tags を渡さない。
+        空タプル既定で後方互換を保つ（additive 拡張）。
+        """
+        card = NotebookCard(name="nb", description=None, persona=None, doc_count=0)
+
+        assert card.tags == ()
+
+    def test_tags_can_be_set_explicitly(self):
+        card = NotebookCard(
+            name="nb", description=None, persona=None, doc_count=0,
+            tags=("量子力学", "スピン"),
+        )
+
+        assert card.tags == ("量子力学", "スピン")
+
 
 class TestRouteTarget:
     def test_constructs_with_notebook_score_subquery_reason(self):
@@ -158,6 +174,39 @@ class TestStudyNote:
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             note.text = "別の本文"
+
+    def test_chunk_ids_defaults_to_empty_tuple(self):
+        """span のみを組み立てる呼び出し箇所（chunk_ids 未対応の場面）は
+        chunk_ids を渡さない。空タプル既定で後方互換を保つ（additive 拡張）。
+        """
+        note = StudyNote(text="学び本文")
+
+        assert note.chunk_ids == ()
+
+    def test_chunk_ids_can_be_set_explicitly(self):
+        note = StudyNote(text="学び本文", chunk_ids=("nb/doc#0", "nb/doc#1"))
+
+        assert note.chunk_ids == ("nb/doc#0", "nb/doc#1")
+
+    def test_section_defaults_to_none(self):
+        note = StudyNote(text="学び本文")
+
+        assert note.section is None
+
+    def test_section_can_be_set_explicitly(self):
+        note = StudyNote(text="学び本文", section="§2.1")
+
+        assert note.section == "§2.1"
+
+    def test_page_defaults_to_none(self):
+        note = StudyNote(text="学び本文")
+
+        assert note.page is None
+
+    def test_page_can_be_set_explicitly(self):
+        note = StudyNote(text="学び本文", page=42)
+
+        assert note.page == 42
 
 
 class TestFileSummary:

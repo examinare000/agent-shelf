@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -77,17 +78,36 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 -- 検索対象化は indexer が本テーブルを読み、kind='digest' チャンクとして chunks に
 -- upsert する（study_notes 自体は embedding を持たない = ここではただの記録）。
 CREATE TABLE IF NOT EXISTS study_notes (
-  id          TEXT PRIMARY KEY,          -- {notebook}/{doc_id}#d{n}
-  notebook    TEXT NOT NULL,
-  doc_id      TEXT NOT NULL,
-  seq         INTEGER NOT NULL,          -- doc 内の学び連番（0 起点）
-  text        TEXT NOT NULL,             -- 学び本文（mask 適用済み）
-  source_span TEXT,                      -- 由来（節・ページ範囲等）任意
-  source_hash TEXT,                      -- 生成時点の正規化 md ハッシュ（陳腐化検出）
-  model       TEXT,                      -- 生成に使ったモデル名（例 qwen3:8b）
-  created_at  TEXT NOT NULL,
+  id               TEXT PRIMARY KEY,     -- {notebook}/{doc_id}#d{n}
+  notebook         TEXT NOT NULL,
+  doc_id           TEXT NOT NULL,
+  seq              INTEGER NOT NULL,     -- doc 内の学び連番（0 起点）
+  text             TEXT NOT NULL,        -- 学び本文（mask 適用済み）
+  source_span      TEXT,                 -- 由来（節・ページ範囲等）任意
+  source_hash      TEXT,                 -- 生成時点の正規化 md ハッシュ（陳腐化検出）
+  model            TEXT,                 -- 生成に使ったモデル名（例 qwen3:8b）
+  created_at       TEXT NOT NULL,
+  -- 代表チャンクの節パンくず・ページ（全文グラウンディング改良: 接地元の人間可読表示）。
+  section          TEXT,
+  page             INTEGER,
+  -- 接地元チャンク id の JSON 配列文字列（例 '["nb/doc#3","nb/doc#5"]'）。
+  -- store 層は JSON 文字列で永続化し、list_study_notes で list に復元して返す。
+  source_chunk_ids TEXT,
+  -- 生成パイプライン版数。旧=1（単発生成・既定）、map-reduce=2。
+  pipeline         INTEGER NOT NULL DEFAULT 1,
   UNIQUE(notebook, doc_id, seq)
 );
+
+-- 文書タグ（学び抽出パイプラインが文書単位に付与するラベル。notebook 横断の
+-- タグ一覧・絞り込み用途）。doc_id 単位の delete-then-insert で管理する。
+CREATE TABLE IF NOT EXISTS document_tags (
+  doc_id      TEXT NOT NULL,
+  notebook    TEXT NOT NULL,
+  tag         TEXT NOT NULL,
+  PRIMARY KEY (doc_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_document_tags_tag ON document_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_document_tags_notebook ON document_tags(notebook);
 """
 
 
@@ -114,9 +134,12 @@ class Store:
         self._migrate_documents_columns()
         self._migrate_notebooks_columns()
         self._migrate_chunks_columns()
+        self._migrate_study_notes_columns()
         # notebook 単位のベクトル行列キャッシュ: {notebook: (generation, ids, matrix)}。
         # generation が現在値と一致する間は SQLite に再クエリしない（§ ベクタキャッシュ）。
         self._vector_cache: dict[str, tuple[int, list[str], np.ndarray]] = {}
+        self.fts_enabled = False
+        self._init_fts()
 
     def close(self) -> None:
         self._conn.close()
@@ -148,6 +171,77 @@ class Store:
         # SQLite の ALTER TABLE ... DEFAULT は既存行にも遡って値を埋めるため、
         # 追加直後から既存行を含めて NOT NULL 制約と既定値が両立する。
         self._add_missing_columns("chunks", {"kind": "TEXT NOT NULL DEFAULT 'body'"})
+
+    def _migrate_study_notes_columns(self) -> None:
+        # 旧スキーマ DB（section/page/source_chunk_ids/pipeline 列なし）を開いても
+        # チャンク接地・パイプライン版数付き学びノートが使えるようにする。
+        # pipeline は kind と同様、ALTER TABLE ... DEFAULT 1 で既存行にも遡って
+        # 値を補完する（旧形式=単発生成パイプラインは常に 1）。
+        self._add_missing_columns(
+            "study_notes",
+            {
+                "section": "TEXT",
+                "page": "INTEGER",
+                "source_chunk_ids": "TEXT",
+                "pipeline": "INTEGER NOT NULL DEFAULT 1",
+            },
+        )
+
+    def _init_fts(self) -> None:
+        # fts5 の trigram tokenizer は SQLite のビルドオプション次第で使えない
+        # 環境があるため、作成に失敗したら fts_enabled=False にフェイルソフトする
+        # （キーワード検索は諦めるが、他の永続化機能はブロックしない）。
+        # sqlite_master を CREATE 前に見ておくことで「今回新規作成したか」を判定し、
+        # 新規作成時のみ既存 chunks から一括バックフィルする（毎起動 rebuild は無駄）。
+        already_existed = (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+            ).fetchone()
+            is not None
+        )
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5("
+                "text, content='chunks', content_rowid='rowid', tokenize='trigram')"
+            )
+        except sqlite3.OperationalError:
+            self._conn.rollback()
+            self.fts_enabled = False
+            return
+        self.fts_enabled = True
+        if not already_existed:
+            # 新規作成時のみ既存 chunks から一括バックフィルする。この時点で
+            # 現在の generation との同期が取れているので fts_generation に
+            # 記録しておき、直後の最初の keyword_topk 呼び出しでの無駄な
+            # 二重 rebuild を避ける。
+            self._rebuild_fts()
+            self.set_meta("fts_generation", str(self._current_generation()))
+        self._conn.commit()
+
+    def _rebuild_fts(self) -> None:
+        # keyword_topk 冒頭の遅延同期フックからのみ呼ぶ（§ 遅延 rebuild）。content=
+        # 外部コンテンツテーブルなのでトリガーではなくこの明示 rebuild で追従させる
+        # （設計判断: トリガーは使わない方針）。呼び出し元の commit に相乗りする
+        # ため、ここ自体ではコミットしない。
+        if self.fts_enabled:
+            self._conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+
+    def _sync_fts_if_stale(self) -> None:
+        # chunks への書き込みごとに rebuild していた旧実装は、indexer.py の
+        # delete_by_source_file→upsert_chunks（1ファイルにつき2回）や一括投入で
+        # O(N^2) 的コストになっていた（コードレビュー指摘#2）。書き込み側の
+        # _bump_generation は既に全ての chunks 変更経路を網羅しているため、
+        # ここでは「chunks_fts が最後に同期された generation」を meta に永続化し、
+        # 現在の generation とズレていれば読み取り時に1回だけ rebuild する
+        # （プロセス内キャッシュの generation 無効化と同じ発想を read-time
+        # rebuild に転用）。meta 永続なのでプロセス跨ぎ・再起動後も正しく検知できる
+        # （初回・fts_generation 未記録時は必ず rebuild する）。
+        current = self._current_generation()
+        synced = self.get_meta("fts_generation")
+        if synced is not None and int(synced) == current:
+            return
+        self._rebuild_fts()
+        self.set_meta("fts_generation", str(current))
 
     # -- generation（ベクタキャッシュ無効化用カウンタ） ---------------------------
 
@@ -219,6 +313,7 @@ class Store:
         ]
         self._conn.execute("DELETE FROM chunks WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM study_notes WHERE notebook = ?", (name,))
+        self._conn.execute("DELETE FROM document_tags WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM documents WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM notebooks WHERE name = ?", (name,))
         for source_path in source_paths:
@@ -324,6 +419,7 @@ class Store:
     def delete_document(self, id: str) -> None:
         self._conn.execute("DELETE FROM chunks WHERE doc_id = ?", (id,))
         self._conn.execute("DELETE FROM study_notes WHERE doc_id = ?", (id,))
+        self._conn.execute("DELETE FROM document_tags WHERE doc_id = ?", (id,))
         self._conn.execute("DELETE FROM documents WHERE id = ?", (id,))
         self._bump_generation()
         self._conn.commit()
@@ -387,6 +483,95 @@ class Store:
         ).fetchone()
         return None if row is None else dict(row)
 
+    def list_chunks(self, notebook: str, doc_id: str, *, kind: str = "body") -> list[dict]:
+        """doc_id 内の指定 kind のチャンクを seq 昇順で返す（map-reduce 学び抽出の入力用）。
+
+        id 辞書順ではなく seq 昇順で返す必要がある: digests.group_into_windows が
+        隣接チャンクの連続性（同じ節が固まっていること）を前提にウィンドウ境界を
+        判定するため、chunker.py が付与した元の並び順を保つ（get_chunk が単一 id
+        取得なのに対し、こちらは 1 doc 分をまとめて読む用途）。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT id, section, page, seq, text
+            FROM chunks
+            WHERE notebook = ? AND doc_id = ? AND kind = ?
+            ORDER BY seq
+            """,
+            (notebook, doc_id, kind),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def keyword_topk(self, notebook: str, fts_query: str, limit: int) -> list[tuple[str, float]]:
+        """全文グラウンディング改良のハイブリッド検索用キーワード索引。
+
+        `(chunk_id, bm25スコア)` のリストを bm25 昇順（値が小さいほど良い一致＝
+        fts5 の仕様）で返す。fts_enabled=False（fts5/trigram 非対応環境）・
+        空/空白のみのクエリ・不正な MATCH 構文（ユーザー由来の生クエリなので
+        例外にせず劣化させる）は全て `[]` を返す（呼び出し側=search.py が
+        キーワード検索を諦めてベクタ検索のみにフォールバックできるように）。
+        """
+        if not self.fts_enabled:
+            return []
+        self._sync_fts_if_stale()
+        if not fts_query.strip():
+            return []
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT c.id AS id, bm25(chunks_fts) AS score
+                FROM chunks_fts
+                JOIN chunks c ON c.rowid = chunks_fts.rowid
+                WHERE chunks_fts MATCH ? AND c.notebook = ?
+                ORDER BY score
+                LIMIT ?
+                """,
+                (fts_query, notebook, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(row["id"], row["score"]) for row in rows]
+
+    # -- document_tags（文書タグ。学び抽出パイプラインが付与） -------------------
+
+    def replace_document_tags(self, notebook: str, doc_id: str, tags: list[str]) -> None:
+        """doc_id の既存タグを全削除してから tags を書き込む（replace_study_notes と
+        同じ delete-then-insert の流儀。再生成時に前回分が残留しないようにする）。
+        """
+        self._conn.execute("DELETE FROM document_tags WHERE doc_id = ?", (doc_id,))
+        if tags:
+            self._conn.executemany(
+                "INSERT INTO document_tags (doc_id, notebook, tag) VALUES (?, ?, ?)",
+                [(doc_id, notebook, tag) for tag in tags],
+            )
+        self._conn.commit()
+
+    def list_document_tags(self, notebook: str, doc_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT tag FROM document_tags WHERE notebook = ? AND doc_id = ? ORDER BY tag",
+            (notebook, doc_id),
+        ).fetchall()
+        return [row["tag"] for row in rows]
+
+    def list_tags_by_notebook(self, limit_per_notebook: int = 15) -> dict[str, list[str]]:
+        """notebook ごとに、タグが付いた doc 数の降順（同数はタグ名昇順で決定的に）で
+        上位 limit_per_notebook 件のタグ名を返す。UI のタグ一覧・絞り込み候補表示用。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT notebook, tag, COUNT(DISTINCT doc_id) AS doc_count
+            FROM document_tags
+            GROUP BY notebook, tag
+            ORDER BY notebook, doc_count DESC, tag ASC
+            """
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            bucket = result.setdefault(row["notebook"], [])
+            if len(bucket) < limit_per_notebook:
+                bucket.append(row["tag"])
+        return result
+
     # -- study_notes（学びノート・source-of-truth。indexer が kind='digest' チャンク化） ----
 
     def replace_study_notes(self, notebook: str, doc_id: str, notes: list[dict]) -> None:
@@ -395,8 +580,12 @@ class Store:
         `shelf digest --force` の再生成や失敗リトライで「前回分が残ったまま重複する」
         ことを避けるため、insert-or-update ではなく delete-then-insert で「今の状態」
         を過不足なく反映する。notes の各 dict は text が必須、source_span/source_hash/
-        model は省略可。id は "{notebook}/{doc_id}#d{n}"（n は 0 起点連番）で決定的に
-        生成する（§4-A）。
+        model/section/page/source_chunk_ids/pipeline は省略可（既存呼び出し元は
+        section 以降を渡さない旧形式 dict のままでよい＝後方互換）。id は
+        "{notebook}/{doc_id}#d{n}"（n は 0 起点連番）で決定的に生成する（§4-A）。
+        source_chunk_ids は接地元チャンク id の list[str] を渡す（store 層で
+        JSON 文字列に変換して永続化する。呼び出し側=service は list のまま
+        扱えばよい）。
         """
         self._conn.execute(
             "DELETE FROM study_notes WHERE notebook = ? AND doc_id = ?", (notebook, doc_id)
@@ -413,6 +602,12 @@ class Store:
                 note.get("source_hash"),
                 note.get("model"),
                 created_at,
+                note.get("section"),
+                note.get("page"),
+                json.dumps(note["source_chunk_ids"])
+                if note.get("source_chunk_ids") is not None
+                else None,
+                note.get("pipeline") if note.get("pipeline") is not None else 1,
             )
             for seq, note in enumerate(notes)
         ]
@@ -421,8 +616,8 @@ class Store:
                 """
                 INSERT INTO study_notes
                     (id, notebook, doc_id, seq, text, source_span, source_hash, model,
-                     created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     created_at, section, page, source_chunk_ids, pipeline)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -431,7 +626,8 @@ class Store:
     def list_study_notes(self, notebook: str, doc_id: str | None = None) -> list[dict]:
         query = (
             "SELECT id, notebook, doc_id, seq, text, source_span, source_hash, model, "
-            "created_at FROM study_notes WHERE notebook = ?"
+            "created_at, section, page, source_chunk_ids, pipeline "
+            "FROM study_notes WHERE notebook = ?"
         )
         params: tuple[str, ...] = (notebook,)
         if doc_id is not None:
@@ -439,7 +635,15 @@ class Store:
             params += (doc_id,)
         query += " ORDER BY doc_id, seq"
         rows = self._conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+        notes = []
+        for row in rows:
+            note = dict(row)
+            # DB 上は JSON 文字列で持つ（sqlite3 が list を直接扱えないため）。
+            # 呼び出し側は list[str] | None として素直に扱えるようここで復元する。
+            raw_chunk_ids = note["source_chunk_ids"]
+            note["source_chunk_ids"] = json.loads(raw_chunk_ids) if raw_chunk_ids else None
+            notes.append(note)
+        return notes
 
     def load_vectors(self, notebook: str) -> tuple[list[str], np.ndarray]:
         """cosine 検索用に notebook 内の全ベクトルを1つの行列としてロードする。

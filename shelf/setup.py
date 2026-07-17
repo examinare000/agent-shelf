@@ -25,10 +25,24 @@ from shelf.engines.ollama import is_reachable
 
 # 学びの粒度プリセット（設計書タスク仕様 §1-3）。english キーはJSON/内部表現用、
 # 画面表示は日本語ラベルで行う（GRANULARITY_LABELS）。
+#
+# digest_input_max_chars は旧単発生成パイプライン（digest 1資料を先頭4000字だけ
+# 1回のLLM呼び出しで要約）専用の値だった。map-reduce パイプライン化（service.py
+# DIGEST_PIPELINE_VERSION=2）に伴い、対応する設定は config.DIGEST_MAP_WINDOW_CHARS
+# （env SHELF_DIGEST_MAP_WINDOW_CHARS）に置き換わったが、この2つは意味が異なる:
+# 旧は「1資料の先頭から何字を読むか」の入力上限で、値が大きいほど『fine(細かい)』
+# （2000→8000で fine ほど大きい）という直感的な対応だった。新の window_chars は
+# 「mapフェーズ1ウィンドウの分割単位」で、値が小さいほどウィンドウ数が増えて
+# 抽出される学びノート総数が増える＝fine 方向という、旧設定とは逆方向の関係になる。
+# 単純に値を差し替えると「fine なのに window_chars が大きい(粗い方向)」という
+# 矛盾したプリセットになってしまうため、ここでは書き込みのみを削除し、
+# window_chars をプリセットへ組み込むのは見送った（新パイプラインでの適切な
+# 既定値・方向性は要別途設計判断・完了報告に明記）。粒度は既存の digest_max_notes
+# （文書全体で保持する学びノート数）と top_k で引き続き制御する。
 GRANULARITY_PRESETS: dict[str, dict[str, int]] = {
-    "coarse": {"digest_max_notes": 3, "digest_input_max_chars": 2000, "top_k": 5},
-    "standard": {"digest_max_notes": 5, "digest_input_max_chars": 4000, "top_k": 10},
-    "fine": {"digest_max_notes": 10, "digest_input_max_chars": 8000, "top_k": 20},
+    "coarse": {"digest_max_notes": 10, "top_k": 5},
+    "standard": {"digest_max_notes": 20, "top_k": 10},
+    "fine": {"digest_max_notes": 40, "top_k": 20},
 }
 GRANULARITY_LABELS: dict[str, str] = {
     "coarse": "粗い",
@@ -74,7 +88,6 @@ def default_answers() -> dict:
         "granularity": _DEFAULT_GRANULARITY,
         # None = 選択したプリセットの値をそのまま使う（resolve_granularity 参照）。
         "digest_max_notes": None,
-        "digest_input_max_chars": None,
         "top_k": None,
         "corpus_dir": str(config.CORPUS_DIR),
         "db_path": str(config.DB_PATH),
@@ -90,7 +103,7 @@ def resolve_granularity(answers: dict) -> dict:
         answers.get("granularity", _DEFAULT_GRANULARITY), GRANULARITY_PRESETS[_DEFAULT_GRANULARITY]
     )
     resolved = dict(preset)
-    for key in ("digest_max_notes", "digest_input_max_chars", "top_k"):
+    for key in ("digest_max_notes", "top_k"):
         override = answers.get(key)
         if override is not None:
             resolved[key] = override
@@ -116,7 +129,6 @@ def answers_to_config_values(answers: dict) -> dict[str, str]:
         "SHELF_DEFAULT_BACKEND": answers["provider"],
         "SHELF_ROUTER_BACKEND": answers["router_backend"],
         "SHELF_DIGEST_MAX_NOTES": str(granularity["digest_max_notes"]),
-        "SHELF_DIGEST_INPUT_MAX_CHARS": str(granularity["digest_input_max_chars"]),
         "SHELF_TOP_K": str(granularity["top_k"]),
         "SHELF_CORPUS_DIR": answers["corpus_dir"],
         "SHELF_DB_PATH": answers["db_path"],
@@ -203,7 +215,6 @@ def collect_answers_interactively(
         input_func, print_func, "粒度プリセット", defaults["granularity"]
     )
     digest_max_notes = defaults["digest_max_notes"]
-    digest_input_max_chars = defaults["digest_input_max_chars"]
     top_k = defaults["top_k"]
 
     print_func("== 4. 配置 ==")
@@ -222,7 +233,6 @@ def collect_answers_interactively(
         "router_backend": router_backend,
         "granularity": granularity,
         "digest_max_notes": digest_max_notes,
-        "digest_input_max_chars": digest_input_max_chars,
         "top_k": top_k,
         "corpus_dir": corpus_dir,
         "db_path": db_path,

@@ -208,13 +208,16 @@ def _build_service() -> ShelfService:
         default_backend=config.DEFAULT_BACKEND,
         top_k=config.TOP_K,
         deep_dive=config.DEEP_DIVE,
+        hybrid_search=config.HYBRID_SEARCH,
         mask=mask,
         converter=convert,
         router_backend=config.ROUTER_BACKEND,
         route_top_n=config.ROUTE_TOP_N,
         route_fallback=config.ROUTE_FALLBACK,
         digest_max_notes=config.DIGEST_MAX_NOTES,
-        digest_input_max_chars=config.DIGEST_INPUT_MAX_CHARS,
+        digest_map_notes=config.DIGEST_MAP_NOTES,
+        digest_map_window_chars=config.DIGEST_MAP_WINDOW_CHARS,
+        digest_backend=config.DIGEST_BACKEND,
         shelve_backend=config.SHELVE_BACKEND,
     )
 

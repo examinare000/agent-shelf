@@ -10,6 +10,7 @@ import sqlite3
 import numpy as np
 import pytest
 
+from shelf.search import build_fts_query
 from shelf.store import DuplicateNotebookError, Store, UnknownNotebookError
 
 
@@ -849,3 +850,558 @@ class TestMeta:
         store.set_meta("model", "old")
         store.set_meta("model", "new")
         assert store.get_meta("model") == "new"
+
+
+class TestStudyNotesGrounding:
+    """学びノートのチャンク接地（section/page/source_chunk_ids）とパイプライン版数。
+
+    「学び抽出の全文グラウンディング改良」第1ステップ（永続層のみ）。
+    """
+
+    def test_replace_study_notes_round_trips_grounding_fields(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes(
+            "physics",
+            "doc1",
+            [
+                {
+                    "text": "学び1",
+                    "section": "§3.2",
+                    "page": 42,
+                    "source_chunk_ids": ["physics/doc1#3", "physics/doc1#5"],
+                    "pipeline": 2,
+                }
+            ],
+        )
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["section"] == "§3.2"
+        assert note["page"] == 42
+        assert note["source_chunk_ids"] == ["physics/doc1#3", "physics/doc1#5"]
+        assert note["pipeline"] == 2
+
+    def test_replace_study_notes_defaults_pipeline_to_1_when_omitted(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes("physics", "doc1", [{"text": "学び1"}])
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["pipeline"] == 1
+
+    def test_replace_study_notes_defaults_pipeline_to_1_when_explicitly_none(self, store):
+        # コードレビュー指摘#4: note.get("pipeline", 1) は明示的な None を素通しし、
+        # pipeline 列は NOT NULL 制約なので IntegrityError になっていた。
+        # source_chunk_ids と同じ「is not None」パターンに揃え、None を渡した場合も
+        # 省略時と同じ既定値1にフォールバックする。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes("physics", "doc1", [{"text": "学び1", "pipeline": None}])
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["pipeline"] == 1
+
+    def test_replace_study_notes_with_legacy_dict_without_new_keys_still_works(self, store):
+        # service.py の既存呼び出し元は section/page/source_chunk_ids/pipeline を
+        # 渡さない（旧形式 dict）。互換性が壊れていないことを確認する。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes(
+            "physics",
+            "doc1",
+            [{"text": "学び1", "source_span": "§1", "source_hash": "h1", "model": "qwen3:8b"}],
+        )
+
+        note = store.list_study_notes("physics", "doc1")[0]
+        assert note["text"] == "学び1"
+        assert note["section"] is None
+        assert note["page"] is None
+        assert note["source_chunk_ids"] is None
+        assert note["pipeline"] == 1
+
+    def test_list_study_notes_source_chunk_ids_defaults_to_none_when_absent(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_study_notes("physics", "doc1", [{"text": "学び1"}])
+
+        note = store.list_study_notes("physics", "doc1")[0]
+
+        assert note["source_chunk_ids"] is None
+
+
+class TestStudyNotesGroundingSchemaMigration:
+    """旧スキーマ DB（study_notes に section/page/source_chunk_ids/pipeline 列を
+    欠く）を開いた際の冪等マイグレーションを検証する。
+    """
+
+    def _create_legacy_db(self, db_path):
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE notebooks (
+              name        TEXT PRIMARY KEY,
+              description TEXT,
+              backend     TEXT NOT NULL DEFAULT 'codex',
+              created_at  TEXT NOT NULL,
+              persona     TEXT
+            );
+            CREATE TABLE documents (
+              id              TEXT PRIMARY KEY,
+              notebook        TEXT NOT NULL REFERENCES notebooks(name),
+              origin          TEXT NOT NULL,
+              origin_type     TEXT NOT NULL,
+              normalized_path TEXT NOT NULL,
+              title           TEXT,
+              converter       TEXT NOT NULL,
+              content_hash    TEXT,
+              added_at        TEXT NOT NULL,
+              fetched_at      TEXT,
+              description        TEXT,
+              description_source TEXT,
+              UNIQUE(notebook, origin)
+            );
+            CREATE TABLE study_notes (
+              id          TEXT PRIMARY KEY,
+              notebook    TEXT NOT NULL,
+              doc_id      TEXT NOT NULL,
+              seq         INTEGER NOT NULL,
+              text        TEXT NOT NULL,
+              source_span TEXT,
+              source_hash TEXT,
+              model       TEXT,
+              created_at  TEXT NOT NULL,
+              UNIQUE(notebook, doc_id, seq)
+            );
+            INSERT INTO notebooks (name, description, backend, created_at)
+                VALUES ('physics', '物理の論文', 'codex', '2026-01-01T00:00:00Z');
+            INSERT INTO documents
+                (id, notebook, origin, origin_type, normalized_path, converter, added_at)
+                VALUES ('doc1', 'physics', 'feynman.pdf', 'pdf', 'corpus/physics/doc1.md',
+                        'pymupdf4llm', '2026-01-01T00:00:00Z');
+            INSERT INTO study_notes
+                (id, notebook, doc_id, seq, text, created_at)
+                VALUES ('physics/doc1#d0', 'physics', 'doc1', 0, '既存の学び',
+                        '2026-01-01T00:00:00Z');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def test_init_migrates_columns_and_existing_rows_default_pipeline_to_1(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        self._create_legacy_db(db_path)
+
+        store = Store(db_path)
+        try:
+            note = store.list_study_notes("physics", "doc1")[0]
+            assert note["text"] == "既存の学び"
+            assert note["section"] is None
+            assert note["page"] is None
+            assert note["source_chunk_ids"] is None
+            # ALTER TABLE ... DEFAULT 1 は既存行にも遡って値を入れる。
+            assert note["pipeline"] == 1
+        finally:
+            store.close()
+
+    def test_init_migration_is_idempotent_across_two_opens(self, tmp_path):
+        db_path = tmp_path / "legacy.db"
+        self._create_legacy_db(db_path)
+
+        store1 = Store(db_path)
+        store1.close()
+        store2 = Store(db_path)  # 2回目の open で ALTER TABLE の重複エラーが出ないことを確認
+        try:
+            note = store2.list_study_notes("physics", "doc1")[0]
+            assert note["pipeline"] == 1
+            store2.replace_study_notes(
+                "physics", "doc1", [{"text": "新しい学び", "pipeline": 2}]
+            )
+            assert store2.list_study_notes("physics", "doc1")[0]["pipeline"] == 2
+        finally:
+            store2.close()
+
+
+class TestDocumentTags:
+    def test_replace_then_list_document_tags_round_trips(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_document_tags("physics", "doc1", ["量子力学", "相対論"])
+
+        assert store.list_document_tags("physics", "doc1") == ["相対論", "量子力学"]
+
+    def test_replace_document_tags_overwrites_existing(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["旧タグ"])
+
+        store.replace_document_tags("physics", "doc1", ["新タグ"])
+
+        assert store.list_document_tags("physics", "doc1") == ["新タグ"]
+
+    def test_replace_document_tags_with_empty_list_clears(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["タグ"])
+
+        store.replace_document_tags("physics", "doc1", [])
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_list_document_tags_returns_empty_for_no_tags(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_delete_document_cascades_document_tags(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["タグ"])
+
+        store.delete_document("doc1")
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_delete_notebook_cascades_document_tags(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["タグ"])
+
+        store.delete_notebook("physics")
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_list_tags_by_notebook_orders_by_doc_count_desc_then_tag_asc(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="physics", origin="doc2.pdf",
+                        normalized_path="corpus/physics/doc2.md")
+        _make_document(store, id_="doc3", notebook="physics", origin="doc3.pdf",
+                        normalized_path="corpus/physics/doc3.md")
+        # 「量子力学」は2文書、「相対論」「熱力学」は1文書ずつ（同数はタグ名昇順で決定的に）。
+        store.replace_document_tags("physics", "doc1", ["量子力学", "熱力学"])
+        store.replace_document_tags("physics", "doc2", ["量子力学", "相対論"])
+        store.replace_document_tags("physics", "doc3", [])
+
+        result = store.list_tags_by_notebook()
+
+        # SQLite 既定の BINARY collation（UTF-8 バイト順=コードポイント順）で昇順。
+        # 「熱」(U+71B1) < 「相」(U+76F8) のため熱力学が相対論より先に来る。
+        assert result["physics"] == ["量子力学", "熱力学", "相対論"]
+
+    def test_list_tags_by_notebook_respects_limit_per_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["a", "b", "c", "d"])
+
+        result = store.list_tags_by_notebook(limit_per_notebook=2)
+
+        assert result["physics"] == ["a", "b"]
+
+    def test_list_tags_by_notebook_groups_separately_per_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="math", origin="doc2.pdf",
+                        normalized_path="corpus/math/doc2.md")
+        store.replace_document_tags("physics", "doc1", ["物理タグ"])
+        store.replace_document_tags("math", "doc2", ["数学タグ"])
+
+        result = store.list_tags_by_notebook()
+
+        assert result == {"physics": ["物理タグ"], "math": ["数学タグ"]}
+
+    def test_list_tags_by_notebook_returns_empty_dict_when_no_tags(self, store):
+        _make_notebook(store, name="physics")
+
+        assert store.list_tags_by_notebook() == {}
+
+
+class TestListChunks:
+    """doc 単位・kind 別のチャンク一覧取得（map-reduce 学び抽出の入力用）。"""
+
+    def test_list_chunks_returns_rows_in_seq_order(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#1", seq=1, text="2番目"),
+                _chunk_row(id_="doc1#0", seq=0, text="1番目"),
+            ]
+        )
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert [r["text"] for r in rows] == ["1番目", "2番目"]
+        assert [r["id"] for r in rows] == ["doc1#0", "doc1#1"]
+
+    def test_list_chunks_returns_id_section_page_seq_text(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [_chunk_row(id_="doc1#0", section="§3.2", page=42, text="本文")]
+        )
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert rows == [
+            {"id": "doc1#0", "section": "§3.2", "page": 42, "seq": 0, "text": "本文"}
+        ]
+
+    def test_list_chunks_defaults_to_kind_body_and_excludes_other_kinds(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        body_row = _chunk_row(id_="doc1#0", seq=0, text="本文")
+        digest_row = _chunk_row(id_="doc1#-2", seq=-2, text="学び")
+        digest_row["kind"] = "digest"
+        store.upsert_chunks([body_row, digest_row])
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert [r["id"] for r in rows] == ["doc1#0"]
+
+    def test_list_chunks_respects_explicit_kind(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        digest_row = _chunk_row(id_="doc1#-2", seq=-2, text="学び")
+        digest_row["kind"] = "digest"
+        store.upsert_chunks([digest_row])
+
+        rows = store.list_chunks("physics", "doc1", kind="digest")
+
+        assert [r["id"] for r in rows] == ["doc1#-2"]
+
+    def test_list_chunks_scopes_to_notebook_and_doc_id(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="physics", origin="doc2.pdf",
+                        normalized_path="corpus/physics/doc2.md")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", doc_id="doc1", source_path="corpus/physics/doc1.md"),
+                _chunk_row(id_="doc2#0", doc_id="doc2", source_path="corpus/physics/doc2.md"),
+            ]
+        )
+
+        rows = store.list_chunks("physics", "doc1")
+
+        assert [r["id"] for r in rows] == ["doc1#0"]
+
+    def test_list_chunks_returns_empty_list_when_no_chunks(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        assert store.list_chunks("physics", "doc1") == []
+
+
+class TestKeywordTopK:
+    """FTS5（trigram tokenizer）によるキーワード検索索引 chunks_fts。"""
+
+    def test_fts_enabled_is_true_on_this_sqlite_build(self, store):
+        # このプロジェクトの動作環境（uv 管理の Python）は fts5+trigram が有効な
+        # SQLite にリンクされている前提（実装ノート参照）。無効ならフェイルソフト
+        # パス（別テストで検証）が働くはずなのでここでは有効を確認する。
+        assert store.fts_enabled is True
+
+    def test_keyword_topk_returns_matching_chunk_ids_ordered_by_relevance(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", text="quantum entanglement basics quantum quantum"),
+                _chunk_row(id_="doc1#1", seq=1, text="classical mechanics overview"),
+            ]
+        )
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_filters_by_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="math", origin="doc2.pdf",
+                        normalized_path="corpus/math/doc2.md")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", notebook="physics", doc_id="doc1",
+                           text="quantum entanglement"),
+                _chunk_row(id_="doc2#0", notebook="math", doc_id="doc2",
+                           source_path="corpus/math/doc2.md", text="quantum computing basics"),
+            ]
+        )
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_reflects_new_chunks_after_upsert(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="classical mechanics")])
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+        store.upsert_chunks([_chunk_row(id_="doc1#1", seq=1, text="quantum entanglement")])
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#1"]
+
+    def test_keyword_topk_excludes_deleted_chunks(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        assert len(store.keyword_topk("physics", "quantum", limit=10)) == 1
+
+        store.delete_by_source_file("corpus/physics/doc1.md")
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+    def test_keyword_topk_returns_empty_list_for_blank_query(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        assert store.keyword_topk("physics", "   ", limit=10) == []
+        assert store.keyword_topk("physics", "", limit=10) == []
+
+    def test_keyword_topk_returns_empty_list_for_invalid_match_syntax(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        # 未閉じの引用符は fts5 MATCH 構文エラーになる（ユーザー由来クエリなので
+        # 例外にせず劣化させる）。
+        assert store.keyword_topk("physics", '"unterminated', limit=10) == []
+
+    def test_keyword_topk_returns_empty_list_when_fts_disabled(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store.fts_enabled = False  # fts5/trigram が使えない環境の劣化パスを強制検証
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+    def test_keyword_topk_hits_japanese_natural_sentence_via_build_fts_query(self, store):
+        # コードレビュー指摘#1の再現/回帰テスト: build_fts_query が空白分割のままだと
+        # スペースなしの日本語自然文が丸ごと1フレーズになりtrigram索引に一致せず
+        # 常に0件になる(ハイブリッド検索が日本語で無言のno-opになる不具合)。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [_chunk_row(id_="doc1#0", text="量子力学の基礎について解説する資料です。")]
+        )
+
+        hits = store.keyword_topk(
+            "physics", build_fts_query("量子力学の基礎について教えてください"), limit=10
+        )
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_hits_mixed_ascii_and_japanese_query(self, store):
+        # ASCII語("Python")のみを含むチャンクとCJKグラムのみが一致するチャンクを
+        # 分けて置くことで、ASCII語ヒットとCJKグラムヒットの両方が独立に効くこと
+        # を検証する(旧実装は空白区切りの1トークン全体一致を要求するため、
+        # 完全一致しないdoc1#1側は不具合下では拾えない)。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", text="Python is a great language for prototyping."),
+                _chunk_row(id_="doc1#1", seq=1, text="型システムに関する解説記事です。"),
+            ]
+        )
+
+        hits = store.keyword_topk(
+            "physics", build_fts_query("Python の型システムについて"), limit=10
+        )
+
+        assert {chunk_id for chunk_id, _score in hits} == {"doc1#0", "doc1#1"}
+
+
+class TestFtsLazyRebuild:
+    """chunks_fts の再構築(_rebuild_fts=`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`)
+    を書き込みごとに無条件実行するのではなく、次回の keyword_topk 呼び出し時に
+    generation とのズレを検知して1回だけ遅延実行する(コードレビュー指摘#2)。
+    indexer.py はファイルごとに delete_by_source_file→upsert_chunks を呼ぶため、
+    書き込みごとの即時 rebuild は一括投入で O(N^2) 的コストになっていた。
+    """
+
+    @staticmethod
+    def _count_rebuilds(store, monkeypatch) -> dict[str, int]:
+        original = store._rebuild_fts
+        counter = {"n": 0}
+
+        def counting():
+            counter["n"] += 1
+            return original()
+
+        monkeypatch.setattr(store, "_rebuild_fts", counting)
+        return counter
+
+    def test_upsert_chunks_does_not_rebuild_fts_immediately(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        assert counter["n"] == 0
+
+    def test_two_consecutive_keyword_topk_calls_rebuild_fts_only_once(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        store.keyword_topk("physics", "quantum", limit=10)
+        store.keyword_topk("physics", "quantum", limit=10)
+
+        assert counter["n"] == 1
+
+    def test_write_then_keyword_topk_finds_new_chunk_and_rebuilds_once(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="classical mechanics")])
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+        store.upsert_chunks([_chunk_row(id_="doc1#1", seq=1, text="quantum entanglement")])
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#1"]
+        assert counter["n"] == 1
+
+    def test_reopening_store_with_new_instance_stays_in_sync(self, tmp_path):
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        _make_notebook(store1, name="physics")
+        _make_document(store1, id_="doc1", notebook="physics")
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store1.close()
+
+        store2 = Store(str(db_path))
+        try:
+            hits = store2.keyword_topk("physics", "quantum", limit=10)
+        finally:
+            store2.close()
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_returns_empty_list_when_fts_disabled_without_rebuild(
+        self, store, monkeypatch
+    ):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store.fts_enabled = False
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert counter["n"] == 0

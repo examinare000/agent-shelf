@@ -73,6 +73,8 @@ def _format_card(card: NotebookCard) -> str:
         meta.append(f"概要: {card.description}")
     if card.persona is not None:
         meta.append(f"専門家像: {card.persona}")
+    if card.tags:
+        meta.append(f"タグ: {', '.join(card.tags)}")
     return "\n".join(meta)
 
 
