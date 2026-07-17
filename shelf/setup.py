@@ -40,9 +40,9 @@ from shelf.engines.ollama import is_reachable
 # 既定値・方向性は要別途設計判断・完了報告に明記）。粒度は既存の digest_max_notes
 # （文書全体で保持する学びノート数）と top_k で引き続き制御する。
 GRANULARITY_PRESETS: dict[str, dict[str, int]] = {
-    "coarse": {"digest_max_notes": 3, "top_k": 5},
-    "standard": {"digest_max_notes": 5, "top_k": 10},
-    "fine": {"digest_max_notes": 10, "top_k": 20},
+    "coarse": {"digest_max_notes": 10, "top_k": 5},
+    "standard": {"digest_max_notes": 20, "top_k": 10},
+    "fine": {"digest_max_notes": 40, "top_k": 20},
 }
 GRANULARITY_LABELS: dict[str, str] = {
     "coarse": "粗い",

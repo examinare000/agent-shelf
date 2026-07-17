@@ -39,9 +39,9 @@ class TestResolveGranularity:
     @pytest.mark.parametrize(
         "preset, expected",
         [
-            ("coarse", {"digest_max_notes": 3, "top_k": 5}),
-            ("standard", {"digest_max_notes": 5, "top_k": 10}),
-            ("fine", {"digest_max_notes": 10, "top_k": 20}),
+            ("coarse", {"digest_max_notes": 10, "top_k": 5}),
+            ("standard", {"digest_max_notes": 20, "top_k": 10}),
+            ("fine", {"digest_max_notes": 40, "top_k": 20}),
         ],
     )
     def test_preset_values(self, preset, expected):
@@ -51,7 +51,7 @@ class TestResolveGranularity:
     def test_unknown_preset_falls_back_to_standard(self):
         answers = {**setup.default_answers(), "granularity": "not-a-real-preset"}
         assert setup.resolve_granularity(answers) == {
-            "digest_max_notes": 5,
+            "digest_max_notes": 20,
             "top_k": 10,
         }
 
@@ -87,7 +87,7 @@ class TestAnswersToConfigValues:
             "SHELF_SHELVE_BACKEND": "ollama",
             "SHELF_DEFAULT_BACKEND": config.DEFAULT_BACKEND,
             "SHELF_ROUTER_BACKEND": config.ROUTER_BACKEND,
-            "SHELF_DIGEST_MAX_NOTES": "5",
+            "SHELF_DIGEST_MAX_NOTES": "20",
             "SHELF_TOP_K": "10",
             "SHELF_CORPUS_DIR": str(config.CORPUS_DIR),
             "SHELF_DB_PATH": str(config.DB_PATH),
@@ -109,7 +109,7 @@ class TestAnswersToConfigValues:
         assert values["SHELF_SHELVE_BACKEND"] == "gemini"
         assert values["SHELF_DEFAULT_BACKEND"] == "gemini"
         assert values["SHELF_ROUTER_BACKEND"] == "ollama"
-        assert values["SHELF_DIGEST_MAX_NOTES"] == "10"
+        assert values["SHELF_DIGEST_MAX_NOTES"] == "40"
         assert values["SHELF_TOP_K"] == "20"
         assert values["SHELF_CORPUS_DIR"] == "/tmp/corpus"
         assert values["SHELF_DB_PATH"] == "/tmp/shelf.db"
