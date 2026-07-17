@@ -160,14 +160,18 @@ def index_notebook(
         # 既存掃除ロジックに自然に乗る(§4-B)。
         for note in store.list_study_notes(notebook, doc_id):
             digest_seq = DIGEST_SEQ_BASE - note["seq"]
+            # map-reduce パイプライン(pipeline=2)の study_notes は section/page を
+            # チャンク接地情報として直接持つため、これを優先する。旧パイプライン
+            # (pipeline=1)は section を持たないので、後方互換として従来どおり
+            # source_span を代替の人間可読表示に使う。
             rows.append(
                 {
                     "id": f"{notebook}/{doc_id}#{digest_seq}",
                     "notebook": notebook,
                     "doc_id": doc_id,
                     "source_path": source_path,
-                    "section": note.get("source_span"),
-                    "page": None,
+                    "section": note.get("section") or note.get("source_span"),
+                    "page": note.get("page"),
                     "seq": digest_seq,
                     "text": note["text"],
                     "kind": "digest",

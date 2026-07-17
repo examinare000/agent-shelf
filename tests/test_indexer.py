@@ -370,6 +370,39 @@ def test_multiple_study_notes_get_sequential_negative_seqs(tmp_path, store, embe
     assert store.get_chunk("physics/a#-4")["text"] == "学び3"
 
 
+def test_digest_chunk_uses_note_section_and_page_when_present(tmp_path, store, embedder) -> None:
+    """map-reduce パイプライン(pipeline=2)の study_notes は section/page を直接持つ。
+    旧 source_span より優先して使う（新パイプラインの正確なチャンク接地情報を
+    人間可読表示に反映するため）。"""
+    _write(tmp_path, "physics", "a.md", "# A\n\nhello world\n")
+    _add_document(store, "physics", "a")
+    store.replace_study_notes(
+        "physics", "a",
+        [{"text": "学び1", "source_span": "§旧", "section": "§2.3", "page": 5}],
+    )
+
+    index_notebook(tmp_path, "physics", store, embedder)
+
+    digest_chunk = store.get_chunk("physics/a#-2")
+    assert digest_chunk["section"] == "§2.3"
+    assert digest_chunk["page"] == 5
+
+
+def test_digest_chunk_falls_back_to_source_span_when_section_absent(
+    tmp_path, store, embedder
+) -> None:
+    """旧パイプライン(pipeline=1)の study_notes は section を持たないため、
+    従来どおり source_span を代替の人間可読表示に使う（後方互換）。"""
+    _write(tmp_path, "physics", "a.md", "# A\n\nhello world\n")
+    _add_document(store, "physics", "a")
+    store.replace_study_notes("physics", "a", [{"text": "学び1", "source_span": "§1"}])
+
+    index_notebook(tmp_path, "physics", store, embedder)
+
+    assert store.get_chunk("physics/a#-2")["section"] == "§1"
+    assert store.get_chunk("physics/a#-2")["page"] is None
+
+
 def test_document_without_study_notes_produces_no_digest_chunks(tmp_path, store, embedder) -> None:
     _write(tmp_path, "physics", "a.md", "# A\n\nhello world\n")
     _add_document(store, "physics", "a")

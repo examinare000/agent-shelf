@@ -222,27 +222,6 @@ def test_digest_max_notes_invalid_value_falls_back_to_default(monkeypatch):
     importlib.reload(config)
 
 
-def test_digest_input_max_chars_default_matches_digests_module_default():
-    # digests.DIGEST_INPUT_MAX_CHARS(4000) と矛盾しない既定値であることを固定する。
-    assert config.DIGEST_INPUT_MAX_CHARS == 4000
-
-
-def test_digest_input_max_chars_env_override(monkeypatch):
-    with monkeypatch.context() as m:
-        m.setenv("SHELF_DIGEST_INPUT_MAX_CHARS", "2000")
-        importlib.reload(config)
-        assert config.DIGEST_INPUT_MAX_CHARS == 2000
-    importlib.reload(config)
-
-
-def test_digest_input_max_chars_invalid_value_falls_back_to_default(monkeypatch):
-    with monkeypatch.context() as m:
-        m.setenv("SHELF_DIGEST_INPUT_MAX_CHARS", "abc")
-        importlib.reload(config)
-        assert config.DIGEST_INPUT_MAX_CHARS == 4000
-    importlib.reload(config)
-
-
 def test_digest_map_notes_default_is_five():
     # map フェーズは1ウィンドウあたりの上限であり、reduce 後の DIGEST_MAX_NOTES(20)
     # とは独立した控えめな既定値にする(1ウィンドウから20件も学びが出るのは過剰)。

@@ -10,6 +10,7 @@ service.py が要求する convert_file/convert_url の2メソッド構成とは
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import pytest
 
 import shelf.service
 from shelf.convert import ConversionError, ConvertResult
-from shelf.digests import DIGEST_SCHEMA
+from shelf.digests import MAP_SCHEMA, REDUCE_SCHEMA
 from shelf.indexer import index_notebook
 from shelf.ports import RawAnswer, RouteTarget
 from shelf.prompts import ANSWER_SCHEMA, SUMMARY_SCHEMA
@@ -1687,11 +1688,15 @@ def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     assert routed["insights"] == []
 
 
-# -- digest（学びノート生成・設計書 §7-B） --------------------------------------
+# -- digest（学びノート生成・map-reduce パイプライン・設計書 §7-B） -------------
 
 
-def _digest_answer(notes: list[dict]) -> str:
+def _map_answer(notes: list[dict]) -> str:
     return json.dumps({"notes": notes})
+
+
+def _reduce_answer(notes: list[dict], tags: list[str] | None = None) -> str:
+    return json.dumps({"notes": notes, "tags": tags or []})
 
 
 def test_digest_generates_and_stores_study_notes_then_reindexes(
@@ -1708,7 +1713,10 @@ def test_digest_generates_and_stores_study_notes_then_reindexes(
         title="鯨の資料",
     )
     backend = FakeAnswerBackend(
-        canned=_digest_answer([{"text": "鯨は哺乳類である", "span": "§1"}])
+        canned=[
+            _map_answer([{"text": "鯨は哺乳類である", "chunks": [1]}]),
+            _reduce_answer([{"text": "鯨は哺乳類である", "sources": [1]}]),
+        ]
     )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
 
@@ -1718,7 +1726,7 @@ def test_digest_generates_and_stores_study_notes_then_reindexes(
     notes = store.list_study_notes("nb", "doc")
     assert len(notes) == 1
     assert notes[0]["text"] == "鯨は哺乳類である"
-    assert notes[0]["source_span"] == "§1"
+    assert notes[0]["pipeline"] == 2
     # 生成後に再索引され、kind='digest' チャンクが検索対象になる
     ids, _ = store.load_vectors("nb")
     chunk_kinds = {store.get_chunk(i)["kind"] for i in ids}
@@ -1751,7 +1759,10 @@ def test_digest_writes_digest_chunks_when_run_after_prior_indexing(
     index_notebook(corpus_dir, "nb", store, embedder)
 
     backend = FakeAnswerBackend(
-        canned=_digest_answer([{"text": "鯨は哺乳類である", "span": "§1"}])
+        canned=[
+            _map_answer([{"text": "鯨は哺乳類である", "chunks": [1]}]),
+            _reduce_answer([{"text": "鯨は哺乳類である", "sources": [1]}]),
+        ]
     )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
 
@@ -1765,7 +1776,7 @@ def test_digest_writes_digest_chunks_when_run_after_prior_indexing(
     assert "digest" in chunk_kinds
 
 
-def test_digest_uses_notebook_persona_and_document_title_in_prompt(
+def test_digest_uses_notebook_persona_and_document_title_in_map_and_reduce_prompts(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
     store.create_notebook("nb", backend="codex", persona="鯨類学者")
@@ -1778,65 +1789,362 @@ def test_digest_uses_notebook_persona_and_document_title_in_prompt(
         normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
         title="鯨の資料",
     )
-    backend = FakeAnswerBackend(canned=_digest_answer([{"text": "学び"}]))
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}]),
+        ]
+    )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
 
     service.digest("nb")
 
-    assert len(backend.calls) == 1
-    call = backend.calls[0]
-    assert "あなたは鯨類学者である。" in call["prompt"]
-    assert "鯨の資料" in call["prompt"]
-    assert call["schema"] == DIGEST_SCHEMA
-    assert call["workdir"] == corpus_dir / "nb"
+    assert len(backend.calls) == 2
+    map_call, reduce_call = backend.calls
+    assert "あなたは鯨類学者である。" in map_call["prompt"]
+    assert "鯨の資料" in map_call["prompt"]
+    assert map_call["schema"] == MAP_SCHEMA
+    assert map_call["workdir"] == corpus_dir / "nb"
+    assert "あなたは鯨類学者である。" in reduce_call["prompt"]
+    assert reduce_call["schema"] == REDUCE_SCHEMA
+    assert reduce_call["workdir"] == corpus_dir / "nb"
 
 
-def test_digest_respects_custom_digest_input_max_chars(
+def test_digest_multi_window_doc_merges_map_notes_via_reduce_with_chunk_id_union(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
-    """SHELF_DIGEST_INPUT_MAX_CHARS(config.DIGEST_INPUT_MAX_CHARS)配線の回帰テスト。
-
-    ShelfService コンストラクタに digest_input_max_chars を渡すと、その値が
-    digests.build_digest_prompt の切詰めしきい値として実際に使われる
-    （digest_max_notes と同じ流儀の additive 配線）ことを検証する。
-    """
+    """節が変わると group_into_windows が新ウィンドウを開始する（digests.py §設計）ため、
+    2節の doc は map が2回・reduce が1回呼ばれる。reduce の sources 参照は
+    parse_reduce により両ウィンドウの chunk_ids 和集合へ解決される。"""
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
     nb_dir.mkdir(parents=True)
-    marker = "この目印はプロンプトに含まれてはならない"
-    (nb_dir / "doc.md").write_text("あ" * 50 + marker, encoding="utf-8")
+    (nb_dir / "doc.md").write_text(
+        "# Doc\n\n## 鯨\n\nwhale content in section one.\n\n"
+        "## アザラシ\n\nseal content in section two.\n",
+        encoding="utf-8",
+    )
     store.upsert_document(
         id="doc", notebook="nb", origin="doc.md", origin_type="md",
         normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
     )
-    backend = FakeAnswerBackend(canned=_digest_answer([{"text": "学び"}]))
-    service = ShelfService(
-        store, embedder, lambda name: backend, corpus_dir, digest_input_max_chars=50
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "鯨は哺乳類", "chunks": [1]}]),
+            _map_answer([{"text": "アザラシは哺乳類", "chunks": [1]}]),
+            _reduce_answer(
+                [{"text": "海洋哺乳類の学び", "sources": [1, 2]}], tags=["海洋生物"]
+            ),
+        ]
     )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    assert len(backend.calls) == 3
+    notes = store.list_study_notes("nb", "doc")
+    assert len(notes) == 1
+    assert notes[0]["text"] == "海洋哺乳類の学び"
+    assert notes[0]["pipeline"] == 2
+    assert set(notes[0]["source_chunk_ids"]) == {"nb/doc#0", "nb/doc#1"}
+    assert store.list_document_tags("nb", "doc") == ["海洋生物"]
+
+
+def test_digest_single_window_failure_continues_to_other_windows_within_doc(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text(
+        "# Doc\n\n## 鯨\n\nwhale content in section one.\n\n"
+        "## アザラシ\n\nseal content in section two.\n",
+        encoding="utf-8",
+    )
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            RawAnswer(text="", ok=False, error="timeout"),
+            _map_answer([{"text": "アザラシは哺乳類", "chunks": [1]}]),
+            _reduce_answer([{"text": "アザラシは哺乳類", "sources": [1]}]),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    notes = store.list_study_notes("nb", "doc")
+    assert notes[0]["text"] == "アザラシは哺乳類"
+
+
+def test_digest_all_windows_failing_records_doc_error_without_calling_reduce(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text(
+        "# Doc\n\n## 鯨\n\nwhale content in section one.\n\n"
+        "## アザラシ\n\nseal content in section two.\n",
+        encoding="utf-8",
+    )
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            RawAnswer(text="", ok=False, error="timeout"),
+            RawAnswer(text="", ok=False, error="timeout"),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result["generated"] == []
+    assert len(result["errors"]) == 1
+    assert result["errors"][0]["doc_id"] == "doc"
+    assert len(backend.calls) == 2  # map 2件のみ・reduce は一度も呼ばれない
+
+
+def test_digest_all_windows_failing_includes_last_backend_error_text_in_doc_error(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """コードレビュー指摘#5: 全ウィンドウ全滅時の doc エラー文言は固定文言のみ
+    だったが、可観測性のため最後に観測した backend の raw.error 文言を含める。
+    戻り値スキーマ(generated/skipped/errorsキー)自体は変えない。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(canned=[RawAnswer(text="", ok=False, error="rate limited")])
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result["errors"][0]["doc_id"] == "doc"
+    assert "rate limited" in result["errors"][0]["error"]
+
+
+def test_digest_reduce_failure_falls_back_to_clamped_map_notes_with_empty_tags(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer(
+                [
+                    {"text": "1件目の学び", "chunks": [1]},
+                    {"text": "2件目の学び", "chunks": [1]},
+                ]
+            ),
+            RawAnswer(text="", ok=False, error="timeout"),
+        ]
+    )
+    service = ShelfService(
+        store, embedder, lambda name: backend, corpus_dir, digest_max_notes=1
+    )
+
+    result = service.digest("nb")
+
+    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    notes = store.list_study_notes("nb", "doc")
+    assert len(notes) == 1
+    assert notes[0]["text"] == "1件目の学び"
+    assert notes[0]["pipeline"] == 2
+    assert store.list_document_tags("nb", "doc") == []
+
+
+def test_digest_reduce_failure_logs_warning_with_last_backend_error_text(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, caplog
+) -> None:
+    """コードレビュー指摘#5: reduce 失敗（劣化継続）時に、最後に観測した backend の
+    raw.error 文言を含む warning ログを残す（observability。戻り値スキーマ・
+    ログ以外の既存挙動は変えない）。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "1件目の学び", "chunks": [1]}]),
+            RawAnswer(text="", ok=False, error="reduce timeout"),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    with caplog.at_level("WARNING"):
+        service.digest("nb")
+
+    assert any("reduce timeout" in record.message for record in caplog.records)
+
+
+def test_digest_reduce_prompt_includes_existing_notebook_tag_catalog(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc1.md").write_text("# Doc1\n\ncontent one.\n", encoding="utf-8")
+    (nb_dir / "doc2.md").write_text("# Doc2\n\ncontent two.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc1", notebook="nb", origin="doc1.md", origin_type="md",
+        normalized_path="nb/doc1.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    store.upsert_document(
+        id="doc2", notebook="nb", origin="doc2.md", origin_type="md",
+        normalized_path="nb/doc2.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    store.replace_document_tags("nb", "doc1", ["既存タグ"])
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}], tags=["既存タグ"]),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    service.digest("nb", doc_id="doc2")
+
+    reduce_call = backend.calls[-1]
+    assert "既存タグ" in reduce_call["prompt"]
+    assert reduce_call["schema"] == REDUCE_SCHEMA
+
+
+def test_digest_calls_list_tags_by_notebook_once_per_run_not_per_document(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch
+) -> None:
+    """コードレビュー指摘#3: _digest_one が文書ごとに notebook 横断 GROUP BY の
+    list_tags_by_notebook を呼んでいたN+1を解消し、digest() のループ前に1回だけ
+    引く。2文書のnotebookでも呼び出しは1回に留まることを検証する。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc1.md").write_text("# Doc1\n\ncontent one.\n", encoding="utf-8")
+    (nb_dir / "doc2.md").write_text("# Doc2\n\ncontent two.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc1", notebook="nb", origin="doc1.md", origin_type="md",
+        normalized_path="nb/doc1.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    store.upsert_document(
+        id="doc2", notebook="nb", origin="doc2.md", origin_type="md",
+        normalized_path="nb/doc2.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "doc1の学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "doc1の学び", "sources": [1]}], tags=["タグ1"]),
+            _map_answer([{"text": "doc2の学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "doc2の学び", "sources": [1]}], tags=["タグ1"]),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+    call_count = 0
+    original = store.list_tags_by_notebook
+
+    def counting(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "list_tags_by_notebook", counting)
+
+    result = service.digest("nb")
+
+    assert result["generated"] == ["doc1", "doc2"]
+    assert call_count == 1
+
+
+def test_digest_reduce_prompt_for_later_doc_includes_tags_saved_by_earlier_doc_in_same_run(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """list_tags_by_notebook をループ前に1回だけ引く最適化後も、後続文書の reduce
+    プロンプトに先行文書がこの実行内で保存したタグが反映される実質挙動は保つ
+    (brief §修正3: DBへ問い合わせ直さず、ローカルにタグを追記して引き継ぐ)。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc1.md").write_text("# Doc1\n\ncontent one.\n", encoding="utf-8")
+    (nb_dir / "doc2.md").write_text("# Doc2\n\ncontent two.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc1", notebook="nb", origin="doc1.md", origin_type="md",
+        normalized_path="nb/doc1.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    store.upsert_document(
+        id="doc2", notebook="nb", origin="doc2.md", origin_type="md",
+        normalized_path="nb/doc2.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "doc1の学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "doc1の学び", "sources": [1]}], tags=["新タグ"]),
+            _map_answer([{"text": "doc2の学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "doc2の学び", "sources": [1]}], tags=["新タグ"]),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
 
     service.digest("nb")
 
-    assert len(backend.calls) == 1
-    prompt = backend.calls[0]["prompt"]
-    assert "あ" * 50 in prompt
-    assert marker not in prompt
+    # calls: [doc1 map, doc1 reduce, doc2 map, doc2 reduce]
+    doc2_reduce_call = backend.calls[3]
+    assert "新タグ" in doc2_reduce_call["prompt"]
 
 
-def test_digest_masks_generated_notes_before_storing(
+def test_digest_masks_note_text_section_and_tags_before_storing(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
     nb_dir.mkdir(parents=True)
-    (nb_dir / "doc.md").write_text("# Doc\n\ncontent.\n", encoding="utf-8")
+    secret = "sk-abcdefgh12345678"
+    (nb_dir / "doc.md").write_text(
+        f"# Doc\n\n## {secret}\n\ncontent body text.\n", encoding="utf-8"
+    )
     store.upsert_document(
         id="doc", notebook="nb", origin="doc.md", origin_type="md",
         normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
     )
-    secret = "sk-ABCDEF1234567890"
-    backend = FakeAnswerBackend(canned=_digest_answer([{"text": f"token {secret} learned"}]))
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": f"token {secret} learned", "chunks": [1]}]),
+            _reduce_answer(
+                [{"text": f"token {secret} learned", "sources": [1]}],
+                tags=[f"{secret}タグ"],
+            ),
+        ]
+    )
 
     def fake_mask(text: str) -> str:
         return text.replace(secret, "<REDACTED>")
@@ -1847,9 +2155,12 @@ def test_digest_masks_generated_notes_before_storing(
 
     notes = store.list_study_notes("nb", "doc")
     assert notes[0]["text"] == "token <REDACTED> learned"
+    assert secret not in (notes[0]["section"] or "")
+    tags = store.list_document_tags("nb", "doc")
+    assert all(secret not in tag for tag in tags)
 
 
-def test_digest_skips_regeneration_when_content_unchanged_and_not_forced(
+def test_digest_skips_regeneration_when_pipeline2_and_hash_unchanged_and_not_forced(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
     store.create_notebook("nb", backend="codex")
@@ -1861,15 +2172,56 @@ def test_digest_skips_regeneration_when_content_unchanged_and_not_forced(
         id="doc", notebook="nb", origin="doc.md", origin_type="md",
         normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
     )
-    backend = FakeAnswerBackend(canned=_digest_answer([{"text": "初回の学び"}]))
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "初回の学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "初回の学び", "sources": [1]}]),
+        ]
+    )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
     service.digest("nb")
-    assert len(backend.calls) == 1
+    assert len(backend.calls) == 2
 
     result = service.digest("nb")
 
-    assert len(backend.calls) == 1  # 再生成されない = backend が再度呼ばれない
+    assert len(backend.calls) == 2  # 再生成されない = backend が再度呼ばれない
     assert result == {"notebook": "nb", "generated": [], "skipped": ["doc"], "errors": []}
+
+
+def test_digest_regenerates_legacy_pipeline1_notes_even_without_force(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """旧パイプライン(pipeline=1)の study_notes は source_hash が一致していても
+    --force なしで再生成対象になる(移行が force なしで進むように・完了条件)。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    markdown = "# Doc\n\nstable content.\n"
+    (nb_dir / "doc.md").write_text(markdown, encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    store.replace_study_notes(
+        "nb", "doc",
+        [{"text": "旧パイプラインの学び", "source_hash": content_hash, "pipeline": 1}],
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "新しい学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "新しい学び", "sources": [1]}]),
+        ]
+    )
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    notes = store.list_study_notes("nb", "doc")
+    assert notes[0]["text"] == "新しい学び"
+    assert notes[0]["pipeline"] == 2
 
 
 def test_digest_force_regenerates_even_when_content_unchanged(
@@ -1885,14 +2237,19 @@ def test_digest_force_regenerates_even_when_content_unchanged(
         normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
     )
     backend = FakeAnswerBackend(
-        canned=[_digest_answer([{"text": "初回"}]), _digest_answer([{"text": "再生成"}])]
+        canned=[
+            _map_answer([{"text": "初回", "chunks": [1]}]),
+            _reduce_answer([{"text": "初回", "sources": [1]}]),
+            _map_answer([{"text": "再生成", "chunks": [1]}]),
+            _reduce_answer([{"text": "再生成", "sources": [1]}]),
+        ]
     )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
     service.digest("nb")
 
     result = service.digest("nb", force=True)
 
-    assert len(backend.calls) == 2
+    assert len(backend.calls) == 4
     assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
     notes = store.list_study_notes("nb", "doc")
     assert notes[0]["text"] == "再生成"
@@ -1916,10 +2273,13 @@ def test_digest_records_failure_and_continues_without_stopping_other_docs(
         normalized_path="nb/bad.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
     )
     # store.list_documents は id 昇順で返すため処理順は "bad" -> "good"。
+    # "bad" は(唯一の)ウィンドウの map 応答自体が失敗し全滅=doc エラーとなり、
+    # reduce は一度も呼ばれない。
     backend = FakeAnswerBackend(
         canned=[
             RawAnswer(text="", ok=False, error="timeout"),
-            _digest_answer([{"text": "学び"}]),
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}]),
         ]
     )
     service = ShelfService(store, embedder, lambda name: backend, corpus_dir)
@@ -1952,6 +2312,66 @@ def test_digest_records_parse_failure_as_error(
     assert result["generated"] == []
     assert len(result["errors"]) == 1
     assert result["errors"][0]["doc_id"] == "doc"
+
+
+def test_digest_uses_configured_digest_backend_over_notebook_backend(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\ncontent.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    codex_backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="not used"))
+    ollama_backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}]),
+        ]
+    )
+    registry = {"codex": codex_backend, "ollama": ollama_backend}
+    service = ShelfService(
+        store, embedder, lambda name: registry[name], corpus_dir, digest_backend="ollama"
+    )
+
+    result = service.digest("nb")
+
+    assert result["generated"] == ["doc"]
+    assert codex_backend.calls == []
+    assert len(ollama_backend.calls) == 2
+
+
+def test_digest_falls_back_to_notebook_backend_when_digest_backend_unset(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\ncontent.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    codex_backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}]),
+        ]
+    )
+    ollama_backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="not used"))
+    registry = {"codex": codex_backend, "ollama": ollama_backend}
+    service = ShelfService(store, embedder, lambda name: registry[name], corpus_dir)
+
+    result = service.digest("nb")
+
+    assert result["generated"] == ["doc"]
+    assert ollama_backend.calls == []
+    assert len(codex_backend.calls) == 2
 
 
 def test_digest_rejects_invalid_notebook_name(

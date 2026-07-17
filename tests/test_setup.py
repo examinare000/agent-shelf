@@ -30,7 +30,6 @@ class TestDefaultAnswers:
         assert answers["router_backend"] == config.ROUTER_BACKEND
         assert answers["granularity"] == "standard"
         assert answers["digest_max_notes"] is None
-        assert answers["digest_input_max_chars"] is None
         assert answers["top_k"] is None
         assert answers["corpus_dir"] == str(config.CORPUS_DIR)
         assert answers["db_path"] == str(config.DB_PATH)
@@ -40,9 +39,9 @@ class TestResolveGranularity:
     @pytest.mark.parametrize(
         "preset, expected",
         [
-            ("coarse", {"digest_max_notes": 3, "digest_input_max_chars": 2000, "top_k": 5}),
-            ("standard", {"digest_max_notes": 5, "digest_input_max_chars": 4000, "top_k": 10}),
-            ("fine", {"digest_max_notes": 10, "digest_input_max_chars": 8000, "top_k": 20}),
+            ("coarse", {"digest_max_notes": 3, "top_k": 5}),
+            ("standard", {"digest_max_notes": 5, "top_k": 10}),
+            ("fine", {"digest_max_notes": 10, "top_k": 20}),
         ],
     )
     def test_preset_values(self, preset, expected):
@@ -53,7 +52,6 @@ class TestResolveGranularity:
         answers = {**setup.default_answers(), "granularity": "not-a-real-preset"}
         assert setup.resolve_granularity(answers) == {
             "digest_max_notes": 5,
-            "digest_input_max_chars": 4000,
             "top_k": 10,
         }
 
@@ -66,7 +64,6 @@ class TestResolveGranularity:
         resolved = setup.resolve_granularity(answers)
         assert resolved["digest_max_notes"] == 99
         # 明示指定していないキーはプリセット値のまま
-        assert resolved["digest_input_max_chars"] == 2000
         assert resolved["top_k"] == 5
 
 
@@ -91,7 +88,6 @@ class TestAnswersToConfigValues:
             "SHELF_DEFAULT_BACKEND": config.DEFAULT_BACKEND,
             "SHELF_ROUTER_BACKEND": config.ROUTER_BACKEND,
             "SHELF_DIGEST_MAX_NOTES": "5",
-            "SHELF_DIGEST_INPUT_MAX_CHARS": "4000",
             "SHELF_TOP_K": "10",
             "SHELF_CORPUS_DIR": str(config.CORPUS_DIR),
             "SHELF_DB_PATH": str(config.DB_PATH),
@@ -156,7 +152,6 @@ class TestLoadAnswersFile:
             "router_backend": "codex",
             "granularity": "custom",
             "digest_max_notes": 7,
-            "digest_input_max_chars": 1234,
             "top_k": 15,
             "corpus_dir": "/data/corpus",
             "db_path": "/data/shelf.db",

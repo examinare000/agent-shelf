@@ -127,11 +127,6 @@ ROUTE_FALLBACK = os.environ.get("SHELF_ROUTE_FALLBACK", "")
 # （env 変数名 SHELF_DIGEST_MAX_NOTES は既存呼び出し・運用設定との互換のため維持）。
 DIGEST_MAX_NOTES = _int_env("SHELF_DIGEST_MAX_NOTES", 20)
 
-# shelf digest が LLM へ渡す資料本文の先頭何文字までを入力とするかの上限。
-# digests.py はローカル定数 DIGEST_INPUT_MAX_CHARS=4000 を独立に持つ（config非依存の
-# 制約上）が、service.py 側で config 値を渡す運用に備え同値をここにも定義する。
-DIGEST_INPUT_MAX_CHARS = _int_env("SHELF_DIGEST_INPUT_MAX_CHARS", 4000)
-
 # shelf digest の map フェーズで 1 ウィンドウ（1 回の map LLM 呼び出し入力）あたり
 # 抽出する学びノート数の既定上限。digests.build_map_prompt(..., max_notes=...) へ
 # service.py が明示的に渡す。DIGEST_MAX_NOTES（reduce 後・文書全体の上限）とは
