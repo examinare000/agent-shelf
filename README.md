@@ -94,6 +94,17 @@ shelf index "技術書"
 
 インデックスは `.catalog/shelf.db` へ保存されます（gitignore 対象）。
 
+## ダイジェスト生成（digest）
+
+shelf は大規模資料（数百頁の書籍など）から学びノートを効率的に抽出するため、**map-reduce パイプライン**を採用しています。
+
+- **Map 段階**: 資料の本文を `SHELF_DIGEST_MAP_WINDOW_CHARS`（既定8000字）ごとに分割し、section 境界を優先して調整したウィンドウを構成。各ウィンドウから最大 `SHELF_DIGEST_MAP_NOTES`（既定5）件の学びを LLM で抽出。大規模資料ではウィンドウ数分の LLM 呼び出しが発生します（例: 60万字の資料≈75回）。
+- **Reduce 段階**: 全ウィンドウから集約した学びを文書全体で重複統合し、最大 `SHELF_DIGEST_MAX_NOTES`（既定20）件に厳選。タグ3～8個を付与（既存タグカタログから選別、NFKC/lower で正規化）。
+
+各学び（study_note）は根拠チャンク（source_chunk_ids / section / page）に接地して保存されます。
+
+**LLM 呼び出し最適化**: 大規模資料で多くの呼び出しが発生する場合、`SHELF_DIGEST_BACKEND` でローカル ollama など低コストなバックエンドへ逃がせます（未指定時は notebook の backend → SHELF_DEFAULT_BACKEND の順で解決）。
+
 ## 環境変数一覧
 
 | 環境変数 | 既定値 | 説明 |
@@ -110,10 +121,31 @@ shelf index "技術書"
 | `SHELF_ROUTER_BACKEND` | `` | 司書（ルーティング推論）専用バックエンド（未指定時は SHELF_DEFAULT_BACKEND を使用） |
 | `SHELF_ROUTE_TOP_N` | `1` | ルーティングで選択する notebook 数（最大） |
 | `SHELF_ROUTE_FALLBACK` | `` | ルーティング失敗時の方針（`all` = 全 notebook、空 = 対象ゼロ） |
-| `SHELF_DIGEST_MAX_NOTES` | `5` | 資料 1 つあたりの生成学びノート数 |
-| `SHELF_DIGEST_INPUT_MAX_CHARS` | `4000` | ダイジェスト生成時の入力テキスト上限文字数 |
+| `SHELF_DIGEST_MAX_NOTES` | `20` | 資料全体で保持する学びノート数（reduce 後の上限） |
+| `SHELF_DIGEST_MAP_NOTES` | `5` | 1 ウィンドウあたりの抽出学びノート数（map フェーズ） |
+| `SHELF_DIGEST_MAP_WINDOW_CHARS` | `8000` | ウィンドウサイズ（字数）。section 境界優先で調整 |
+| `SHELF_DIGEST_BACKEND` | `` | Digest 専用 LLM バックエンド（未指定時は notebook の backend → SHELF_DEFAULT_BACKEND） |
+| `SHELF_HYBRID_SEARCH` | `true` | ハイブリッド検索有効化（cosine + FTS5 BM25 RRF）。SQLite が FTS5 非対応の場合は自動劣化 |
 | `SHELF_SHELVE_BACKEND` | `ollama` | 自動分類・新規 notebook 生成時のバックエンド |
 | `SHELF_EXTRACT_PY` | `<repo>/distill/extract.py` | 機微情報マスク規則の読み込み元（下記参照） |
+
+## アップグレード・マイグレーション（0.3.x → 0.4.0）
+
+v0.4.0 ではダイジェスト生成パイプラインが単発 LLM 呼び出しから **map-reduce 方式**へ変更になり、DB スキーマが拡張されました。既存デプロイを v0.4.0 へ更新する場合は以下の手順を実施してください。
+
+### 破壊的変更
+- 環境変数 `SHELF_DIGEST_INPUT_MAX_CHARS` は廃止しました（新パイプラインでは `SHELF_DIGEST_MAP_WINDOW_CHARS` で制御）。
+- 既存の旧世代学びノート（pipeline=1）は自動認識され、新パイプラインで全件再生成対象になります。
+
+### 移行手順
+1. アプリケーションをバージョン v0.4.0 にデプロイ
+2. サーバを再起動（DB マイグレーション・FTS インデックス初期化が自動実行される）
+3. 各 notebook ごとに `shelf digest <notebook>` を実行し、学びノートを再生成（既存の旧ノートは置き換わります）
+4. `shelf ask` / `shelf consult` でスモーク確認（検索・回答が正常に動作することを確認）
+
+### 環境変数の更新
+- `SHELF_DIGEST_INPUT_MAX_CHARS` を環境変数から削除（ローカルテスト環境の場合）
+- 大規模資料で LLM 呼び出し回数が多い場合、`SHELF_DIGEST_BACKEND=ollama` でローカル LLM へ逃がすことを推奨
 
 ## 機微情報マスクの正本
 

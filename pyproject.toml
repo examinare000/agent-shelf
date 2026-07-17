@@ -1,6 +1,6 @@
 [project]
 name = "shelf"
-version = "0.3.1"
+version = "0.4.0"
 description = "書籍・資料コーパスへの委譲QA（ローカル検索+サブスクCLI合成）MCPサーバ"
 requires-python = ">=3.11"
 dependencies = [
