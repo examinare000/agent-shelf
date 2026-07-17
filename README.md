@@ -117,6 +117,8 @@ shelf index "技術書"
 
 ## 機微情報マスクの正本
 
+**独立導入性**：agent-shelf は単体で自己完結します（依存する他リポジトリなし）。agent-recall との併用は任意で、併用時のみ SHELF_EXTRACT_PY によるマスク正本共有が意味を持ちます。
+
 出力前のマスク処理（`shelf/masking.py`）は、規則の drift を防ぐため単一ファイル
 `distill/extract.py` の `mask()` を importlib で読み込む設計。単体利用では同梱コピーが
 そのまま正本になる。別頒布の [recall](https://github.com/examinare000/agent-recall)（記憶基盤）と併用する場合は、`SHELF_EXTRACT_PY` を
