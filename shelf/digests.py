@@ -228,6 +228,53 @@ REDUCE_SCHEMA: dict = {
 }
 
 
+# reduce フェーズ入力（map_notes の text 連結）が超えてはならない文字数予算
+# （コードレビュー指摘 P6）。map_notes は window 数に比例して増えるため、
+# 上限なしに全件をプロンプトへ展開すると reduce 呼び出しそのものが失敗しやすくなる。
+# select_reduce_input がこの予算内へ間引く。
+REDUCE_INPUT_MAX_CHARS = 24000
+
+
+def select_reduce_input(
+    map_notes: list[StudyNote], max_chars: int = REDUCE_INPUT_MAX_CHARS
+) -> list[StudyNote]:
+    """reduce フェーズへ渡す map_notes を max_chars 予算内へ間引く（P6）。
+
+    text の合計文字数が max_chars 以下ならそのまま全件返す。超える場合は、
+    先頭・末尾を必ず含む均等ストライドで件数を選び（順序維持）、予算に収まる
+    最大件数を採用する（可能な限り多くの学びを reduce に残すため、n-1 件から
+    2 件まで降順に試す）。1〜2 件しかない場合はこれ以上間引けないため
+    そのまま返す（呼び出し側の service.py が、間引きが発生した場合のみ
+    警告ログを出す想定）。
+    """
+    if not map_notes:
+        return []
+    if sum(len(note.text) for note in map_notes) <= max_chars:
+        return list(map_notes)
+
+    n = len(map_notes)
+    if n <= 2:
+        return list(map_notes)
+
+    for k in range(n - 1, 1, -1):
+        indices = _even_stride_indices(n, k)
+        selected = [map_notes[i] for i in indices]
+        if sum(len(note.text) for note in selected) <= max_chars:
+            return selected
+
+    # 先頭・末尾の2件のみでも予算を超える場合の最終フォールバック。
+    return [map_notes[0], map_notes[-1]]
+
+
+def _even_stride_indices(n: int, k: int) -> list[int]:
+    """0..n-1 の範囲から、先頭(0)・末尾(n-1)を必ず含む k 個の均等ストライド添字を
+    昇順・重複除去で返す（丸め込みで重複した場合は結果的に k 未満になり得る。
+    その場合は選択件数がさらに減るだけで、予算判定側の安全性は損なわれない）。"""
+    if k <= 1:
+        return [0]
+    return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+
+
 def build_reduce_prompt(
     map_notes: list[StudyNote],
     *,

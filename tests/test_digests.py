@@ -15,6 +15,7 @@ from shelf.digests import (
     normalize_tags,
     parse_map,
     parse_reduce,
+    select_reduce_input,
 )
 from shelf.ports import StudyNote
 
@@ -381,6 +382,45 @@ class TestBuildReducePrompt:
 
         assert "タイトル" not in prompt_without
         assert "タイトル" in prompt_with
+
+
+class TestSelectReduceInput:
+    """コードレビュー指摘 P6: reduce プロンプトへ全 map ノートを無上限展開すると
+    ウィンドウ数に比例して入力が肥大化し、reduce 呼び出しが失敗しやすくなる。
+    REDUCE_INPUT_MAX_CHARS 予算内に収めるための間引き選択のテスト。"""
+
+    def _notes(self, n: int, *, text_len: int) -> list[StudyNote]:
+        return [
+            StudyNote(text=f"学び{i}" + "あ" * (text_len - len(f"学び{i}")), chunk_ids=(f"nb/doc#{i}",))
+            for i in range(n)
+        ]
+
+    def test_returns_all_notes_unchanged_when_under_budget(self):
+        notes = self._notes(3, text_len=10)
+
+        selected = select_reduce_input(notes, max_chars=1000)
+
+        assert selected == notes
+
+    def test_empty_list_returns_empty_list(self):
+        assert select_reduce_input([], max_chars=1000) == []
+
+    def test_samples_evenly_across_whole_list_keeping_first_and_last_within_budget(self):
+        notes = self._notes(10, text_len=50)  # 合計500字
+
+        selected = select_reduce_input(notes, max_chars=170)
+
+        # 均等ストライドで [0, 4, 9] の3件（計150字、次の4件(200字)は予算超過）。
+        assert selected == [notes[0], notes[4], notes[9]]
+        assert sum(len(note.text) for note in selected) <= 170
+
+    def test_sampled_selection_preserves_original_order(self):
+        notes = self._notes(10, text_len=50)
+
+        selected = select_reduce_input(notes, max_chars=170)
+
+        original_indices = [notes.index(note) for note in selected]
+        assert original_indices == sorted(original_indices)
 
 
 class TestReduceSchema:

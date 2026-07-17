@@ -24,12 +24,14 @@ from shelf import convert as _default_converter
 from shelf.convert import ConversionError, pick_converter
 from shelf.digests import (
     MAP_SCHEMA,
+    REDUCE_INPUT_MAX_CHARS,
     REDUCE_SCHEMA,
     build_map_prompt,
     build_reduce_prompt,
     group_into_windows,
     parse_map,
     parse_reduce,
+    select_reduce_input,
 )
 from shelf.indexer import IndexStats, index_notebook
 from shelf.librarian import Librarian
@@ -1476,8 +1478,22 @@ class ShelfService:
         # tag_catalog は同一 notebook の既存タグ（他資料分含む・この実行内で先行
         # 文書が保存した分も含む）を渡し、表記揺れなく既存タグを再利用しやすく
         # する（brief §6・list_tags_by_notebook 配線）。
+        #
+        # map_notes は window 数に比例して増えるため、reduce プロンプトへ無上限に
+        # 展開すると入力が肥大化し reduce 呼び出しが失敗しやすくなる
+        # （コードレビュー指摘 P6）。select_reduce_input で REDUCE_INPUT_MAX_CHARS
+        # 予算内へ間引いた上で prompt を組み立て、以降の parse_reduce にも同じ
+        # 間引き後リストを渡す（build_reduce_prompt の [N] 番号付けと parse_reduce の
+        # 番号解決を一致させるため、両者に必ず同一のリストを渡す）。
+        reduce_input_notes = select_reduce_input(map_notes, REDUCE_INPUT_MAX_CHARS)
+        if len(reduce_input_notes) < len(map_notes):
+            _logger.warning(
+                "digest reduce フェーズの入力を文字数上限のため間引きました: "
+                "notebook=%s doc_id=%s kept=%d total=%d",
+                notebook, doc_id, len(reduce_input_notes), len(map_notes),
+            )
         reduce_prompt = build_reduce_prompt(
-            map_notes,
+            reduce_input_notes,
             tag_catalog=tuple(tag_catalog),
             persona=persona,
             title=title,
@@ -1498,7 +1514,7 @@ class ShelfService:
             return f"reduce失敗: {reduce_raw.error}"
 
         reduced_notes, tags = parse_reduce(
-            reduce_raw.text, map_notes, max_notes=self._digest_max_notes
+            reduce_raw.text, reduce_input_notes, max_notes=self._digest_max_notes
         )
         if not reduced_notes:
             # reduce 応答が ok=True でも、JSON解析失敗や有効なノート0件は実質的な

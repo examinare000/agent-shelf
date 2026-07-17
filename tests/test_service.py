@@ -2296,6 +2296,69 @@ def test_digest_map_window_exception_logs_warning_and_keeps_first_error_text(
     )
 
 
+def test_digest_reduce_input_sampled_when_map_notes_exceed_char_budget_and_warns(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, caplog, monkeypatch
+) -> None:
+    """コードレビュー指摘 P6: reduce プロンプトへ全 map ノートを無上限展開せず、
+    digests.REDUCE_INPUT_MAX_CHARS 予算内へ間引くことを service.py の配線レベルで
+    確認する（select_reduce_input 自体の単体テストは test_digests.py）。
+    5件の map ノート（各50字・計250字）を予算170字へ間引くと、均等ストライドで
+    [0,2,4] の3件（計150字）のみが reduce プロンプトへ残る。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text(
+        "# Doc\n\n"
+        "## 節0\n\ncontent zero.\n\n"
+        "## 節1\n\ncontent one.\n\n"
+        "## 節2\n\ncontent two.\n\n"
+        "## 節3\n\ncontent three.\n\n"
+        "## 節4\n\ncontent four.\n",
+        encoding="utf-8",
+    )
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+    )
+    note_texts = [f"学び{i}".ljust(50, "い") for i in range(5)]
+    backend = FakeAnswerBackend(
+        canned=[
+            *[_map_answer([{"text": text, "chunks": [1]}]) for text in note_texts],
+            _reduce_answer(
+                [{"text": "統合された学び", "sources": [1, 2, 3]}], tags=["タグ"]
+            ),
+        ]
+    )
+    # digest_map_window_chars を各チャンク単体より小さくし、5節=5windowへ分割させる
+    # （P5: group_into_windows は節では強制分割しなくなったため）。
+    service = ShelfService(
+        store, embedder, lambda name: backend, corpus_dir, digest_map_window_chars=5
+    )
+    monkeypatch.setattr(shelf.service, "REDUCE_INPUT_MAX_CHARS", 170)
+
+    with caplog.at_level("WARNING"):
+        result = service.digest("nb")
+
+    assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
+    assert len(backend.calls) == 6  # map 5件 + reduce 1件
+    reduce_prompt = backend.calls[-1]["prompt"]
+    kept, dropped = {0, 2, 4}, {1, 3}
+    for i in kept:
+        assert note_texts[i] in reduce_prompt
+    for i in dropped:
+        assert note_texts[i] not in reduce_prompt
+    # 間引き後の3件が [N1]..[N3] へ振り直され、sources=[1,2,3] の解決先と
+    # 一貫していること（parse_reduce の番号解決が select_reduce_input 後の
+    # リストに対して行われることの確認）。
+    assert "[N1]" in reduce_prompt and "[N2]" in reduce_prompt and "[N3]" in reduce_prompt
+    assert "[N4]" not in reduce_prompt and "[N5]" not in reduce_prompt
+    assert any(
+        "doc_id=doc" in record.message and "kept=3" in record.message and "total=5" in record.message
+        for record in caplog.records
+    )
+
+
 def test_digest_zero_chunk_document_reports_missing_body_chunks_message(
     store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch
 ) -> None:
