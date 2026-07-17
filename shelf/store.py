@@ -138,6 +138,8 @@ class Store:
         # notebook 単位のベクトル行列キャッシュ: {notebook: (generation, ids, matrix)}。
         # generation が現在値と一致する間は SQLite に再クエリしない（§ ベクタキャッシュ）。
         self._vector_cache: dict[str, tuple[int, list[str], np.ndarray]] = {}
+        self.fts_enabled = False
+        self._init_fts()
 
     def close(self) -> None:
         self._conn.close()
@@ -184,6 +186,62 @@ class Store:
                 "pipeline": "INTEGER NOT NULL DEFAULT 1",
             },
         )
+
+    def _init_fts(self) -> None:
+        # fts5 の trigram tokenizer は SQLite のビルドオプション次第で使えない
+        # 環境があるため、作成に失敗したら fts_enabled=False にフェイルソフトする
+        # （キーワード検索は諦めるが、他の永続化機能はブロックしない）。
+        # sqlite_master を CREATE 前に見ておくことで「今回新規作成したか」を判定し、
+        # 新規作成時のみ既存 chunks から一括バックフィルする（毎起動 rebuild は無駄）。
+        already_existed = (
+            self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+            ).fetchone()
+            is not None
+        )
+        try:
+            self._conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5("
+                "text, content='chunks', content_rowid='rowid', tokenize='trigram')"
+            )
+        except sqlite3.OperationalError:
+            self._conn.rollback()
+            self.fts_enabled = False
+            return
+        self.fts_enabled = True
+        if not already_existed:
+            # 新規作成時のみ既存 chunks から一括バックフィルする。この時点で
+            # 現在の generation との同期が取れているので fts_generation に
+            # 記録しておき、直後の最初の keyword_topk 呼び出しでの無駄な
+            # 二重 rebuild を避ける。
+            self._rebuild_fts()
+            self.set_meta("fts_generation", str(self._current_generation()))
+        self._conn.commit()
+
+    def _rebuild_fts(self) -> None:
+        # keyword_topk 冒頭の遅延同期フックからのみ呼ぶ（§ 遅延 rebuild）。content=
+        # 外部コンテンツテーブルなのでトリガーではなくこの明示 rebuild で追従させる
+        # （設計判断: トリガーは使わない方針）。呼び出し元の commit に相乗りする
+        # ため、ここ自体ではコミットしない。
+        if self.fts_enabled:
+            self._conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+
+    def _sync_fts_if_stale(self) -> None:
+        # chunks への書き込みごとに rebuild していた旧実装は、indexer.py の
+        # delete_by_source_file→upsert_chunks（1ファイルにつき2回）や一括投入で
+        # O(N^2) 的コストになっていた（コードレビュー指摘#2）。書き込み側の
+        # _bump_generation は既に全ての chunks 変更経路を網羅しているため、
+        # ここでは「chunks_fts が最後に同期された generation」を meta に永続化し、
+        # 現在の generation とズレていれば読み取り時に1回だけ rebuild する
+        # （プロセス内キャッシュの generation 無効化と同じ発想を read-time
+        # rebuild に転用）。meta 永続なのでプロセス跨ぎ・再起動後も正しく検知できる
+        # （初回・fts_generation 未記録時は必ず rebuild する）。
+        current = self._current_generation()
+        synced = self.get_meta("fts_generation")
+        if synced is not None and int(synced) == current:
+            return
+        self._rebuild_fts()
+        self.set_meta("fts_generation", str(current))
 
     # -- generation（ベクタキャッシュ無効化用カウンタ） ---------------------------
 
@@ -424,6 +482,36 @@ class Store:
             (id,),
         ).fetchone()
         return None if row is None else dict(row)
+
+    def keyword_topk(self, notebook: str, fts_query: str, limit: int) -> list[tuple[str, float]]:
+        """全文グラウンディング改良のハイブリッド検索用キーワード索引。
+
+        `(chunk_id, bm25スコア)` のリストを bm25 昇順（値が小さいほど良い一致＝
+        fts5 の仕様）で返す。fts_enabled=False（fts5/trigram 非対応環境）・
+        空/空白のみのクエリ・不正な MATCH 構文（ユーザー由来の生クエリなので
+        例外にせず劣化させる）は全て `[]` を返す（呼び出し側=search.py が
+        キーワード検索を諦めてベクタ検索のみにフォールバックできるように）。
+        """
+        if not self.fts_enabled:
+            return []
+        self._sync_fts_if_stale()
+        if not fts_query.strip():
+            return []
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT c.id AS id, bm25(chunks_fts) AS score
+                FROM chunks_fts
+                JOIN chunks c ON c.rowid = chunks_fts.rowid
+                WHERE chunks_fts MATCH ? AND c.notebook = ?
+                ORDER BY score
+                LIMIT ?
+                """,
+                (fts_query, notebook, limit),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(row["id"], row["score"]) for row in rows]
 
     # -- document_tags（文書タグ。学び抽出パイプラインが付与） -------------------
 

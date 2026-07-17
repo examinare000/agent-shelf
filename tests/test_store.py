@@ -1119,3 +1119,175 @@ class TestDocumentTags:
         _make_notebook(store, name="physics")
 
         assert store.list_tags_by_notebook() == {}
+
+
+class TestKeywordTopK:
+    """FTS5（trigram tokenizer）によるキーワード検索索引 chunks_fts。"""
+
+    def test_fts_enabled_is_true_on_this_sqlite_build(self, store):
+        # このプロジェクトの動作環境（uv 管理の Python）は fts5+trigram が有効な
+        # SQLite にリンクされている前提（実装ノート参照）。無効ならフェイルソフト
+        # パス（別テストで検証）が働くはずなのでここでは有効を確認する。
+        assert store.fts_enabled is True
+
+    def test_keyword_topk_returns_matching_chunk_ids_ordered_by_relevance(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", text="quantum entanglement basics quantum quantum"),
+                _chunk_row(id_="doc1#1", seq=1, text="classical mechanics overview"),
+            ]
+        )
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_filters_by_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="math", origin="doc2.pdf",
+                        normalized_path="corpus/math/doc2.md")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", notebook="physics", doc_id="doc1",
+                           text="quantum entanglement"),
+                _chunk_row(id_="doc2#0", notebook="math", doc_id="doc2",
+                           source_path="corpus/math/doc2.md", text="quantum computing basics"),
+            ]
+        )
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_reflects_new_chunks_after_upsert(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="classical mechanics")])
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+        store.upsert_chunks([_chunk_row(id_="doc1#1", seq=1, text="quantum entanglement")])
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#1"]
+
+    def test_keyword_topk_excludes_deleted_chunks(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        assert len(store.keyword_topk("physics", "quantum", limit=10)) == 1
+
+        store.delete_by_source_file("corpus/physics/doc1.md")
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+    def test_keyword_topk_returns_empty_list_for_blank_query(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        assert store.keyword_topk("physics", "   ", limit=10) == []
+        assert store.keyword_topk("physics", "", limit=10) == []
+
+    def test_keyword_topk_returns_empty_list_for_invalid_match_syntax(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        # 未閉じの引用符は fts5 MATCH 構文エラーになる（ユーザー由来クエリなので
+        # 例外にせず劣化させる）。
+        assert store.keyword_topk("physics", '"unterminated', limit=10) == []
+
+    def test_keyword_topk_returns_empty_list_when_fts_disabled(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store.fts_enabled = False  # fts5/trigram が使えない環境の劣化パスを強制検証
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+
+class TestFtsLazyRebuild:
+    """chunks_fts の再構築(_rebuild_fts=`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`)
+    を書き込みごとに無条件実行するのではなく、次回の keyword_topk 呼び出し時に
+    generation とのズレを検知して1回だけ遅延実行する(コードレビュー指摘#2)。
+    indexer.py はファイルごとに delete_by_source_file→upsert_chunks を呼ぶため、
+    書き込みごとの即時 rebuild は一括投入で O(N^2) 的コストになっていた。
+    """
+
+    @staticmethod
+    def _count_rebuilds(store, monkeypatch) -> dict[str, int]:
+        original = store._rebuild_fts
+        counter = {"n": 0}
+
+        def counting():
+            counter["n"] += 1
+            return original()
+
+        monkeypatch.setattr(store, "_rebuild_fts", counting)
+        return counter
+
+    def test_upsert_chunks_does_not_rebuild_fts_immediately(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        assert counter["n"] == 0
+
+    def test_two_consecutive_keyword_topk_calls_rebuild_fts_only_once(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        store.keyword_topk("physics", "quantum", limit=10)
+        store.keyword_topk("physics", "quantum", limit=10)
+
+        assert counter["n"] == 1
+
+    def test_write_then_keyword_topk_finds_new_chunk_and_rebuilds_once(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="classical mechanics")])
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+        store.upsert_chunks([_chunk_row(id_="doc1#1", seq=1, text="quantum entanglement")])
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#1"]
+        assert counter["n"] == 1
+
+    def test_reopening_store_with_new_instance_stays_in_sync(self, tmp_path):
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        _make_notebook(store1, name="physics")
+        _make_document(store1, id_="doc1", notebook="physics")
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store1.close()
+
+        store2 = Store(str(db_path))
+        try:
+            hits = store2.keyword_topk("physics", "quantum", limit=10)
+        finally:
+            store2.close()
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_returns_empty_list_when_fts_disabled_without_rebuild(
+        self, store, monkeypatch
+    ):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store.fts_enabled = False
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert counter["n"] == 0
