@@ -3,10 +3,11 @@
 外部 SDK・DB・subprocess・ネットワークを一切知らない。`json`（stdlib）+ `ports.py` の DTO
 + `names.py`（純粋）だけに依存することで、Shelver（shelver.py・オーケストレーション層）を
 差し替えても本モジュールは変更不要という境界を保つ（設計書 §3 依存方向 / §13.3 import
-ガード）。`routing.py` は `prompts._extract_json_payload` を共有再利用しているが、
-shelving.py の許容依存には prompts.py が含まれない（設計書 §13.3 が列挙する
-「json + ports.py + names.py だけ」を厳守するため）ので、同等のロジックを
-`_extract_json_payload` としてこのモジュール内に閉じて複製する。
+ガード）。JSON 抽出は `shelf.jsonutil.extract_json_payload` を共有利用する
+（コードレビュー指摘 P12: 従来は prompts.py が §13.3 の許容依存に含まれないという
+理由で shelving.py 内に同一ロジックを複製していたが、jsonutil.py は json のみに
+依存する stdlib-only の leaf モジュールであり §13.3 の依存境界契約を壊さないため、
+複製せずそのまま import できる）。
 
 classify_step は「幻覚 notebook 名の除去」「名前正規化・衝突連番」を二重防御として
 一手に引き受ける（設計書 §13.4/§13.5）。呼び出し側（Shelver）は working カタログ
@@ -19,6 +20,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from shelf.jsonutil import extract_json_payload
 from shelf.names import assign_unique_name, normalize_notebook_name
 from shelf.ports import (
     ClassificationDecision,
@@ -106,7 +108,7 @@ def parse_classification(text: str) -> ClassificationDecision:
     （新規作成への再解釈）に委ねる。description は必須に含めないため、欠落・
     非文字列はいずれも None として許容する（§13.4: `new` 以外では不要）。
     """
-    payload = _extract_json_payload(text)
+    payload = extract_json_payload(text)
     data = None
     if payload is not None:
         try:
@@ -139,14 +141,6 @@ def parse_classification(text: str) -> ClassificationDecision:
 
 def _parse_failure() -> ClassificationDecision:
     return ClassificationDecision(action="", notebook="", reason="", parse_ok=False, description=None)
-
-
-def _extract_json_payload(text: str) -> str | None:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start : end + 1]
 
 
 @dataclass(frozen=True)

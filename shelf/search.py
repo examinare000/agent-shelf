@@ -60,6 +60,20 @@ _MAX_FTS_TERMS = 32
 _MIN_RUN_LEN = 3  # trigram tokenizer は3文字未満のランを索引できない（照合不能）。
 
 
+def _even_stride_indices(n: int, k: int) -> list[int]:
+    """0..n-1 の範囲から、先頭(0)・末尾(n-1)を必ず含む k 個の均等ストライド添字を
+    昇順・重複除去で返す（丸め込みで重複した場合は結果的に k 未満になり得る）。
+
+    digests.py の _even_stride_indices（reduce 入力の間引き選択向け）と同一実装の
+    双子。search.py は「sqlite3 も import しない」依存最小方針（モジュール冒頭
+    docstring）を保つため shelf.digests には依存せず、この6行だけを複製する
+    （コードレビュー指摘#7）。
+    """
+    if k <= 1:
+        return [0]
+    return sorted({round(i * (n - 1) / (k - 1)) for i in range(k)})
+
+
 def _quote(term: str) -> str:
     # FTS5 標準の quoted-string escaping（`"` を `""` に二重化）。文字クラスの
     # ランに分割した後は `"` はラン境界として弾かれ term 内には現れない想定だが、
@@ -94,8 +108,12 @@ def build_fts_query(question: str) -> str:
     語同士は AND ではなく OR で結合する: デフォルトの AND だと質問文の全語一致に
     まで絞られ recall が落ちるため、trigram tokenizer 前提で部分一致が効く
     この用途では OR で広く拾うほうが望ましい。
-    重複タームは初出順を保ったまま除去し、クエリ肥大を防ぐため先頭
-    _MAX_FTS_TERMS 件（既定32）に切り詰める（先頭優先）。
+    重複タームは初出順を保ったまま除去し、クエリ肥大を防ぐため上限
+    _MAX_FTS_TERMS 件（既定32）に絞り込む。上限を超える場合は先頭優先の
+    単純切り詰めではなく、質問文全体（初出順のリスト全体）に対する均等
+    ストライドサンプリングで選ぶ（コードレビュー指摘#7）。長い質問文を先頭
+    切り詰めすると後半の重要語がFTSタームに一切反映されず、キーワード
+    ランキングが質問全体を代表しなくなる不具合があったため。
     """
     terms: list[str] = []
     run_chars: list[str] = []
@@ -119,7 +137,10 @@ def build_fts_query(question: str) -> str:
             run_is_ascii = None
     flush()
 
-    unique_terms = list(dict.fromkeys(terms))[:_MAX_FTS_TERMS]
+    unique_terms = list(dict.fromkeys(terms))
+    if len(unique_terms) > _MAX_FTS_TERMS:
+        indices = _even_stride_indices(len(unique_terms), _MAX_FTS_TERMS)
+        unique_terms = [unique_terms[i] for i in indices]
     if not unique_terms:
         return ""
     return " OR ".join(_quote(term) for term in unique_terms)

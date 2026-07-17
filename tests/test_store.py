@@ -558,6 +558,82 @@ class TestChunkCRUD:
         assert ids == ["doc2#0"]
 
 
+class TestGetChunks:
+    """コードレビュー指摘#11: service._load_chunks が get_chunk を id ごとに
+    N回呼ぶ N+1 の解消用。get_chunks はまとめて1クエリ（大量ID時は500件区切り）
+    で取得し、結果を入力 ids の順序へ並べ替えて返す。"""
+
+    def _seed(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", seq=0, text="第0"),
+                _chunk_row(id_="doc1#1", seq=1, text="第1"),
+                _chunk_row(id_="doc1#2", seq=2, text="第2"),
+            ]
+        )
+
+    def test_returns_rows_reordered_to_match_input_id_order(self, store):
+        self._seed(store)
+
+        rows = store.get_chunks(["doc1#2", "doc1#0", "doc1#1"])
+
+        assert [row["id"] for row in rows] == ["doc1#2", "doc1#0", "doc1#1"]
+
+    def test_skips_missing_ids_while_preserving_order_of_the_rest(self, store):
+        self._seed(store)
+
+        rows = store.get_chunks(["doc1#0", "does-not-exist", "doc1#2"])
+
+        assert [row["id"] for row in rows] == ["doc1#0", "doc1#2"]
+
+    class _CountingConnProxy:
+        """sqlite3.Connection は C拡張型で execute の直接差し替えができないため
+        （test_keyword_topk_degrades_and_disables_fts_on_broken_read_state の
+        コメント参照）、Store._conn 自体を execute 呼び出し回数を数える薄い
+        プロキシへ差し替える。execute 以外は実接続へそのまま委譲する。"""
+
+        def __init__(self, real_conn):
+            self._real = real_conn
+            self.calls = 0
+
+        def execute(self, *args, **kwargs):
+            self.calls += 1
+            return self._real.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def test_empty_id_list_returns_empty_list_without_querying(self, store, monkeypatch):
+        proxy = self._CountingConnProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+
+        assert store.get_chunks([]) == []
+        assert proxy.calls == 0
+
+    def test_issues_a_single_query_for_many_ids(self, store, monkeypatch):
+        self._seed(store)
+        proxy = self._CountingConnProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+
+        store.get_chunks(["doc1#0", "doc1#1", "doc1#2"])
+
+        assert proxy.calls == 1
+
+    def test_batches_queries_at_500_ids_per_statement(self, store, monkeypatch):
+        # SQLite バインドパラメータ上限を踏まえた分割。存在しないIDでも
+        # クエリの発行回数だけを検証すれば十分なため、実データは作らない。
+        proxy = self._CountingConnProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+        ids = [f"missing#{i}" for i in range(501)]
+
+        result = store.get_chunks(ids)
+
+        assert result == []
+        assert proxy.calls == 2
+
+
 class TestChunkKind:
     def test_upsert_chunks_defaults_kind_to_body(self, store):
         _make_notebook(store, name="physics")
@@ -1121,6 +1197,41 @@ class TestDocumentTags:
 
         assert store.list_tags_by_notebook() == {}
 
+    def test_list_notebook_tags_returns_more_than_15_tags_uncapped(self, store):
+        # コードレビュー指摘#14: list_tags_by_notebook の limit_per_notebook=15 は
+        # UI一覧用のcapで、digest reduce の再利用タグカタログには不適切に流用
+        # されていた。list_notebook_tags は同じcapを継承しない専用APIにする。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="physics", origin="doc2.pdf",
+                        normalized_path="corpus/physics/doc2.md")
+        _make_document(store, id_="doc3", notebook="physics", origin="doc3.pdf",
+                        normalized_path="corpus/physics/doc3.md")
+        tags = [f"tag{i:02d}" for i in range(20)]
+        store.replace_document_tags("physics", "doc1", tags[0:7])
+        store.replace_document_tags("physics", "doc2", tags[7:14])
+        store.replace_document_tags("physics", "doc3", tags[14:20])
+
+        result = store.list_notebook_tags("physics")
+
+        assert result == tags
+
+    def test_list_notebook_tags_excludes_other_notebooks(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="math", origin="doc2.pdf",
+                        normalized_path="corpus/math/doc2.md")
+        store.replace_document_tags("physics", "doc1", ["物理タグ"])
+        store.replace_document_tags("math", "doc2", ["数学タグ"])
+
+        assert store.list_notebook_tags("physics") == ["物理タグ"]
+
+    def test_list_notebook_tags_returns_empty_list_when_no_tags(self, store):
+        _make_notebook(store, name="physics")
+
+        assert store.list_notebook_tags("physics") == []
+
 
 class TestListChunks:
     """doc 単位・kind 別のチャンク一覧取得（map-reduce 学び抽出の入力用）。"""
@@ -1287,6 +1398,38 @@ class TestKeywordTopK:
 
         assert store.keyword_topk("physics", "quantum", limit=10) == []
 
+    def test_keyword_topk_degrades_and_disables_fts_on_broken_read_state(
+        self, store, monkeypatch, caplog
+    ):
+        """コードレビュー指摘#1: 読み取り(MATCH SELECT)自体が壊れている(read-only DB・
+        fts5 モジュール消失等)場合も keyword_topk の docstring 契約どおり例外にせず
+        [] に劣化させ、以後の呼び出しでは fts_enabled を落として静かにスキップし
+        続けることを検証する(壊れたクエリを毎回再実行して警告ログを連発しない)。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store._conn.execute("DROP TABLE chunks_fts")  # 読み取りが壊れた状態を人工的に作る
+
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+        assert store.fts_enabled is False
+        assert len(caplog.records) == 1  # 警告は初回失敗時に1回だけ
+
+        # フラグが立った後、壊れた接続へ再クエリしないことを保証する。
+        # sqlite3.Connection は C 拡張型でメソッドの直接差し替えができないため、
+        # Store._conn 自体を MagicMock に差し替えて execute 未呼び出しを検証する。
+        from unittest.mock import MagicMock
+
+        fake_conn = MagicMock()
+        monkeypatch.setattr(store, "_conn", fake_conn)
+
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+        fake_conn.execute.assert_not_called()
+        assert len(caplog.records) == 1  # 2回目の呼び出しで警告が増えない(黙ってスキップ)
+
     def test_keyword_topk_hits_japanese_natural_sentence_via_build_fts_query(self, store):
         # コードレビュー指摘#1の再現/回帰テスト: build_fts_query が空白分割のままだと
         # スペースなしの日本語自然文が丸ごと1フレーズになりtrigram索引に一致せず
@@ -1324,12 +1467,84 @@ class TestKeywordTopK:
         assert {chunk_id for chunk_id, _score in hits} == {"doc1#0", "doc1#1"}
 
 
-class TestFtsLazyRebuild:
-    """chunks_fts の再構築(_rebuild_fts=`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`)
-    を書き込みごとに無条件実行するのではなく、次回の keyword_topk 呼び出し時に
-    generation とのズレを検知して1回だけ遅延実行する(コードレビュー指摘#2)。
-    indexer.py はファイルごとに delete_by_source_file→upsert_chunks を呼ぶため、
-    書き込みごとの即時 rebuild は一括投入で O(N^2) 的コストになっていた。
+class TestFtsInitProbe:
+    """コードレビュー指摘#2: 既存 chunks_fts テーブルに対する
+    `CREATE VIRTUAL TABLE IF NOT EXISTS` はテーブル既存時にモジュール検証を
+    行わない(USING no_such_module ですら成功する)ため、_init_fts は実際に
+    MATCH を実行するプローブクエリで fts5/trigram の動作を検証する。
+    """
+
+    def test_pre_existing_fts_table_disables_when_probe_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))  # 通常起動で chunks_fts を作成しておく(テーブル既存化)
+        store1.close()
+
+        def failing_probe(self):
+            raise sqlite3.OperationalError("simulated: trigram tokenizer unavailable")
+
+        monkeypatch.setattr(Store, "_probe_fts", failing_probe)
+
+        with caplog.at_level("WARNING"):
+            store2 = Store(str(db_path))
+        try:
+            assert store2.fts_enabled is False
+            # コードレビュー指摘: _init_fts の劣化時にログが出ない不具合の回帰
+            # テスト。DB オープン時に FTS が無効化された事実は運用上observableで
+            # あるべきなので、_fts_disable_after_failure 経由で警告が1回出る。
+            assert len(caplog.records) == 1
+        finally:
+            store2.close()
+
+    def test_migration_backfill_failure_disables_and_logs_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # _init_fts の初回バックフィル(_rebuild_fts)が失敗した場合も
+        # _fts_disable_after_failure 経由で警告ログを残すことを検証する
+        # (コードレビュー指摘: 劣化時にログが出ない不具合の回帰テスト)。
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        _make_notebook(store1, name="physics")
+        _make_document(store1, id_="doc1", notebook="physics")
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store1._conn.execute("DROP TABLE chunks_fts")  # FTS 未導入の旧 DB を模す(chunks は既存)
+        store1._conn.commit()
+        store1.close()
+
+        def failing_rebuild(self):
+            raise sqlite3.OperationalError("simulated: rebuild failed during migration")
+
+        monkeypatch.setattr(Store, "_rebuild_fts", failing_rebuild)
+
+        with caplog.at_level("WARNING"):
+            store2 = Store(str(db_path))
+        try:
+            assert store2.fts_enabled is False
+            assert len(caplog.records) == 1
+        finally:
+            store2.close()
+
+    def test_pre_existing_fts_table_stays_enabled_when_probe_succeeds(self, tmp_path):
+        # 対比用の正常系: プローブが成功する通常環境では、再オープンしても
+        # fts_enabled は True のままであることを確認する。
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        store1.close()
+
+        store2 = Store(str(db_path))
+        try:
+            assert store2.fts_enabled is True
+        finally:
+            store2.close()
+
+
+class TestFtsIncrementalSync:
+    """コードレビュー指摘#10: 読み取りパス(keyword_topk)での全コーパス再構築を
+    廃止し、chunks の書き込み経路(upsert_chunks/delete_by_source_file/
+    delete_notebook)側で行単位に chunks_fts を同期する。_rebuild_fts は
+    「chunks_fts が今回新規作成され、かつ chunks に既存データがある」場合の
+    一度きりの移行/バックフィル専用として残す。
     """
 
     @staticmethod
@@ -1344,41 +1559,77 @@ class TestFtsLazyRebuild:
         monkeypatch.setattr(store, "_rebuild_fts", counting)
         return counter
 
-    def test_upsert_chunks_does_not_rebuild_fts_immediately(self, store, monkeypatch):
+    def test_upsert_chunks_syncs_fts_immediately_without_full_rebuild(self, store, monkeypatch):
+        # 書き込み直後の1回の keyword_topk 呼び出しだけで新規チャンクが見つかり、
+        # かつ全文再構築(_rebuild_fts)が一切走らないことを検証する
+        # (旧: read-time lazy rebuild は1回走っていたが、今回の行単位同期では不要)。
         _make_notebook(store, name="physics")
         _make_document(store, id_="doc1", notebook="physics")
         counter = self._count_rebuilds(store, monkeypatch)
 
         store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        hits = store.keyword_topk("physics", "quantum", limit=10)
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+        assert counter["n"] == 0
+
+    def test_keyword_topk_never_triggers_full_rebuild(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        store.keyword_topk("physics", "quantum", limit=10)
+        store.keyword_topk("physics", "quantum", limit=10)
 
         assert counter["n"] == 0
 
-    def test_two_consecutive_keyword_topk_calls_rebuild_fts_only_once(self, store, monkeypatch):
-        _make_notebook(store, name="physics")
-        _make_document(store, id_="doc1", notebook="physics")
-        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
-        counter = self._count_rebuilds(store, monkeypatch)
-
-        store.keyword_topk("physics", "quantum", limit=10)
-        store.keyword_topk("physics", "quantum", limit=10)
-
-        assert counter["n"] == 1
-
-    def test_write_then_keyword_topk_finds_new_chunk_and_rebuilds_once(self, store, monkeypatch):
+    def test_updating_existing_chunk_text_replaces_old_fts_entry(self, store, monkeypatch):
+        # 同一 id への再 upsert(本文更新)で旧テキストの索引が残らず、新テキストの
+        # みが検索できることを検証する(外部コンテンツ FTS の rowid 据え置き
+        # delete→insert が正しく機能することの回帰テスト)。
         _make_notebook(store, name="physics")
         _make_document(store, id_="doc1", notebook="physics")
         store.upsert_chunks([_chunk_row(id_="doc1#0", text="classical mechanics")])
         assert store.keyword_topk("physics", "quantum", limit=10) == []
-
-        store.upsert_chunks([_chunk_row(id_="doc1#1", seq=1, text="quantum entanglement")])
         counter = self._count_rebuilds(store, monkeypatch)
 
-        hits = store.keyword_topk("physics", "quantum", limit=10)
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
 
-        assert [chunk_id for chunk_id, _score in hits] == ["doc1#1"]
-        assert counter["n"] == 1
+        assert [
+            chunk_id for chunk_id, _score in store.keyword_topk("physics", "quantum", limit=10)
+        ] == ["doc1#0"]
+        assert store.keyword_topk("physics", "classical", limit=10) == []
+        assert counter["n"] == 0
+
+    def test_delete_by_source_file_removes_fts_entries_without_full_rebuild(
+        self, store, monkeypatch
+    ):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        store.delete_by_source_file("corpus/physics/doc1.md")
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert counter["n"] == 0
+
+    def test_delete_notebook_removes_fts_entries_without_full_rebuild(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        counter = self._count_rebuilds(store, monkeypatch)
+
+        store.delete_notebook("physics")
+        _make_notebook(store, name="physics")  # 検索対象の notebook 名を復元(削除確認用)
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert counter["n"] == 0
 
     def test_reopening_store_with_new_instance_stays_in_sync(self, tmp_path):
+        # 書き込み側で常に同期済みになったため、通常の再オープンでは
+        # 追加のバックフィルなしにそのまま検索できる。
         db_path = tmp_path / "shelf.db"
         store1 = Store(str(db_path))
         _make_notebook(store1, name="physics")
@@ -1394,6 +1645,49 @@ class TestFtsLazyRebuild:
 
         assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
 
+    def test_reopening_db_with_pre_existing_chunks_but_no_fts_table_backfills_once(
+        self, tmp_path, monkeypatch
+    ):
+        # 移行シナリオ: chunks_fts が存在しない旧 DB(chunks に既存データあり)を
+        # 開くと、_init_fts が一度だけバックフィルする。バックフィル後の読み取りが
+        # 追加の全文再構築を引き起こさないことも合わせて確認する。
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        _make_notebook(store1, name="physics")
+        _make_document(store1, id_="doc1", notebook="physics")
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store1._conn.execute("DROP TABLE chunks_fts")  # FTS 未導入の旧 DB を模す
+        store1._conn.commit()
+        store1.close()
+
+        store2 = Store(str(db_path))
+        try:
+            counter = self._count_rebuilds(store2, monkeypatch)
+            hits = store2.keyword_topk("physics", "quantum", limit=10)
+            assert counter["n"] == 0  # 起動時のバックフィルのみ。読み取りでは再構築しない
+        finally:
+            store2.close()
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_fresh_db_with_no_chunks_does_not_rebuild_fts_on_init(self, monkeypatch):
+        # chunks が空の全くの新規 DB では、バックフィルすべき対象が無いため
+        # _rebuild_fts を呼ばない(空テーブルへの無駄な rebuild を避ける)。
+        counter = {"n": 0}
+        original = Store._rebuild_fts
+
+        def counting(self):
+            counter["n"] += 1
+            return original(self)
+
+        monkeypatch.setattr(Store, "_rebuild_fts", counting)
+
+        s = Store(":memory:")
+        try:
+            assert counter["n"] == 0
+        finally:
+            s.close()
+
     def test_keyword_topk_returns_empty_list_when_fts_disabled_without_rebuild(
         self, store, monkeypatch
     ):
@@ -1405,3 +1699,70 @@ class TestFtsLazyRebuild:
 
         assert store.keyword_topk("physics", "quantum", limit=10) == []
         assert counter["n"] == 0
+
+    def test_upsert_chunks_batches_fts_sync_for_large_chunk_counts(self, store):
+        # コードレビュー指摘: IN句バッチ分割欠如。get_chunks が
+        # _GET_CHUNKS_BATCH_SIZE(500) 件ごとに分割しているのに対し、chunks_fts の
+        # 行単位同期は無分割の IN (...) を構築していたため、1ファイルのチャンクが
+        # バインドパラメータ上限(環境依存)を超えると sqlite3.Error →
+        # _fts_disable_after_failure でキーワード検索全体が静かに停止していた。
+        # バッチ境界(500)をまたぐ 501 件を投入し、分割後も同期が成功し
+        # fts_enabled=True のまま全件検索できることを検証する。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        n = Store._GET_CHUNKS_BATCH_SIZE + 1
+        rows = [
+            _chunk_row(id_=f"doc1#{i}", seq=i, text=f"quantum entanglement chunk number {i}")
+            for i in range(n)
+        ]
+
+        store.upsert_chunks(rows)
+
+        assert store.fts_enabled is True
+        hits = store.keyword_topk("physics", "quantum", limit=n + 10)
+        assert len(hits) == n
+
+    def test_fts_capture_rows_by_ids_splits_into_batch_sized_calls(self, store, monkeypatch):
+        # sqlite3 のバインド上限は環境依存で、この開発環境では実際にクラッシュを
+        # 再現できないため、分割ロジック自体を呼び出し回数で直接検証する
+        # (_fts_capture_rows へ委譲する各バッチが _GET_CHUNKS_BATCH_SIZE 件以下に
+        # なることの回帰テスト)。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        batch_size = Store._GET_CHUNKS_BATCH_SIZE
+        ids = [f"doc1#{i}" for i in range(batch_size + 1)]
+        call_sizes: list[int] = []
+        original = store._fts_capture_rows
+
+        def spy(where_clause, params):
+            call_sizes.append(len(params))
+            return original(where_clause, params)
+
+        monkeypatch.setattr(store, "_fts_capture_rows", spy)
+
+        store._fts_capture_rows_by_ids(ids)
+
+        assert call_sizes == [batch_size, 1]
+
+    def test_fts_insert_rows_splits_into_batch_sized_calls(self, store, monkeypatch):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        batch_size = Store._GET_CHUNKS_BATCH_SIZE
+        rows = [
+            _chunk_row(id_=f"doc1#{i}", seq=i, text=f"quantum entanglement chunk number {i}")
+            for i in range(batch_size + 1)
+        ]
+        store.upsert_chunks(rows)
+        ids = [row["id"] for row in rows]
+        call_sizes: list[int] = []
+        original = store._fts_insert_rows_batch
+
+        def spy(batch_ids):
+            call_sizes.append(len(batch_ids))
+            return original(batch_ids)
+
+        monkeypatch.setattr(store, "_fts_insert_rows_batch", spy)
+
+        store._fts_insert_rows(ids)
+
+        assert call_sizes == [batch_size, 1]

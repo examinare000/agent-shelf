@@ -183,12 +183,51 @@ def test_build_fts_query_deduplicates_terms_keeping_first_occurrence_order():
     assert result == '"quantum" OR "classical"'
 
 
-def test_build_fts_query_caps_total_term_count_preferring_earlier_terms():
+def test_build_fts_query_caps_total_term_count_via_even_stride_sampling():
+    # コードレビュー指摘#7: 先頭32件への単純切り詰めだと長い質問文の後半が
+    # 一切FTSタームに反映されない。均等ストライドで全体をカバーすることを検証する。
     words = [f"w{i:03d}" for i in range(40)]  # 40個のユニークな3文字以上ASCII語
     question = " ".join(words)
 
     result = build_fts_query(question)
 
     terms = result.split(" OR ")
+    # n=40, k=32 の均等ストライド添字（先頭・末尾を必ず含む）: 手計算値。
+    expected_indices = [
+        0, 1, 3, 4, 5, 6, 8, 9, 10, 11, 13, 14, 15, 16, 18, 19,
+        20, 21, 23, 24, 25, 26, 28, 29, 30, 31, 33, 34, 35, 36, 38, 39,
+    ]
     assert len(terms) == 32
-    assert terms == [f'"{w}"' for w in words[:32]]
+    assert terms == [f'"{words[i]}"' for i in expected_indices]
+    # 旧実装（先頭32件切り詰め）なら含まれ得なかった後半由来のタームが
+    # 含まれていることを示す（単純truncationとの差分を明示的に検証）。
+    assert any(int(t[2:-1]) >= 32 for t in terms)
+
+
+def test_build_fts_query_even_stride_covers_head_middle_and_tail_of_long_cjk_question():
+    # 長い日本語質問文でも先頭付近だけでなく文全体からタームが選ばれることを
+    # 検証する。トライグラムの位置を一意に特定できるよう、CJK統一漢字を
+    # 1文字ずつ変えた合成文字列（意味を持たない）を使う。
+    question = "".join(chr(0x4E00 + i) for i in range(50))  # 50文字の非ASCIIラン → 48トライグラム
+
+    result = build_fts_query(question)
+
+    terms = result.split(" OR ")
+    assert len(terms) == 32
+    all_trigrams = [question[i : i + 3] for i in range(len(question) - 2)]
+    first_term = f'"{all_trigrams[0]}"'
+    last_term = f'"{all_trigrams[-1]}"'
+    assert terms[0] == first_term
+    assert terms[-1] == last_term
+    # 中間（トライグラム添字 20〜27付近）由来のタームも含まれる＝先頭偏重の
+    # 切り詰めでは絶対に出てこない範囲がカバーされていることの確認。
+    middle_terms = {f'"{t}"' for t in all_trigrams[20:28]}
+    assert middle_terms & set(terms)
+
+
+def test_build_fts_query_unchanged_when_under_cap():
+    # 質問文が短くタームがcapを超えない場合は、ストライド間引きを経由せず
+    # 従来通り全タームがそのまま出現順で使われる。
+    result = build_fts_query("quantum classical mechanics")
+
+    assert result == '"quantum" OR "classical" OR "mechanics"'

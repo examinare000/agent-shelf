@@ -8,11 +8,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notebooks (
@@ -192,7 +196,8 @@ class Store:
         # 環境があるため、作成に失敗したら fts_enabled=False にフェイルソフトする
         # （キーワード検索は諦めるが、他の永続化機能はブロックしない）。
         # sqlite_master を CREATE 前に見ておくことで「今回新規作成したか」を判定し、
-        # 新規作成時のみ既存 chunks から一括バックフィルする（毎起動 rebuild は無駄）。
+        # 新規作成時かつ chunks に既存データがある場合のみ一括バックフィルする
+        # （移行専用。毎起動 rebuild や空テーブルへの rebuild は無駄）。
         already_existed = (
             self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
@@ -204,44 +209,143 @@ class Store:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5("
                 "text, content='chunks', content_rowid='rowid', tokenize='trigram')"
             )
-        except sqlite3.OperationalError:
+            # コードレビュー指摘#2: CREATE ... IF NOT EXISTS はテーブルが既存の場合
+            # モジュール検証を行わない（USING no_such_module のような壊れた定義でも
+            # テーブルが既存なら成功してしまう）。そのため MATCH を実際に実行する
+            # プローブクエリで fts5 モジュール + trigram tokenizer の動作を検証する。
+            self._probe_fts()
+        except sqlite3.Error as exc:
             self._conn.rollback()
-            self.fts_enabled = False
+            # コードレビュー指摘: 初期化時の劣化は _fts_disable_after_failure を
+            # 経由させ、fts_enabled=False にする事実を必ず警告ログへ残す
+            # （以前は直接代入していたため、DB オープン時に FTS が無効化された
+            # ことが運用ログから観測できなかった）。
+            self._fts_disable_after_failure("初期化", exc)
             return
         self.fts_enabled = True
         if not already_existed:
-            # 新規作成時のみ既存 chunks から一括バックフィルする。この時点で
-            # 現在の generation との同期が取れているので fts_generation に
-            # 記録しておき、直後の最初の keyword_topk 呼び出しでの無駄な
-            # 二重 rebuild を避ける。
-            self._rebuild_fts()
-            self.set_meta("fts_generation", str(self._current_generation()))
+            has_chunks = self._conn.execute("SELECT 1 FROM chunks LIMIT 1").fetchone() is not None
+            if has_chunks:
+                # 旧 DB（chunks_fts 導入前に作られた・chunks に既存データあり）を
+                # 開いたときだけの一度きりの移行バックフィル。以後の同期は
+                # upsert_chunks/delete_by_source_file/delete_notebook 側の
+                # 行単位更新に委ねる（コードレビュー指摘#10: 読み取りパスでの
+                # 全コーパス再構築の廃止）。
+                try:
+                    self._rebuild_fts()
+                except sqlite3.Error as exc:
+                    self._fts_disable_after_failure("初期化", exc)
         self._conn.commit()
 
+    def _probe_fts(self) -> None:
+        # 既存テーブルに対する CREATE ... IF NOT EXISTS はモジュール検証を行わない
+        # ため、実際に MATCH を実行して fts5 モジュール + trigram tokenizer が
+        # 使える環境かどうかを確認する（コードレビュー指摘#2）。結果は使わず、
+        # 例外の有無だけを見る。
+        self._conn.execute(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?", ("probe",)
+        ).fetchone()
+
     def _rebuild_fts(self) -> None:
-        # keyword_topk 冒頭の遅延同期フックからのみ呼ぶ（§ 遅延 rebuild）。content=
-        # 外部コンテンツテーブルなのでトリガーではなくこの明示 rebuild で追従させる
+        # _init_fts の一度きりの移行バックフィル専用（コードレビュー指摘#10により
+        # keyword_topk からの read-time 遅延呼び出しは廃止）。content= 外部
+        # コンテンツテーブルなのでトリガーではなくこの明示 rebuild で追従させる
         # （設計判断: トリガーは使わない方針）。呼び出し元の commit に相乗りする
         # ため、ここ自体ではコミットしない。
         if self.fts_enabled:
             self._conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
 
-    def _sync_fts_if_stale(self) -> None:
-        # chunks への書き込みごとに rebuild していた旧実装は、indexer.py の
-        # delete_by_source_file→upsert_chunks（1ファイルにつき2回）や一括投入で
-        # O(N^2) 的コストになっていた（コードレビュー指摘#2）。書き込み側の
-        # _bump_generation は既に全ての chunks 変更経路を網羅しているため、
-        # ここでは「chunks_fts が最後に同期された generation」を meta に永続化し、
-        # 現在の generation とズレていれば読み取り時に1回だけ rebuild する
-        # （プロセス内キャッシュの generation 無効化と同じ発想を read-time
-        # rebuild に転用）。meta 永続なのでプロセス跨ぎ・再起動後も正しく検知できる
-        # （初回・fts_generation 未記録時は必ず rebuild する）。
-        current = self._current_generation()
-        synced = self.get_meta("fts_generation")
-        if synced is not None and int(synced) == current:
+    def _fts_disable_after_failure(self, context: str, exc: Exception) -> None:
+        # コードレビュー指摘#1: fts5/trigram が壊れた環境（read-only DB・モジュール
+        # 消失等）では例外にせず劣化させ、以後の呼び出しでは同じ壊れた経路を
+        # 再実行しない。fts_enabled=False にすることで、各メソッド冒頭の
+        # `if not self.fts_enabled: return` に自然に短絡し、警告ログも
+        # この失敗時の1回だけで済む（毎回ログを連発しない）。
+        _logger.warning("chunks_fts の%sに失敗したためキーワード検索を無効化します: %r", context, exc)
+        self.fts_enabled = False
+
+    def _fts_capture_rows(self, where_clause: str, params: tuple) -> list[tuple[int, str]]:
+        """外部コンテンツ FTS の 'delete' コマンドに必要な (rowid, text) を、
+        chunks の上書き/削除より前に退避する（delete コマンドは索引時と同じ
+        テキストを渡す必要があるため、上書き後では取得できない）。where_clause は
+        呼び出し元（Store 内部メソッド）が固定文字列で渡す内部専用引数であり、
+        値は全て params 経由のバインドパラメータになるため f-string 直書きでも
+        injection の懸念はない（_add_missing_columns と同様の設計判断）。
+        """
+        if not self.fts_enabled:
+            return []
+        try:
+            rows = self._conn.execute(
+                f"SELECT rowid, text FROM chunks WHERE {where_clause}", params
+            ).fetchall()
+        except sqlite3.Error as exc:
+            self._fts_disable_after_failure("退避読み取り", exc)
+            return []
+        return [(row["rowid"], row["text"]) for row in rows]
+
+    def _fts_capture_rows_by_ids(self, ids: list[str]) -> list[tuple[int, str]]:
+        """id 群に対応する chunks_fts delete 用 (rowid, text) を退避する。
+        get_chunks（_GET_CHUNKS_BATCH_SIZE）と同じ分割単位で IN 句を分割する
+        （コードレビュー指摘: 無分割の IN (...) は1ファイルのチャンクが多い場合に
+        SQLite のバインドパラメータ上限（環境依存）を超えて sqlite3.Error となり、
+        _fts_disable_after_failure でキーワード検索全体が静かに停止していた）。
+        """
+        if not ids:
+            return []
+        rows: list[tuple[int, str]] = []
+        for start in range(0, len(ids), self._GET_CHUNKS_BATCH_SIZE):
+            batch = ids[start : start + self._GET_CHUNKS_BATCH_SIZE]
+            rows.extend(
+                self._fts_capture_rows(f"id IN ({','.join('?' for _ in batch)})", tuple(batch))
+            )
+        return rows
+
+    def _fts_delete_rows(self, rows: list[tuple[int, str]]) -> None:
+        """_fts_capture_rows で退避した (rowid, text) を chunks_fts から削除する。"""
+        if not self.fts_enabled or not rows:
             return
-        self._rebuild_fts()
-        self.set_meta("fts_generation", str(current))
+        try:
+            self._conn.executemany(
+                "INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', ?, ?)",
+                rows,
+            )
+        except sqlite3.Error as exc:
+            self._fts_disable_after_failure("削除同期", exc)
+
+    def _fts_insert_rows(self, ids: list[str]) -> None:
+        """id 群に対応する現在の (rowid, text) を chunks から読み直し、
+        chunks_fts へ挿入する（upsert 直後に呼ぶことで、新規行・更新行の
+        双方を一括で反映できる。更新行は ON CONFLICT DO UPDATE で rowid が
+        据え置かれるため、_fts_delete_rows の削除対象と同じ rowid に
+        insert し直すことになる）。get_chunks と同じ _GET_CHUNKS_BATCH_SIZE 件
+        ごとにバッチ分割する（コードレビュー指摘: IN句バッチ分割欠如）。
+        """
+        if not self.fts_enabled or not ids:
+            return
+        for start in range(0, len(ids), self._GET_CHUNKS_BATCH_SIZE):
+            if not self.fts_enabled:
+                # 前バッチの失敗で _fts_disable_after_failure により既に
+                # 無効化されている場合、以降のバッチは実行しない。
+                return
+            batch = ids[start : start + self._GET_CHUNKS_BATCH_SIZE]
+            self._fts_insert_rows_batch(batch)
+
+    def _fts_insert_rows_batch(self, ids: list[str]) -> None:
+        """_fts_insert_rows の1バッチ分（最大 _GET_CHUNKS_BATCH_SIZE 件）を処理する。"""
+        # placeholders は "?" の個数分の定型文字列で、実データ(ids)は全て
+        # 後続のバインドパラメータとして渡すため f-string 直書きでも
+        # injection の懸念はない。
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            rows = self._conn.execute(
+                f"SELECT rowid, text FROM chunks WHERE id IN ({placeholders})", ids
+            ).fetchall()
+            self._conn.executemany(
+                "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+                [(row["rowid"], row["text"]) for row in rows],
+            )
+        except sqlite3.Error as exc:
+            self._fts_disable_after_failure("挿入同期", exc)
 
     # -- generation（ベクタキャッシュ無効化用カウンタ） ---------------------------
 
@@ -311,6 +415,9 @@ class Store:
                 "SELECT DISTINCT source_path FROM chunks WHERE notebook = ?", (name,)
             ).fetchall()
         ]
+        # コードレビュー指摘#10: notebook 削除でも chunks_fts の該当行を行単位で
+        # 削除する（他の chunk 削除経路と同様、上書き前に (rowid, text) を退避）。
+        old_fts_rows = self._fts_capture_rows("notebook = ?", (name,))
         self._conn.execute("DELETE FROM chunks WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM study_notes WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM document_tags WHERE notebook = ?", (name,))
@@ -319,6 +426,7 @@ class Store:
         for source_path in source_paths:
             self._conn.execute("DELETE FROM file_state WHERE source_file = ?", (source_path,))
         self._bump_generation()
+        self._fts_delete_rows(old_fts_rows)
         self._conn.commit()
 
     # -- document --------------------------------------------------------------
@@ -429,6 +537,13 @@ class Store:
     def upsert_chunks(self, rows: list[dict]) -> None:
         """rows の各 dict は id/notebook/doc_id/source_path/seq/text/embedding が必須、
         section/page/kind は省略可（kind 既定 'body'）。dim は embedding の長さから自動算出する。"""
+        ids = [row["id"] for row in rows]
+        # コードレビュー指摘#10: 書き込み時に chunks_fts を行単位で同期することで、
+        # 読み取りパス（keyword_topk）での全コーパス再構築を不要にする。既存 id への
+        # 上書き（ON CONFLICT DO UPDATE）は旧テキストの索引を残さないよう、上書き前に
+        # (rowid, text) を退避しておく（新規 id は何もヒットせず、退避は空になる）。
+        # _fts_capture_rows_by_ids が get_chunks と同じ単位で IN 句を分割する。
+        old_fts_rows = self._fts_capture_rows_by_ids(ids)
         values = [
             (
                 row["id"],
@@ -466,11 +581,17 @@ class Store:
             values,
         )
         self._bump_generation()
+        # 上書き前の旧索引を消してから、上書き後の現在値で入れ直す。新規 id は
+        # old_fts_rows に含まれないため単純追加になる。
+        self._fts_delete_rows(old_fts_rows)
+        self._fts_insert_rows(ids)
         self._conn.commit()
 
     def delete_by_source_file(self, source_path: str) -> None:
+        old_fts_rows = self._fts_capture_rows("source_path = ?", (source_path,))
         self._conn.execute("DELETE FROM chunks WHERE source_path = ?", (source_path,))
         self._bump_generation()
+        self._fts_delete_rows(old_fts_rows)
         self._conn.commit()
 
     def get_chunk(self, id: str) -> dict | None:
@@ -482,6 +603,35 @@ class Store:
             (id,),
         ).fetchone()
         return None if row is None else dict(row)
+
+    _GET_CHUNKS_BATCH_SIZE = 500  # SQLite バインドパラメータ上限を踏まえた分割単位。
+
+    def get_chunks(self, ids: Sequence[str]) -> list[dict]:
+        """ids に対応するチャンクをまとめて取得し、入力 ids の順序へ並べ替えて返す
+        （存在しない id はスキップ）。
+
+        service._load_chunks が get_chunk を id ごとに N 回呼ぶ N+1（ハイブリッド
+        検索の候補プールは最大 2×top_k 件あり2倍化する）を1クエリへ集約する
+        （コードレビュー指摘#11）。SQLite のバインドパラメータ数には上限がある
+        ため _GET_CHUNKS_BATCH_SIZE 件ごとにクエリを分割する（呼び出し実態の
+        プールは小さいため通常は1回で完結する）。
+        """
+        if not ids:
+            return []
+        rows_by_id: dict[str, dict] = {}
+        for start in range(0, len(ids), self._GET_CHUNKS_BATCH_SIZE):
+            batch = ids[start : start + self._GET_CHUNKS_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                f"""
+                SELECT id, notebook, doc_id, source_path, section, page, seq, text, kind
+                FROM chunks WHERE id IN ({placeholders})
+                """,
+                tuple(batch),
+            ).fetchall()
+            for row in rows:
+                rows_by_id[row["id"]] = dict(row)
+        return [rows_by_id[id_] for id_ in ids if id_ in rows_by_id]
 
     def list_chunks(self, notebook: str, doc_id: str, *, kind: str = "body") -> list[dict]:
         """doc_id 内の指定 kind のチャンクを seq 昇順で返す（map-reduce 学び抽出の入力用）。
@@ -508,12 +658,14 @@ class Store:
         `(chunk_id, bm25スコア)` のリストを bm25 昇順（値が小さいほど良い一致＝
         fts5 の仕様）で返す。fts_enabled=False（fts5/trigram 非対応環境）・
         空/空白のみのクエリ・不正な MATCH 構文（ユーザー由来の生クエリなので
-        例外にせず劣化させる）は全て `[]` を返す（呼び出し側=search.py が
-        キーワード検索を諦めてベクタ検索のみにフォールバックできるように）。
+        例外にせず劣化させる）・read-only DB やモジュール消失等の実行時エラーは
+        全て `[]` を返す（呼び出し側=search.py がキーワード検索を諦めてベクタ検索
+        のみにフォールバックできるように）。chunks_fts の同期は upsert_chunks 等の
+        書き込み経路側で完了済みのため、ここでは読み取りのみを行う（コードレビュー
+        指摘#10）。
         """
         if not self.fts_enabled:
             return []
-        self._sync_fts_if_stale()
         if not fts_query.strip():
             return []
         try:
@@ -528,7 +680,11 @@ class Store:
                 """,
                 (fts_query, notebook, limit),
             ).fetchall()
-        except sqlite3.OperationalError:
+        except sqlite3.Error as exc:
+            # コードレビュー指摘#1: MATCH SELECT 自体の失敗（read-only DB・
+            # fts5 モジュール消失等）も例外にせず劣化させる。以前は書き込みを
+            # 伴う遅延同期がこの try/except の外側にあり、この契約を破っていた。
+            self._fts_disable_after_failure("読み取り", exc)
             return []
         return [(row["id"], row["score"]) for row in rows]
 
@@ -571,6 +727,22 @@ class Store:
             if len(bucket) < limit_per_notebook:
                 bucket.append(row["tag"])
         return result
+
+    def list_notebook_tags(self, notebook: str) -> list[str]:
+        """notebook 内の distinct タグ名をタグ名昇順で、上限なしで返す。
+
+        list_tags_by_notebook の limit_per_notebook=15 は UI 一覧表示専用の
+        docstring 契約であり、digest() の reduce プロンプトへ渡すタグ再利用
+        カタログにこれを流用すると15件超のタグが暗黙に切り捨てられる不具合
+        だった（コードレビュー指摘#14）。専用APIとして分離し、呼び出し元は
+        用途に応じて list_tags_by_notebook（UI/カタログ）とこちら
+        （reduce タグカタログ）を使い分ける。
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT tag FROM document_tags WHERE notebook = ? ORDER BY tag",
+            (notebook,),
+        ).fetchall()
+        return [row["tag"] for row in rows]
 
     # -- study_notes（学びノート・source-of-truth。indexer が kind='digest' チャンク化） ----
 

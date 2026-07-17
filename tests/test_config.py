@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import shelf.config as config
+import shelf.digests as digests
 
 
 def test_db_path_default_is_under_shelf_package_root():
@@ -206,6 +207,18 @@ def test_digest_max_notes_default_matches_reduce_phase_default():
     assert config.DIGEST_MAX_NOTES == 20
 
 
+def test_digest_max_notes_default_is_sourced_from_digests_reduce_default_notes(monkeypatch):
+    # コードレビュー指摘 P13: 既定値がコメントでの目視同期のみに依存していた
+    # (digests.py の REDUCE_DEFAULT_NOTES とここの 20 がずれても検知できなかった)。
+    # digests.REDUCE_DEFAULT_NOTES を差し替えて config を再読込し、config.py が
+    # 裸リテラルではなく実際にその定数を import して使っていることを固定する。
+    with monkeypatch.context() as m:
+        m.setattr(digests, "REDUCE_DEFAULT_NOTES", 99)
+        importlib.reload(config)
+        assert config.DIGEST_MAX_NOTES == 99
+    importlib.reload(config)
+
+
 def test_digest_max_notes_env_override(monkeypatch):
     with monkeypatch.context() as m:
         m.setenv("SHELF_DIGEST_MAX_NOTES", "3")
@@ -228,6 +241,16 @@ def test_digest_map_notes_default_is_five():
     assert config.DIGEST_MAP_NOTES == 5
 
 
+def test_digest_map_notes_default_is_sourced_from_digests_map_default_notes(monkeypatch):
+    # P13: digests.MAP_DEFAULT_NOTES との実際の import 関係を固定する(上の
+    # DIGEST_MAX_NOTES/REDUCE_DEFAULT_NOTES と対称のテスト)。
+    with monkeypatch.context() as m:
+        m.setattr(digests, "MAP_DEFAULT_NOTES", 99)
+        importlib.reload(config)
+        assert config.DIGEST_MAP_NOTES == 99
+    importlib.reload(config)
+
+
 def test_digest_map_notes_env_override(monkeypatch):
     with monkeypatch.context() as m:
         m.setenv("SHELF_DIGEST_MAP_NOTES", "3")
@@ -247,6 +270,17 @@ def test_digest_map_notes_invalid_value_falls_back_to_default(monkeypatch):
 def test_digest_map_window_chars_default_matches_digests_module_default():
     # digests.WINDOW_DEFAULT_CHARS(8000)と矛盾しない既定値であることをここで固定する。
     assert config.DIGEST_MAP_WINDOW_CHARS == 8000
+
+
+def test_digest_map_window_chars_default_is_sourced_from_digests_window_default_chars(
+    monkeypatch,
+):
+    # P13: digests.WINDOW_DEFAULT_CHARS との実際の import 関係を固定する。
+    with monkeypatch.context() as m:
+        m.setattr(digests, "WINDOW_DEFAULT_CHARS", 12345)
+        importlib.reload(config)
+        assert config.DIGEST_MAP_WINDOW_CHARS == 12345
+    importlib.reload(config)
 
 
 def test_digest_map_window_chars_env_override(monkeypatch):

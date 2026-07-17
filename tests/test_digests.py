@@ -3,11 +3,15 @@
 """
 from __future__ import annotations
 
+import inspect
 import json
 
 from shelf.digests import (
+    MAP_DEFAULT_NOTES,
     MAP_SCHEMA,
+    REDUCE_DEFAULT_NOTES,
     REDUCE_SCHEMA,
+    WINDOW_DEFAULT_CHARS,
     build_map_prompt,
     build_reduce_prompt,
     group_into_windows,
@@ -15,6 +19,7 @@ from shelf.digests import (
     normalize_tags,
     parse_map,
     parse_reduce,
+    select_reduce_input,
 )
 from shelf.ports import StudyNote
 
@@ -44,14 +49,17 @@ class TestGroupIntoWindows:
 
         assert windows == [chunks]
 
-    def test_breaks_window_at_section_boundary_even_under_char_limit(self):
-        # 文字数はまだ余裕があっても、節が変われば優先境界として window を分ける。
+    def test_packs_different_section_chunks_under_char_limit_into_one_window(self):
+        # 節が変わっても、window_chars の予算内であれば window を分けない
+        # （P5: 見出し密度に比例して map 呼び出しが増える強制分割を廃止した）。
+        # チャンクは section/page メタデータを保持したまま同一 window に混在できる
+        # （接地はチャンク単位であり、prompt 整形も各チャンクを個別に節・ページ付きで表示する）。
         first = _chunk("nb/doc#0", section="§1", page=1, seq=0, text="あ" * 10)
         second = _chunk("nb/doc#1", section="§2", page=2, seq=1, text="い" * 10)
 
         windows = group_into_windows([first, second], window_chars=1000)
 
-        assert windows == [[first], [second]]
+        assert windows == [[first, second]]
 
     def test_breaks_window_when_char_limit_exceeded_within_same_section(self):
         first = _chunk("nb/doc#0", section="§1", page=1, seq=0, text="あ" * 60)
@@ -78,18 +86,72 @@ class TestGroupIntoWindows:
         assert windows == [[first, second]]
 
     def test_preserves_chunk_order_within_and_across_windows(self):
+        # window_chars=25: 先頭2チャンク(計20字)は収まるが、3チャンク目を足すと
+        # 30字で超過するため、そこで window を分ける（節が変わったからではなく、
+        # 純粋に文字数予算のみが境界を決めることを確認する）。
         chunks = [
             _chunk("nb/doc#0", section="§1", page=1, seq=0, text="あ" * 10),
             _chunk("nb/doc#1", section="§1", page=1, seq=1, text="い" * 10),
             _chunk("nb/doc#2", section="§2", page=2, seq=2, text="う" * 10),
         ]
 
-        windows = group_into_windows(chunks, window_chars=1000)
+        windows = group_into_windows(chunks, window_chars=25)
 
         assert windows == [
             [chunks[0], chunks[1]],
             [chunks[2]],
         ]
+
+    def test_many_small_sections_pack_into_few_windows_bounded_by_window_chars(self):
+        # 見出し密度が高い文書（見出しごとに1節=1チャンク）でも、window は
+        # window_chars 予算のみで決まるため、節数に比例して window 数が
+        # 増えることはない（P5 の核心: 150見出し文書が150 map 呼び出しになる
+        # 問題の再発防止）。
+        chunks = [
+            _chunk(f"nb/doc#{i}", section=f"§{i}", page=None, seq=i, text="あ" * 10)
+            for i in range(20)
+        ]
+
+        windows = group_into_windows(chunks, window_chars=100)
+
+        assert len(windows) == 2
+        assert [len(w) for w in windows] == [10, 10]
+
+
+class TestSharedDefaultConstants:
+    """既定値5/20/8000がdigests.py・config.py・service.pyで裸リテラル重複しないよう、
+    named constant を唯一の情報源として signature が参照していることを固定する
+    （P13: 従来はコメントでの「同値にして矛盾を避ける」目視同期しかなかった）。"""
+
+    def test_map_default_notes_is_five(self):
+        assert MAP_DEFAULT_NOTES == 5
+
+    def test_reduce_default_notes_is_twenty(self):
+        assert REDUCE_DEFAULT_NOTES == 20
+
+    def test_build_map_prompt_and_parse_map_default_max_notes_share_constant(self):
+        assert (
+            inspect.signature(build_map_prompt).parameters["max_notes"].default
+            == MAP_DEFAULT_NOTES
+        )
+        assert inspect.signature(parse_map).parameters["max_notes"].default == MAP_DEFAULT_NOTES
+
+    def test_build_reduce_prompt_and_parse_reduce_default_max_notes_share_constant(self):
+        assert (
+            inspect.signature(build_reduce_prompt).parameters["max_notes"].default
+            == REDUCE_DEFAULT_NOTES
+        )
+        assert (
+            inspect.signature(parse_reduce).parameters["max_notes"].default
+            == REDUCE_DEFAULT_NOTES
+        )
+
+    def test_group_into_windows_default_window_chars_is_eight_thousand(self):
+        assert WINDOW_DEFAULT_CHARS == 8000
+        assert (
+            inspect.signature(group_into_windows).parameters["window_chars"].default
+            == WINDOW_DEFAULT_CHARS
+        )
 
 
 class TestBuildMapPrompt:
@@ -377,6 +439,45 @@ class TestBuildReducePrompt:
         assert "タイトル" in prompt_with
 
 
+class TestSelectReduceInput:
+    """コードレビュー指摘 P6: reduce プロンプトへ全 map ノートを無上限展開すると
+    ウィンドウ数に比例して入力が肥大化し、reduce 呼び出しが失敗しやすくなる。
+    REDUCE_INPUT_MAX_CHARS 予算内に収めるための間引き選択のテスト。"""
+
+    def _notes(self, n: int, *, text_len: int) -> list[StudyNote]:
+        return [
+            StudyNote(text=f"学び{i}" + "あ" * (text_len - len(f"学び{i}")), chunk_ids=(f"nb/doc#{i}",))
+            for i in range(n)
+        ]
+
+    def test_returns_all_notes_unchanged_when_under_budget(self):
+        notes = self._notes(3, text_len=10)
+
+        selected = select_reduce_input(notes, max_chars=1000)
+
+        assert selected == notes
+
+    def test_empty_list_returns_empty_list(self):
+        assert select_reduce_input([], max_chars=1000) == []
+
+    def test_samples_evenly_across_whole_list_keeping_first_and_last_within_budget(self):
+        notes = self._notes(10, text_len=50)  # 合計500字
+
+        selected = select_reduce_input(notes, max_chars=170)
+
+        # 均等ストライドで [0, 4, 9] の3件（計150字、次の4件(200字)は予算超過）。
+        assert selected == [notes[0], notes[4], notes[9]]
+        assert sum(len(note.text) for note in selected) <= 170
+
+    def test_sampled_selection_preserves_original_order(self):
+        notes = self._notes(10, text_len=50)
+
+        selected = select_reduce_input(notes, max_chars=170)
+
+        original_indices = [notes.index(note) for note in selected]
+        assert original_indices == sorted(original_indices)
+
+
 class TestReduceSchema:
     def test_schema_declares_notes_array_of_text_and_sources_and_tags(self):
         assert REDUCE_SCHEMA["type"] == "object"
@@ -551,6 +652,17 @@ class TestNormalizeTag:
 
     def test_returns_none_for_31_chars(self):
         assert normalize_tag("あ" * 31) is None
+
+    def test_strips_quotes_colons_and_brackets(self):
+        # コードレビュー指摘#8: LLM生成タグは司書ルーティングのカタログ経由で
+        # プロンプトに混入するため、記号を落として間接プロンプト注入を緩和する。
+        assert normalize_tag('quantum`: [inject]"') == "quantum-inject"
+
+    def test_returns_none_when_only_symbols_remain(self):
+        assert normalize_tag("!!!") is None
+
+    def test_preserves_japanese_while_stripping_surrounding_brackets(self):
+        assert normalize_tag("「量子力学」") == "量子力学"
 
 
 class TestNormalizeTags:
