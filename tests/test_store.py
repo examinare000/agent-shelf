@@ -1324,6 +1324,78 @@ class TestKeywordTopK:
         assert {chunk_id for chunk_id, _score in hits} == {"doc1#0", "doc1#1"}
 
 
+class TestFtsInitProbe:
+    """コードレビュー指摘#2: 既存 chunks_fts テーブルに対する
+    `CREATE VIRTUAL TABLE IF NOT EXISTS` はテーブル既存時にモジュール検証を
+    行わない(USING no_such_module ですら成功する)ため、_init_fts は実際に
+    MATCH を実行するプローブクエリで fts5/trigram の動作を検証する。
+    """
+
+    def test_pre_existing_fts_table_disables_when_probe_fails(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))  # 通常起動で chunks_fts を作成しておく(テーブル既存化)
+        store1.close()
+
+        def failing_probe(self):
+            raise sqlite3.OperationalError("simulated: trigram tokenizer unavailable")
+
+        monkeypatch.setattr(Store, "_probe_fts", failing_probe)
+
+        with caplog.at_level("WARNING"):
+            store2 = Store(str(db_path))
+        try:
+            assert store2.fts_enabled is False
+            # コードレビュー指摘: _init_fts の劣化時にログが出ない不具合の回帰
+            # テスト。DB オープン時に FTS が無効化された事実は運用上observableで
+            # あるべきなので、_fts_disable_after_failure 経由で警告が1回出る。
+            assert len(caplog.records) == 1
+        finally:
+            store2.close()
+
+    def test_migration_backfill_failure_disables_and_logs_warning(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # _init_fts の初回バックフィル(_rebuild_fts)が失敗した場合も
+        # _fts_disable_after_failure 経由で警告ログを残すことを検証する
+        # (コードレビュー指摘: 劣化時にログが出ない不具合の回帰テスト)。
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        _make_notebook(store1, name="physics")
+        _make_document(store1, id_="doc1", notebook="physics")
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store1._conn.execute("DROP TABLE chunks_fts")  # FTS 未導入の旧 DB を模す(chunks は既存)
+        store1._conn.commit()
+        store1.close()
+
+        def failing_rebuild(self):
+            raise sqlite3.OperationalError("simulated: rebuild failed during migration")
+
+        monkeypatch.setattr(Store, "_rebuild_fts", failing_rebuild)
+
+        with caplog.at_level("WARNING"):
+            store2 = Store(str(db_path))
+        try:
+            assert store2.fts_enabled is False
+            assert len(caplog.records) == 1
+        finally:
+            store2.close()
+
+    def test_pre_existing_fts_table_stays_enabled_when_probe_succeeds(self, tmp_path):
+        # 対比用の正常系: プローブが成功する通常環境では、再オープンしても
+        # fts_enabled は True のままであることを確認する。
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        store1.close()
+
+        store2 = Store(str(db_path))
+        try:
+            assert store2.fts_enabled is True
+        finally:
+            store2.close()
+
+
 class TestFtsLazyRebuild:
     """chunks_fts の再構築(_rebuild_fts=`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`)
     を書き込みごとに無条件実行するのではなく、次回の keyword_topk 呼び出し時に

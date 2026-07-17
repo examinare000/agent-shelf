@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS notebooks (
@@ -192,7 +195,8 @@ class Store:
         # 環境があるため、作成に失敗したら fts_enabled=False にフェイルソフトする
         # （キーワード検索は諦めるが、他の永続化機能はブロックしない）。
         # sqlite_master を CREATE 前に見ておくことで「今回新規作成したか」を判定し、
-        # 新規作成時のみ既存 chunks から一括バックフィルする（毎起動 rebuild は無駄）。
+        # 新規作成時かつ chunks に既存データがある場合のみ一括バックフィルする
+        # （移行専用。毎起動 rebuild や空テーブルへの rebuild は無駄）。
         already_existed = (
             self._conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
@@ -204,19 +208,42 @@ class Store:
                 "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5("
                 "text, content='chunks', content_rowid='rowid', tokenize='trigram')"
             )
-        except sqlite3.OperationalError:
+            # コードレビュー指摘#2: CREATE ... IF NOT EXISTS はテーブルが既存の場合
+            # モジュール検証を行わない（USING no_such_module のような壊れた定義でも
+            # テーブルが既存なら成功してしまう）。そのため MATCH を実際に実行する
+            # プローブクエリで fts5 モジュール + trigram tokenizer の動作を検証する。
+            self._probe_fts()
+        except sqlite3.Error as exc:
             self._conn.rollback()
-            self.fts_enabled = False
+            # コードレビュー指摘: 初期化時の劣化は _fts_disable_after_failure を
+            # 経由させ、fts_enabled=False にする事実を必ず警告ログへ残す
+            # （以前は直接代入していたため、DB オープン時に FTS が無効化された
+            # ことが運用ログから観測できなかった）。
+            self._fts_disable_after_failure("初期化", exc)
             return
         self.fts_enabled = True
         if not already_existed:
-            # 新規作成時のみ既存 chunks から一括バックフィルする。この時点で
-            # 現在の generation との同期が取れているので fts_generation に
-            # 記録しておき、直後の最初の keyword_topk 呼び出しでの無駄な
-            # 二重 rebuild を避ける。
-            self._rebuild_fts()
-            self.set_meta("fts_generation", str(self._current_generation()))
+            has_chunks = self._conn.execute("SELECT 1 FROM chunks LIMIT 1").fetchone() is not None
+            if has_chunks:
+                # 旧 DB（chunks_fts 導入前に作られた・chunks に既存データあり）を
+                # 開いたときだけの一度きりの移行バックフィル。以後の同期は
+                # upsert_chunks/delete_by_source_file/delete_notebook 側の
+                # 行単位更新に委ねる（コードレビュー指摘#10: 読み取りパスでの
+                # 全コーパス再構築の廃止）。
+                try:
+                    self._rebuild_fts()
+                except sqlite3.Error as exc:
+                    self._fts_disable_after_failure("初期化", exc)
         self._conn.commit()
+
+    def _probe_fts(self) -> None:
+        # 既存テーブルに対する CREATE ... IF NOT EXISTS はモジュール検証を行わない
+        # ため、実際に MATCH を実行して fts5 モジュール + trigram tokenizer が
+        # 使える環境かどうかを確認する（コードレビュー指摘#2）。結果は使わず、
+        # 例外の有無だけを見る。
+        self._conn.execute(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?", ("probe",)
+        ).fetchone()
 
     def _rebuild_fts(self) -> None:
         # keyword_topk 冒頭の遅延同期フックからのみ呼ぶ（§ 遅延 rebuild）。content=
@@ -225,6 +252,15 @@ class Store:
         # ため、ここ自体ではコミットしない。
         if self.fts_enabled:
             self._conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+
+    def _fts_disable_after_failure(self, context: str, exc: Exception) -> None:
+        # コードレビュー指摘#1: fts5/trigram が壊れた環境（read-only DB・モジュール
+        # 消失等）では例外にせず劣化させ、以後の呼び出しでは同じ壊れた経路を
+        # 再実行しない。fts_enabled=False にすることで、各メソッド冒頭の
+        # `if not self.fts_enabled: return` に自然に短絡し、警告ログも
+        # この失敗時の1回だけで済む（毎回ログを連発しない）。
+        _logger.warning("chunks_fts の%sに失敗したためキーワード検索を無効化します: %r", context, exc)
+        self.fts_enabled = False
 
     def _sync_fts_if_stale(self) -> None:
         # chunks への書き込みごとに rebuild していた旧実装は、indexer.py の
