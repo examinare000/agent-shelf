@@ -394,6 +394,228 @@ def test_ask_truncates_citation_quote_to_200_chars(
     assert result["citations"][0]["quote"] == long_text[:200]
 
 
+# -- ask: ハイブリッド検索（ベクトル＋FTS5キーワードのRRF併用） -----------------
+
+
+def test_ask_hybrid_search_includes_keyword_only_match_via_rrf(
+    store: Store, tmp_path: Path
+) -> None:
+    """ベクトル検索だけでは top_k に入らないチャンクでも、キーワード一致が
+    あれば RRF 併用で結果に含まれることを検証する。
+
+    3チャンクを直接注入し、ベクトルスコアを [V=1.0, F=0.5, K=-1.0] と完全に
+    制御する（top_k=2のベクトル単体なら [V, F] が選ばれ K は落ちる）。質問文は
+    K だけが含む語 "keyword_anchor_word" 一語にすることで、FTS キーワード検索は
+    K だけを返す。RRF (k=60既定) で手計算すると V と K が同点(1/61)になるが、
+    タイブレークは「vector_ranking→keyword_ranking の走査順で先に登場した方」
+    なので V が先着で残り、F(1/62)より両者が上回るため最終的に [V, K] が top_k=2
+    に残り F が弾かれる。
+    """
+    store.create_notebook("nb_hybrid", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_hybrid/doc#0", "notebook": "nb_hybrid", "doc_id": "doc",
+                # page を chunk ごとに変える: _build_citations は (source, page) が
+                # 同じ引用を重複除去するため、page が全チャンク同一だと3チャンクが
+                # 1件に潰れてしまいこのテストの意図（複数チャンクの存在確認）を
+                # 検証できなくなる。
+                "source_path": "nb_hybrid/doc.md", "section": None, "page": 1,
+                "seq": 0, "text": "distinctive chunk about whales",
+                "embedding": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "id": "nb_hybrid/doc#1", "notebook": "nb_hybrid", "doc_id": "doc",
+                "source_path": "nb_hybrid/doc.md", "section": None, "page": 2,
+                "seq": 1, "text": "background information on unrelated topics",
+                "embedding": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "id": "nb_hybrid/doc#2", "notebook": "nb_hybrid", "doc_id": "doc",
+                "source_path": "nb_hybrid/doc.md", "section": None, "page": 3,
+                "seq": 2, "text": "keyword_anchor_word population survey results",
+                "embedding": [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+        ]
+    )
+    local_embedder = FakeEmbedder(
+        dim=8, known={"keyword_anchor_word": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    )
+    backend = FakeAnswerBackend(canned=_grounded_raw_answer([1, 2]))
+    service = ShelfService(
+        store, local_embedder, lambda name: backend, tmp_path, top_k=2, hybrid_search=True,
+    )
+
+    result = service.ask("nb_hybrid", "keyword_anchor_word")
+
+    quotes = {c["quote"] for c in result["citations"]}
+    assert quotes == {
+        "distinctive chunk about whales",
+        "keyword_anchor_word population survey results",
+    }
+
+
+def test_ask_hybrid_search_disabled_matches_vector_only_baseline(
+    store: Store, tmp_path: Path
+) -> None:
+    """hybrid_search=False では前段のキーワード検索一致を無視し、従来どおり
+    ベクトル top_k のみで結果を構成する（挙動同一の確認・上のテストと対称）。
+    """
+    store.create_notebook("nb_hybrid_off", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_hybrid_off/doc#0", "notebook": "nb_hybrid_off", "doc_id": "doc",
+                "source_path": "nb_hybrid_off/doc.md", "section": None, "page": 1,
+                "seq": 0, "text": "distinctive chunk about whales",
+                "embedding": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "id": "nb_hybrid_off/doc#1", "notebook": "nb_hybrid_off", "doc_id": "doc",
+                "source_path": "nb_hybrid_off/doc.md", "section": None, "page": 2,
+                "seq": 1, "text": "background information on unrelated topics",
+                "embedding": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "id": "nb_hybrid_off/doc#2", "notebook": "nb_hybrid_off", "doc_id": "doc",
+                "source_path": "nb_hybrid_off/doc.md", "section": None, "page": 3,
+                "seq": 2, "text": "keyword_anchor_word population survey results",
+                "embedding": [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+        ]
+    )
+    local_embedder = FakeEmbedder(
+        dim=8, known={"keyword_anchor_word": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    )
+    backend = FakeAnswerBackend(canned=_grounded_raw_answer([1, 2]))
+    service = ShelfService(
+        store, local_embedder, lambda name: backend, tmp_path, top_k=2, hybrid_search=False,
+    )
+
+    result = service.ask("nb_hybrid_off", "keyword_anchor_word")
+
+    quotes = {c["quote"] for c in result["citations"]}
+    assert quotes == {
+        "distinctive chunk about whales",
+        "background information on unrelated topics",
+    }
+
+
+def test_ask_hybrid_search_degrades_to_vector_only_when_fts_disabled(
+    store: Store, tmp_path: Path
+) -> None:
+    """fts_enabled=False(fts5/trigram非対応環境の劣化パス)を強制した場合、
+    hybrid_search=True でも store.keyword_topk が [] を返すためベクトル単体へ
+    自動劣化する(hybrid_search=Falseのテストと同一結果になるはず)。
+    """
+    store.create_notebook("nb_hybrid_degraded", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_hybrid_degraded/doc#0", "notebook": "nb_hybrid_degraded", "doc_id": "doc",
+                "source_path": "nb_hybrid_degraded/doc.md", "section": None, "page": 1,
+                "seq": 0, "text": "distinctive chunk about whales",
+                "embedding": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "id": "nb_hybrid_degraded/doc#1", "notebook": "nb_hybrid_degraded", "doc_id": "doc",
+                "source_path": "nb_hybrid_degraded/doc.md", "section": None, "page": 2,
+                "seq": 1, "text": "background information on unrelated topics",
+                "embedding": [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+            {
+                "id": "nb_hybrid_degraded/doc#2", "notebook": "nb_hybrid_degraded", "doc_id": "doc",
+                "source_path": "nb_hybrid_degraded/doc.md", "section": None, "page": 3,
+                "seq": 2, "text": "keyword_anchor_word population survey results",
+                "embedding": [-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            },
+        ]
+    )
+    store.fts_enabled = False  # fts5/trigram が使えない環境の劣化パスを強制検証
+    local_embedder = FakeEmbedder(
+        dim=8, known={"keyword_anchor_word": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    )
+    backend = FakeAnswerBackend(canned=_grounded_raw_answer([1, 2]))
+    service = ShelfService(
+        store, local_embedder, lambda name: backend, tmp_path, top_k=2, hybrid_search=True,
+    )
+
+    result = service.ask("nb_hybrid_degraded", "keyword_anchor_word")
+
+    quotes = {c["quote"] for c in result["citations"]}
+    assert quotes == {
+        "distinctive chunk about whales",
+        "background information on unrelated topics",
+    }
+
+
+def test_ask_hybrid_search_clamps_digest_overrepresentation_and_promotes_body(
+    store: Store, tmp_path: Path
+) -> None:
+    """digest チャンクが結果を占有しないよう、max(2, top_k//3) 件を超える分は
+    順位の低い digest から落とし、代わりに次点の非-digest(body)チャンクを
+    top_k の枠内に繰り上げる。
+
+    top_k=6 → digest_cap=max(2,6//3)=2。ベクトルスコアを D1=1.0 > D2=0.9 >
+    D3=0.8 > D4=0.7 > D5=0.6 > B1=0.5 > B2=0.4 > B3=0.3 > B4=0.2 と完全に
+    制御し、D1..D5(digest)+B1(body)がベクトル単体のtop6を占める状態を作る。
+    質問文はD1だけが含む語にし、キーワード検索でD1のRRFスコアを底上げする
+    (実際の並びはベクトル順と一致するため merged 順は [D1..D5,B1,B2,B3,B4])。
+    クランプは digest 超過分(5-2=3件、順位の低いD3,D4,D5)を落とし、tail(B2,B3,B4)
+    から繰り上げて最終的に digest=[D1,D2]・body=[B1,B2,B3,B4]の計6件になる。
+    """
+    store.create_notebook("nb_clamp", backend="codex")
+    digest_chunks = [
+        {
+            "id": f"nb_clamp/doc#-{i}", "notebook": "nb_clamp", "doc_id": "doc",
+            "source_path": "nb_clamp/doc.md", "section": None, "page": None,
+            "seq": -i, "text": f"digest note {i}" + (" clamp_anchor_word" if i == 1 else ""),
+            "embedding": [1.0 - (i - 1) * 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "kind": "digest",
+        }
+        for i in range(1, 6)  # D1..D5
+    ]
+    body_chunks = [
+        {
+            "id": f"nb_clamp/doc#{i}", "notebook": "nb_clamp", "doc_id": "doc",
+            # page を分ける理由は他のハイブリッドテストと同じ(_build_citationsの
+            # (source, page) 重複除去への対策)。
+            "source_path": "nb_clamp/doc.md", "section": None, "page": i + 1,
+            "seq": i, "text": f"body chunk {i + 1}",
+            "embedding": [0.5 - i * 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "kind": "body",
+        }
+        for i in range(0, 4)  # B1..B4
+    ]
+    store.upsert_chunks(digest_chunks + body_chunks)
+    local_embedder = FakeEmbedder(
+        dim=8, known={"clamp_anchor_word": [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+    )
+    payload = {
+        "answer": "summary [S1][S2][S3][S4] notes [L1][L2]",
+        "citations": [{"s": s} for s in (1, 2, 3, 4)],
+        "insights": [{"l": l} for l in (1, 2)],  # noqa: E741 - 設計書の "l" 番号
+        "confident": True,
+    }
+    backend = FakeAnswerBackend(
+        canned=RawAnswer(text=json.dumps(payload), ok=True, error=None)
+    )
+    service = ShelfService(
+        store, local_embedder, lambda name: backend, tmp_path, top_k=6, hybrid_search=True,
+    )
+
+    result = service.ask("nb_clamp", "clamp_anchor_word")
+
+    assert len(result["insights"]) == 2
+    assert {i["note_id"] for i in result["insights"]} == {
+        "nb_clamp/doc#-1", "nb_clamp/doc#-2",
+    }
+    assert len(result["citations"]) == 4
+    assert {c["chunk_id"] for c in result["citations"]} == {
+        "nb_clamp/doc#0", "nb_clamp/doc#1", "nb_clamp/doc#2", "nb_clamp/doc#3",
+    }
+
+
 # -- list_notebooks -----------------------------------------------------------
 
 

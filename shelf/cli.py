@@ -208,6 +208,7 @@ def _build_service() -> ShelfService:
         default_backend=config.DEFAULT_BACKEND,
         top_k=config.TOP_K,
         deep_dive=config.DEEP_DIVE,
+        hybrid_search=config.HYBRID_SEARCH,
         mask=mask,
         converter=convert,
         router_backend=config.ROUTER_BACKEND,

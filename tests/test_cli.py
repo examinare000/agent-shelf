@@ -1103,6 +1103,28 @@ class TestBuildServiceWiring:
     純粋関数のため差し替え不要）。
     """
 
+    def test_wires_hybrid_search_from_config(self, monkeypatch):
+        import shelf.embedder as embedder_module
+
+        captured_kwargs: dict = {}
+
+        class _FakeEmbedder:
+            def __init__(self, model_name: str) -> None:
+                self.model_name = model_name
+
+        class _FakeShelfService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(embedder_module, "FastEmbedEmbedder", _FakeEmbedder)
+        monkeypatch.setattr(cli, "_build_store", lambda: Store(":memory:"))
+        monkeypatch.setattr(cli, "ShelfService", _FakeShelfService)
+        monkeypatch.setattr(cli.config, "HYBRID_SEARCH", False)
+
+        cli._build_service()
+
+        assert captured_kwargs["hybrid_search"] is False
+
     def test_wires_digest_settings_from_config(self, monkeypatch):
         # コードレビュー指摘#7: _build_service() が config.py の digest 関連設定
         # (digest_map_notes/digest_map_window_chars/digest_backend) を ShelfService

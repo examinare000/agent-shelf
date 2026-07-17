@@ -50,7 +50,7 @@ from shelf.prompts import (
     parse_answer,
     parse_summary,
 )
-from shelf.search import cosine_topk
+from shelf.search import build_fts_query, cosine_topk, rrf_merge
 from shelf.shelver import Shelver
 from shelf.store import Store, UnknownNotebookError
 
@@ -191,6 +191,7 @@ class ShelfService:
         default_backend: str = "codex",
         top_k: int = 10,
         deep_dive: bool = False,
+        hybrid_search: bool = True,
         mask: Callable[[str], str] | None = None,
         converter=None,
         router_backend: str = "",
@@ -211,6 +212,12 @@ class ShelfService:
         self._default_backend = default_backend
         self._top_k = top_k
         self._deep_dive = deep_dive
+        # config.HYBRID_SEARCH(env SHELF_HYBRID_SEARCH)。True ならベクトル検索
+        # (cosine_topk) と FTS5 キーワード検索(store.keyword_topk)を RRF で併用する
+        # （_answer_with_expert 参照）。fts5/trigram 非対応環境では
+        # store.fts_enabled=False により keyword_topk が常に [] を返すため、この
+        # フラグが True でも自動的にベクトル単体へ劣化する（意図的なフェイルソフト）。
+        self._hybrid_search = hybrid_search
         self._mask = mask
         # converter 省略時は実変換器（shelf.convert モジュール）を使う。モジュールは
         # convert_file/convert_url を関数として持つため、そのまま「convert_file/
@@ -326,8 +333,14 @@ class ShelfService:
             )
 
         query_vec = self._embedder.embed_query(question)
-        scored = cosine_topk(matrix, ids, query_vec, self._top_k)
-        chunks = self._load_chunks(scored)
+        merged_ids, hybrid_active = self._retrieve_ids(notebook, question, ids, matrix, query_vec)
+        chunks = self._load_chunks(merged_ids)
+        if hybrid_active:
+            # kind バランス制御は「実際に RRF 統合が起きた場合」だけに限定する。
+            # hybrid_search=False・キーワード結果空のときは merged_ids が既に
+            # cosine_topk(limit=top_k) と同一なので、ここを通さないことで
+            # 従来のベクトル単体挙動と完全に一致させる（brief: 挙動同一）。
+            chunks = self._clamp_digest_kind(chunks, self._top_k)
         # S番号(citations)/L番号(insights)の付番は prompts.build_ask_prompt が内部で
         # 使う分割規則(kind!='digest'→citation、kind=='digest'→insight)と完全一致
         # させる必要がある。番号がズレると citation_ids/insight_ids が誤ったチャンクを
@@ -367,10 +380,44 @@ class ShelfService:
             warning=None,
         )
 
-    def _load_chunks(self, scored) -> list[RetrievedChunk]:
+    def _retrieve_ids(
+        self, notebook: str, question: str, ids: list[str], matrix, query_vec
+    ) -> tuple[list[str], bool]:
+        """ベクトル検索(cosine_topk)と FTS5 キーワード検索(store.keyword_topk)を
+        RRF で併用した候補 id リストと、実際に併用が起きたか(hybrid_active)を返す。
+
+        hybrid_active=False の場合、戻り値の id リストは
+        `cosine_topk(matrix, ids, query_vec, self._top_k)` を直接呼んだ場合と
+        完全に同一になる（hybrid_search=False の既定・キーワード結果が空の劣化の
+        両方でこの経路を通り、brief の「挙動同一」要件を満たす）。
+
+        hybrid_active=True の場合は、kind バランス制御（_clamp_digest_kind）が
+        digest 超過分を落として非-digest チャンクへ繰り上げる余地を残すため、
+        top_k より広い候補プール(pool_size)を確保して統合する。プールの上限は
+        cosine_topk/keyword_topk それぞれの返却上限(pool_size)なので、統合後の
+        ユニーク候補数は高々 2*pool_size 件に収まる。
+        """
+        pool_size = self._top_k * 2 if self._hybrid_search else self._top_k
+        vector_ranking = [item.id for item in cosine_topk(matrix, ids, query_vec, pool_size)]
+
+        if not self._hybrid_search:
+            return vector_ranking, False
+
+        fts_query = build_fts_query(question)
+        keyword_ranking = [
+            chunk_id
+            for chunk_id, _score in self._store.keyword_topk(notebook, fts_query, pool_size)
+        ]
+        if not keyword_ranking:
+            return vector_ranking[: self._top_k], False
+
+        merged = rrf_merge([vector_ranking, keyword_ranking], limit=pool_size)
+        return merged, True
+
+    def _load_chunks(self, ids: list[str]) -> list[RetrievedChunk]:
         chunks: list[RetrievedChunk] = []
-        for item in scored:
-            row = self._store.get_chunk(item.id)
+        for chunk_id in ids:
+            row = self._store.get_chunk(chunk_id)
             if row is None:  # 検索後に削除された等のレースは無視して結果から除く
                 continue
             chunks.append(
@@ -385,6 +432,38 @@ class ShelfService:
                 )
             )
         return chunks
+
+    @staticmethod
+    def _clamp_digest_kind(
+        chunks: list[RetrievedChunk], top_k: int
+    ) -> list[RetrievedChunk]:
+        """digest チャンクの結果占有を防ぐ kind バランス制御。
+
+        chunks は呼び出し元(RRF統合結果)の順位順という前提。まず先頭 top_k 件を
+        初期候補にし、digest 件数が max(2, top_k//3) を超える場合だけ、その超過分
+        を「順位の低い(=head内で最後に出現する) digest チャンク」から落とし、
+        top_k より後ろの候補(tail)から非-digest チャンクを順位順に繰り上げて
+        埋める。tail に十分な非-digest チャンクが無ければ、全体件数は top_k 未満
+        のままで良い（brief: 「全体件数は top_k を超えない」）。
+
+        「非-digest」で判定する（"body" 固定文字列比較にしない）理由:
+        _split_chunks_by_kind と同じ二分法（kind=='digest' か否か）に揃えるため。
+        """
+        digest_cap = max(2, top_k // 3)
+        head = chunks[:top_k]
+        tail = chunks[top_k:]
+
+        digest_indices = [i for i, c in enumerate(head) if c.kind == "digest"]
+        if len(digest_indices) <= digest_cap:
+            return head
+
+        excess = len(digest_indices) - digest_cap
+        drop_indices = set(digest_indices[-excess:])  # head内で最後=順位の低いdigest
+        kept = [c for i, c in enumerate(head) if i not in drop_indices]
+
+        promotable = [c for c in tail if c.kind != "digest"]
+        kept.extend(promotable[:excess])
+        return kept
 
     @staticmethod
     def _split_chunks_by_kind(

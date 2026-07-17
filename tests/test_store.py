@@ -10,6 +10,7 @@ import sqlite3
 import numpy as np
 import pytest
 
+from shelf.search import build_fts_query
 from shelf.store import DuplicateNotebookError, Store, UnknownNotebookError
 
 
@@ -1285,6 +1286,42 @@ class TestKeywordTopK:
         store.fts_enabled = False  # fts5/trigram が使えない環境の劣化パスを強制検証
 
         assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+    def test_keyword_topk_hits_japanese_natural_sentence_via_build_fts_query(self, store):
+        # コードレビュー指摘#1の再現/回帰テスト: build_fts_query が空白分割のままだと
+        # スペースなしの日本語自然文が丸ごと1フレーズになりtrigram索引に一致せず
+        # 常に0件になる(ハイブリッド検索が日本語で無言のno-opになる不具合)。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [_chunk_row(id_="doc1#0", text="量子力学の基礎について解説する資料です。")]
+        )
+
+        hits = store.keyword_topk(
+            "physics", build_fts_query("量子力学の基礎について教えてください"), limit=10
+        )
+
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_keyword_topk_hits_mixed_ascii_and_japanese_query(self, store):
+        # ASCII語("Python")のみを含むチャンクとCJKグラムのみが一致するチャンクを
+        # 分けて置くことで、ASCII語ヒットとCJKグラムヒットの両方が独立に効くこと
+        # を検証する(旧実装は空白区切りの1トークン全体一致を要求するため、
+        # 完全一致しないdoc1#1側は不具合下では拾えない)。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks(
+            [
+                _chunk_row(id_="doc1#0", text="Python is a great language for prototyping."),
+                _chunk_row(id_="doc1#1", seq=1, text="型システムに関する解説記事です。"),
+            ]
+        )
+
+        hits = store.keyword_topk(
+            "physics", build_fts_query("Python の型システムについて"), limit=10
+        )
+
+        assert {chunk_id for chunk_id, _score in hits} == {"doc1#0", "doc1#1"}
 
 
 class TestFtsLazyRebuild:
