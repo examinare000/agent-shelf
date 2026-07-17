@@ -97,6 +97,17 @@ CREATE TABLE IF NOT EXISTS study_notes (
   pipeline         INTEGER NOT NULL DEFAULT 1,
   UNIQUE(notebook, doc_id, seq)
 );
+
+-- 文書タグ（学び抽出パイプラインが文書単位に付与するラベル。notebook 横断の
+-- タグ一覧・絞り込み用途）。doc_id 単位の delete-then-insert で管理する。
+CREATE TABLE IF NOT EXISTS document_tags (
+  doc_id      TEXT NOT NULL,
+  notebook    TEXT NOT NULL,
+  tag         TEXT NOT NULL,
+  PRIMARY KEY (doc_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_document_tags_tag ON document_tags(tag);
+CREATE INDEX IF NOT EXISTS idx_document_tags_notebook ON document_tags(notebook);
 """
 
 
@@ -244,6 +255,7 @@ class Store:
         ]
         self._conn.execute("DELETE FROM chunks WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM study_notes WHERE notebook = ?", (name,))
+        self._conn.execute("DELETE FROM document_tags WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM documents WHERE notebook = ?", (name,))
         self._conn.execute("DELETE FROM notebooks WHERE name = ?", (name,))
         for source_path in source_paths:
@@ -349,6 +361,7 @@ class Store:
     def delete_document(self, id: str) -> None:
         self._conn.execute("DELETE FROM chunks WHERE doc_id = ?", (id,))
         self._conn.execute("DELETE FROM study_notes WHERE doc_id = ?", (id,))
+        self._conn.execute("DELETE FROM document_tags WHERE doc_id = ?", (id,))
         self._conn.execute("DELETE FROM documents WHERE id = ?", (id,))
         self._bump_generation()
         self._conn.commit()
@@ -411,6 +424,46 @@ class Store:
             (id,),
         ).fetchone()
         return None if row is None else dict(row)
+
+    # -- document_tags（文書タグ。学び抽出パイプラインが付与） -------------------
+
+    def replace_document_tags(self, notebook: str, doc_id: str, tags: list[str]) -> None:
+        """doc_id の既存タグを全削除してから tags を書き込む（replace_study_notes と
+        同じ delete-then-insert の流儀。再生成時に前回分が残留しないようにする）。
+        """
+        self._conn.execute("DELETE FROM document_tags WHERE doc_id = ?", (doc_id,))
+        if tags:
+            self._conn.executemany(
+                "INSERT INTO document_tags (doc_id, notebook, tag) VALUES (?, ?, ?)",
+                [(doc_id, notebook, tag) for tag in tags],
+            )
+        self._conn.commit()
+
+    def list_document_tags(self, notebook: str, doc_id: str) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT tag FROM document_tags WHERE notebook = ? AND doc_id = ? ORDER BY tag",
+            (notebook, doc_id),
+        ).fetchall()
+        return [row["tag"] for row in rows]
+
+    def list_tags_by_notebook(self, limit_per_notebook: int = 15) -> dict[str, list[str]]:
+        """notebook ごとに、タグが付いた doc 数の降順（同数はタグ名昇順で決定的に）で
+        上位 limit_per_notebook 件のタグ名を返す。UI のタグ一覧・絞り込み候補表示用。
+        """
+        rows = self._conn.execute(
+            """
+            SELECT notebook, tag, COUNT(DISTINCT doc_id) AS doc_count
+            FROM document_tags
+            GROUP BY notebook, tag
+            ORDER BY notebook, doc_count DESC, tag ASC
+            """
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            bucket = result.setdefault(row["notebook"], [])
+            if len(bucket) < limit_per_notebook:
+                bucket.append(row["tag"])
+        return result
 
     # -- study_notes（学びノート・source-of-truth。indexer が kind='digest' チャンク化） ----
 

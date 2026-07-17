@@ -1022,3 +1022,100 @@ class TestStudyNotesGroundingSchemaMigration:
             assert store2.list_study_notes("physics", "doc1")[0]["pipeline"] == 2
         finally:
             store2.close()
+
+
+class TestDocumentTags:
+    def test_replace_then_list_document_tags_round_trips(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_document_tags("physics", "doc1", ["量子力学", "相対論"])
+
+        assert store.list_document_tags("physics", "doc1") == ["相対論", "量子力学"]
+
+    def test_replace_document_tags_overwrites_existing(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["旧タグ"])
+
+        store.replace_document_tags("physics", "doc1", ["新タグ"])
+
+        assert store.list_document_tags("physics", "doc1") == ["新タグ"]
+
+    def test_replace_document_tags_with_empty_list_clears(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["タグ"])
+
+        store.replace_document_tags("physics", "doc1", [])
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_list_document_tags_returns_empty_for_no_tags(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_delete_document_cascades_document_tags(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["タグ"])
+
+        store.delete_document("doc1")
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_delete_notebook_cascades_document_tags(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["タグ"])
+
+        store.delete_notebook("physics")
+
+        assert store.list_document_tags("physics", "doc1") == []
+
+    def test_list_tags_by_notebook_orders_by_doc_count_desc_then_tag_asc(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="physics", origin="doc2.pdf",
+                        normalized_path="corpus/physics/doc2.md")
+        _make_document(store, id_="doc3", notebook="physics", origin="doc3.pdf",
+                        normalized_path="corpus/physics/doc3.md")
+        # 「量子力学」は2文書、「相対論」「熱力学」は1文書ずつ（同数はタグ名昇順で決定的に）。
+        store.replace_document_tags("physics", "doc1", ["量子力学", "熱力学"])
+        store.replace_document_tags("physics", "doc2", ["量子力学", "相対論"])
+        store.replace_document_tags("physics", "doc3", [])
+
+        result = store.list_tags_by_notebook()
+
+        # SQLite 既定の BINARY collation（UTF-8 バイト順=コードポイント順）で昇順。
+        # 「熱」(U+71B1) < 「相」(U+76F8) のため熱力学が相対論より先に来る。
+        assert result["physics"] == ["量子力学", "熱力学", "相対論"]
+
+    def test_list_tags_by_notebook_respects_limit_per_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_document_tags("physics", "doc1", ["a", "b", "c", "d"])
+
+        result = store.list_tags_by_notebook(limit_per_notebook=2)
+
+        assert result["physics"] == ["a", "b"]
+
+    def test_list_tags_by_notebook_groups_separately_per_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(store, id_="doc1", notebook="physics")
+        _make_document(store, id_="doc2", notebook="math", origin="doc2.pdf",
+                        normalized_path="corpus/math/doc2.md")
+        store.replace_document_tags("physics", "doc1", ["物理タグ"])
+        store.replace_document_tags("math", "doc2", ["数学タグ"])
+
+        result = store.list_tags_by_notebook()
+
+        assert result == {"physics": ["物理タグ"], "math": ["数学タグ"]}
+
+    def test_list_tags_by_notebook_returns_empty_dict_when_no_tags(self, store):
+        _make_notebook(store, name="physics")
+
+        assert store.list_tags_by_notebook() == {}
