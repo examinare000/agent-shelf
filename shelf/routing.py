@@ -10,8 +10,8 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 
+from shelf.jsonutil import extract_json_payload
 from shelf.ports import NotebookCard, RouteTarget, RoutingDecision
-from shelf.prompts import _extract_json_payload
 
 # apply_fallback の score 降順クランプが設定値に関わらず超えない上限（設計書 §6-C 分岐4b）。
 # 司書が誤って大量の notebook をルーティングし、専門家推論の fan-out が
@@ -81,13 +81,13 @@ def _format_card(card: NotebookCard) -> str:
 def parse_routing(raw_text: str) -> RoutingDecision:
     """司書エンジンの生出力を ROUTING_SCHEMA として解釈する。
 
-    prompts.parse_answer と同じ _extract_json_payload を再利用し、フェンス付き/
-    前後ノイズ耐性を確保する（設計書 §6-B）。パース失敗は握り潰さず parse_ok=False
-    で返し、apply_fallback の安全側フォールバックへ委ねる。answerable は必須項目
-    として扱い、欠落・型不一致はパース失敗とする一方、targets 欠落は空リストとして
-    許容する（parse_answer の citations 欠落許容と同じ寛容さの方針）。
+    prompts.parse_answer と同じ shelf.jsonutil.extract_json_payload を再利用し、
+    フェンス付き/前後ノイズ耐性を確保する（設計書 §6-B）。パース失敗は握り潰さず
+    parse_ok=False で返し、apply_fallback の安全側フォールバックへ委ねる。answerable
+    は必須項目として扱い、欠落・型不一致はパース失敗とする一方、targets 欠落は空
+    リストとして許容する（parse_answer の citations 欠落許容と同じ寛容さの方針）。
     """
-    payload = _extract_json_payload(raw_text)
+    payload = extract_json_payload(raw_text)
     data = None
     if payload is not None:
         try:

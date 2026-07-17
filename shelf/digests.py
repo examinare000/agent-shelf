@@ -6,37 +6,11 @@
 """
 from __future__ import annotations
 
-import json
 import re
 import unicodedata
 
+from shelf.jsonutil import parse_json_object
 from shelf.ports import StudyNote
-
-
-def _extract_json_payload(text: str) -> str | None:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start : end + 1]
-
-
-def _parse_json_object(text: str) -> dict | None:
-    """エンジン生出力から厳格 JSON オブジェクトを抜き出す共通ヘルパー。
-
-    _extract_json_payload + json.loads の組（parse_map/parse_reduce の
-    2 関数が同じ手順を必要とするため集約した）。パース失敗・トップレベルが dict でない
-    場合はいずれも None へ劣化させ、呼び出し側が一律に空リスト等へフォールバックできる
-    ようにする。
-    """
-    payload = _extract_json_payload(text)
-    if payload is None:
-        return None
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
 
 
 # map-reduce 学び抽出パイプラインでの 1 ウィンドウ（1 回の map LLM 呼び出し入力）の
@@ -175,7 +149,7 @@ def parse_map(
     残す（劣化方針は prompts._normalize_marker_ids と同じ番号検証規則を踏襲する）。
     代表 section/page は先頭の有効参照チャンクの値（参照が全滅した場合は None）。
     """
-    data = _parse_json_object(text)
+    data = parse_json_object(text)
     if data is None:
         return []
 
@@ -339,7 +313,7 @@ def parse_reduce(
     JSON 全体のパース失敗は ([], []) へ劣化させ、呼び出し側 service.py が
     map フェーズの結果へフォールバックするかを判断できるようにする。
     """
-    data = _parse_json_object(text)
+    data = parse_json_object(text)
     if data is None:
         return [], []
 

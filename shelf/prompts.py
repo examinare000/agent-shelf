@@ -10,6 +10,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from shelf.jsonutil import extract_json_payload
 from shelf.ports import RetrievedChunk
 
 # codex --output-schema に渡す厳格 JSON スキーマ。
@@ -174,7 +175,7 @@ def parse_answer(text: str) -> ParsedAnswer:
     それでもパースできない場合は劣化返却（parse_ok=False・原文をそのまま answer に）にし、
     呼び出し側（service.py）がエラーで潰さず warning 付きで返せるようにする。
     """
-    payload = _extract_json_payload(text)
+    payload = extract_json_payload(text)
     data = None
     if payload is not None:
         try:
@@ -196,22 +197,14 @@ def parse_answer(text: str) -> ParsedAnswer:
     )
 
 
-def _extract_json_payload(text: str) -> str | None:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start : end + 1]
-
-
 def parse_summary(text: str) -> str | None:
     """エンジンの生出力テキストから summary 文字列を取り出す。
 
-    parse_answer と同じ _extract_json_payload を再利用し、
+    parse_answer と同じ shelf.jsonutil.extract_json_payload を再利用し、
     JSON が取れない・dict でない・summary が str でない・
     strip 後に空文字列になる場合はいずれも None を返し、呼び出し側で失敗扱いにする。
     """
-    payload = _extract_json_payload(text)
+    payload = extract_json_payload(text)
     if payload is None:
         return None
 
