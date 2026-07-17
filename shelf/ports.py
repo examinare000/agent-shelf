@@ -63,6 +63,10 @@ class NotebookCard:
     description: str | None
     persona: str | None
     doc_count: int
+    # digest で保存された文書タグ集合（store.list_tags_by_notebook 由来・出現doc数降順）。
+    # 既定値を付けることで、tags を知らない既存呼び出し箇所（_build_catalog 等）を
+    # 壊さずに追加する（他 DTO の additive 拡張と同じ後方互換方針）。
+    tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -95,15 +99,26 @@ class RoutingDecision:
 
 @dataclass(frozen=True)
 class StudyNote:
-    """学びノート 1 件（設計書 §7-B）。digests.parse_digest() が DIGEST_SCHEMA
-    ({"notes": [{"text": "str", "span": "str"}]}) から抽出する中立表現。
+    """学びノート 1 件（設計書 §7-B）。map-reduce 学び抽出パイプライン
+    （digests.parse_map() が MAP_SCHEMA、digests.parse_reduce() が REDUCE_SCHEMA から）
+    が抽出する中立表現。
 
     store.study_notes テーブルの id/notebook/doc_id/seq/source_hash/model/created_at は
     service.digest() が書込み時に付与する（このモデルは LLM 出力の忠実な抽出に留める）。
+
+    chunk_ids/section/page は parse_map/parse_reduce が個々のチャンクへ接地するために
+    追加した情報。span（旧来のフィールド、節見出し等の簡易表記）と併存し、
+    どちらも既定値付きの additive フィールドとして安全に構築できる。
     """
 
     text: str
     span: str | None = None
+    # 学びの根拠となったチャンク id の並び（重複除去・出現順）。chunk_ids を渡さない
+    # 呼び出し箇所は空タプルのまま = 個別チャンクへの接地なし。
+    chunk_ids: tuple[str, ...] = ()
+    # 代表節・代表ページ（先頭の根拠チャンクの値。設計書 §7-B チャンク接地）。
+    section: str | None = None
+    page: int | None = None
 
 
 @dataclass(frozen=True)
