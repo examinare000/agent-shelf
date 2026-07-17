@@ -1091,14 +1091,18 @@ class ShelfService:
         """Librarian.route() に渡す投影 DTO を store.list_notebooks() から組み立てる。
 
         Librarian は store を一切知らない（設計書 §3「カタログは service が組み立てて
-        Librarian に渡す」）ため、この変換は service の責務。
+        Librarian に渡す」）ため、この変換は service の責務。tags は
+        store.list_tags_by_notebook() を1回だけ引いて notebook 名で引き当てる
+        （notebook 数ぶん個別クエリを発行しない・N+1 回避）。
         """
+        tags_by_notebook = self._store.list_tags_by_notebook()
         return [
             NotebookCard(
                 name=row["name"],
                 description=row["description"],
                 persona=row["persona"],
                 doc_count=row["documents"],
+                tags=tuple(tags_by_notebook.get(row["name"], ())),
             )
             for row in self._store.list_notebooks()
         ]

@@ -1713,6 +1713,30 @@ def test_consult_fans_out_to_multiple_experts_when_librarian_returns_multiple_ta
     assert len(fake_librarian.calls) == 1
 
 
+def test_consult_catalog_includes_notebook_tags_saved_by_digest(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """digest で保存済みの document_tags を、司書ルーティング用カタログ
+    （NotebookCard.tags）に含める（brief §6・list_tags_by_notebook 配線）。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb")
+    store.replace_document_tags("nb", "doc", ["量子力学", "スピン"])
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    assert len(fake_librarian.calls) == 1
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert len(catalog) == 1
+    assert catalog[0].name == "nb"
+    # store.list_tags_by_notebook は doc_count 降順・同数はタグ名昇順で返す
+    # （同一doc上の2タグは doc_count 同点のためタグ名の Unicode 順）。
+    assert set(catalog[0].tags) == {"量子力学", "スピン"}
+
+
 def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:

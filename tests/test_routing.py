@@ -101,6 +101,20 @@ class TestBuildRoutingPrompt:
 
         assert "一覧に無い" in prompt
 
+    def test_includes_tags_when_present(self):
+        card = _card(tags=("量子力学", "スピン"))
+
+        prompt = build_routing_prompt("質問", [card])
+
+        assert "タグ: 量子力学, スピン" in prompt
+
+    def test_omits_tags_line_when_empty(self):
+        card = _card(tags=())
+
+        prompt = build_routing_prompt("質問", [card])
+
+        assert "タグ:" not in prompt
+
 
 class TestRoutingSchema:
     def test_declares_answerable_and_targets(self):
