@@ -1233,19 +1233,24 @@ class ShelfService:
             }
 
         librarian = self._get_librarian()
-        targets = librarian.route(question, catalog)
-        if not targets:
+        outcome = librarian.route(question, catalog)
+        if not outcome.targets:
+            warning = (
+                f"司書ルーティングの backend 呼び出しに失敗: {outcome.router_error}"
+                if outcome.router_error is not None
+                else "資料からは分からない"
+            )
             return {
                 "question": question,
                 "answered": False,
                 "routed": [],
-                "warning": "資料からは分からない",
+                "warning": warning,
             }
 
         return {
             "question": question,
             "answered": True,
-            "routed": [self._consult_target(target) for target in targets],
+            "routed": [self._consult_target(target) for target in outcome.targets],
             "warning": None,
         }
 

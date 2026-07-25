@@ -3434,3 +3434,28 @@ def test_shelve_converts_each_file_once_uses_summary_as_description_and_recommen
     assert result["notes"] == [
         "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
     ]
+
+
+def test_consult_reports_router_error_when_librarian_backend_fails(store, embedder, tmp_path):
+    """【6】司書(Librarian)の backend 呼び出し失敗時、warning に router_error が含まれる"""
+    router_backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="librarian backend timeout"))
+    expert_backend = FakeAnswerBackend(canned='{"answer": "答え", "citations": [], "grounded": false}')
+    service = ShelfService(
+        store, embedder, lambda name: expert_backend, tmp_path,
+        librarian=FakeLibrarian([]),  # targets 空のため専門家は呼ばれない
+    )
+    # notebook を作成してカタログを非空にする
+    store.create_notebook("physics", description="物理")
+
+    # Librarian を router_error を返すように差し替える
+    from shelf.librarian import Librarian
+
+    service._librarian = Librarian(
+        router_backend, workdir=tmp_path, top_n=1, fallback="conservative"
+    )
+
+    result = service.consult("質問")
+
+    assert result["answered"] is False
+    assert "librarian backend timeout" in result["warning"]
+    assert "司書ルーティングの backend 呼び出しに失敗" in result["warning"]
