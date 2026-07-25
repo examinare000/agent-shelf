@@ -292,6 +292,13 @@ class Store:
             self._probe_fts()
         except sqlite3.Error as exc:
             self._conn.rollback()
+            # プローブ失敗時に chunks_fts を DROP しておくことで、次回オープン時に
+            # already_existed=False に戻し CREATE+バックフィルを再試行できるようにする
+            # （SQLITE_BUSY 等の一過性失敗から回復する手段）。
+            try:
+                self._conn.execute("DROP TABLE IF EXISTS chunks_fts")
+            except sqlite3.Error:
+                pass
             # コードレビュー指摘: 初期化時の劣化は _fts_disable_after_failure を
             # 経由させ、fts_enabled=False にする事実を必ず警告ログへ残す
             # （以前は直接代入していたため、DB オープン時に FTS が無効化された

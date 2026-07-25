@@ -1841,6 +1841,64 @@ class TestFtsRebuildFailureSelfHeals:
         # already_existed=False となり CREATE+バックフィルが再試行され、
         # store1 で投入済みの doc1#0 がヒットするはず。
         assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+
+class TestFtsProbeFailureSelfHeals:
+    """【1】_init_fts の CREATE VIRTUAL TABLE が成功しても _probe_fts が失敗すると
+    空の chunks_fts テーブルが残存する(CREATE は DDL 自動コミットのため
+    rollback()で取り消せない)。次回起動時 already_existed=True となり二度と
+    バックフィルが走らず、既存チャンクが恒久的にキーワード検索から漏れる
+    (サイレント劣化)。probe 失敗時は chunks_fts を DROP して次回起動時に
+    CREATE+バックフィルを再試行させる自己修復を検証する。
+    """
+
+    def test_probe_failure_drops_fts_table_so_next_open_retries_backfill(
+        self, tmp_path, monkeypatch
+    ):
+        """【1】probe 失敗時に chunks_fts を DROP して次回再試行"""
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        _make_notebook(store1, name="physics")
+        _make_document(store1, id_="doc1", notebook="physics")
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        # chunks を投入した直後に chunks_fts を DROP して、旧 DB（chunks_fts 未導入）を模す
+        # （これにより store2 での _init_fts で already_existed=False → rebuild が対象になる）
+        store1._conn.execute("DROP TABLE chunks_fts")
+        store1._conn.commit()
+        store1.close()
+
+        # 1 回目オープン: プローブ失敗を強制
+        call_count = [0]
+
+        def failing_probe_once(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise sqlite3.OperationalError("simulated: SQLITE_BUSY")
+            # 2 回目以降は成功
+
+        monkeypatch.setattr(Store, "_probe_fts", failing_probe_once)
+
+        store2 = Store(str(db_path))
+        assert store2.fts_enabled is False  # プローブ失敗により disable
+        store2.close()
+        # 修正がされていれば chunks_fts は DROP 済みのはず
+        # DROP 済みなら次回オープンで already_existed=False となり
+        # rebuild が再試行される
+        # 未修正なら chunks_fts が残存し next open で already_existed=True → rebuild スキップ
+
+        # 2 回目オープン: DROP 済みなら新規作成からバックフィル、未修正なら既存のまま
+        store3 = Store(str(db_path))
+        try:
+            # 修正済み: chunks_fts が DROP 済み → already_existed=False → rebuild 実行
+            #         → chunks_fts がバックフィルされた → keyword_topk が結果を返す
+            # 未修正: chunks_fts が残存 → already_existed=True → rebuild スキップ
+            #        → chunks_fts が空のまま → keyword_topk が [] を返す
+            hits = store3.keyword_topk("physics", "quantum", limit=10)
+            assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+        finally:
+            store3.close()
+
+
 class TestPathNormalization:
     """【3】Windows で構築済みの既存 DB に残る `\` 区切りを POSIX 正規化
     （personal 修正・personal tests との回帰テスト）"""
