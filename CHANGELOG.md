@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests Removed & Consolidated
+- **重複テスト解消**: v0.4.2 の PR #9 で追加した test_probe_failure_drops_fts_table_for_retry_on_next_open（TestFtsInitProbe クラス）と v0.4.2 タグ前後の TestFtsProbeFailureSelfHeals.test_probe_failure_drops_fts_table_so_next_open_retries_backfill は同一シナリオのテストであったため、PR #9 版を残し TestFtsProbeFailureSelfHeals クラスごと削除（クラス内に他のテストなし、テスト数1017→1016に減少）
+
 ## [0.4.2] - 2026-07-25
 
 ### Fixed
