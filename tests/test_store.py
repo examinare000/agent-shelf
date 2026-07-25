@@ -1796,3 +1796,48 @@ class TestFtsGhostRowDeletion:
         assert store.keyword_topk("physics", "quantum", limit=10) == []
 
 
+class TestFtsRebuildFailureSelfHeals:
+    """【2】_init_fts の移行バックフィル(_rebuild_fts)が失敗しても chunks_fts テーブル
+    自体は CREATE 済みのままコミットされてしまうと、次回起動時 already_existed=True
+    となり二度とバックフィルが走らず、移行前の既存チャンクが恒久的にキーワード
+    検索から漏れる(サイレント劣化)。rebuild 失敗時は chunks_fts
+    を DROP して次回起動時に CREATE+バックフィルを再試行させる自己修復を検証する。
+    """
+
+    def test_rebuild_failure_drops_fts_table_so_next_open_retries_backfill(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """【2】rebuild 失敗時に chunks_fts を DROP して次回再試行"""
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(db_path)
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store1._conn.execute("DROP TABLE chunks_fts")  # FTS 未導入の旧 DB を模す
+        store1._conn.commit()
+        store1.close()
+
+        def failing_rebuild(self):
+            import sqlite3
+            raise sqlite3.OperationalError("simulated rebuild failure")
+
+        monkeypatch.setattr(Store, "_rebuild_fts", failing_rebuild)
+
+        with caplog.at_level("WARNING"):
+            store2 = Store(db_path)
+        try:
+            assert store2.fts_enabled is False
+        finally:
+            store2.close()
+
+        # 失敗した _rebuild_fts の差し替えを戻し、実装本来の rebuild で再オープンする。
+        monkeypatch.undo()
+
+        store3 = Store(db_path)
+        try:
+            hits = store3.keyword_topk("physics", "quantum", limit=10)
+        finally:
+            store3.close()
+
+        # chunks_fts が自己修復で DROP されていたなら、store3 の起動時に
+        # already_existed=False となり CREATE+バックフィルが再試行され、
+        # store1 で投入済みの doc1#0 がヒットするはず。
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]

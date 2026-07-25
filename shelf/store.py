@@ -234,6 +234,18 @@ class Store:
                 try:
                     self._rebuild_fts()
                 except sqlite3.Error as exc:
+                    # 失敗時 chunks_fts テーブル自体が CREATE 済みのまま残ると、
+                    # 次回起動時 already_existed=True となり二度とバックフィルが
+                    # 走らず、移行前の既存チャンクが恒久的にキーワード検索から
+                    # 漏れる（サイレント劣化）。テーブルごと消しておけば次回起動時
+                    # already_existed=False に戻り、CREATE+バックフィルを再試行
+                    # できる（自己修復）。DROP 自体の失敗は握り潰す（既に劣化
+                    # ルートに入っているため、ここで追加の例外を呼び出し元に
+                    # 波及させても得はない）。
+                    try:
+                        self._conn.execute("DROP TABLE IF EXISTS chunks_fts")
+                    except sqlite3.Error:
+                        pass
                     self._fts_disable_after_failure("初期化", exc)
         self._conn.commit()
 
