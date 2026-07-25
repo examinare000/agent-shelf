@@ -1562,7 +1562,7 @@ class ShelfService:
             }
             for note in reduced_notes
         ]
-        # 【1】notes と tags を1コミットで原子的に書き込む。replace_study_notes/
+        # notes と tags を1コミットで原子的に書き込む。replace_study_notes/
         # replace_document_tags を独立呼び出しすると、1段目成功後に2段目が失敗する
         # 場合に notes は新 pipeline・新 source_hash で確定するのに tags は古いままに
         # なり、以後の skip 判定（source_hash+pipeline のみ参照）が再生成不要と
