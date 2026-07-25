@@ -139,6 +139,7 @@ class Store:
         self._migrate_notebooks_columns()
         self._migrate_chunks_columns()
         self._migrate_study_notes_columns()
+        self._migrate_normalize_path_separators()
         # notebook 単位のベクトル行列キャッシュ: {notebook: (generation, ids, matrix)}。
         # generation が現在値と一致する間は SQLite に再クエリしない（§ ベクタキャッシュ）。
         self._vector_cache: dict[str, tuple[int, list[str], np.ndarray]] = {}
@@ -190,6 +191,68 @@ class Store:
                 "pipeline": "INTEGER NOT NULL DEFAULT 1",
             },
         )
+
+    def _migrate_normalize_path_separators(self, _force_windows: bool = False) -> None:
+        r"""Windows で構築済みの既存 DB に残る `\` 区切りの
+        chunks.source_path / file_state.source_file を POSIX 区切りへ後追いで
+        正規化する。放置すると indexer.py の他 notebook 保護（`f"{notebook}/"`
+        プレフィックス判定）が旧 `\` 行を吸収できず、`--full` 再索引でも消えない
+        prune 不能なゴミとして残り続ける。
+
+        POSIX ではバックスラッシュはファイル名の合法文字であり、無条件 REPLACE は
+        正当なファイル名を黙って書き換え prune による削除まで起こしうるため、
+        Windows（os.name == "nt"）でのみ実行する。
+
+        chunks.source_path は id が PRIMARY KEY で source_path 自体に一意制約は
+        ないため、単純な REPLACE で衝突を気にせず更新できる（id/rowid/text は
+        不変なので chunks_fts の追随も不要）。file_state.source_file は
+        PRIMARY KEY のため、正規化後のキーが既に存在する場合（修正後のコードで
+        新規に posix 行が書かれた後に旧 `\` 行が残っているケース）は UPDATE すると
+        PK 衝突するので、その旧行は DELETE で捨てる。
+
+        Args:
+            _force_windows: テスト用。True の場合、os.name の値に関わらず Windows 正規化を実行。
+        """
+        import os
+
+        # POSIX では正当なファイル名のバックスラッシュを保護する
+        if not _force_windows and os.name != "nt":
+            return
+
+        changed = False
+
+        chunks_updated = self._conn.execute(
+            "UPDATE chunks SET source_path = REPLACE(source_path, '\\', '/') "
+            "WHERE source_path LIKE '%\\%'"
+        ).rowcount
+        if chunks_updated > 0:
+            changed = True
+
+        legacy_file_states = self._conn.execute(
+            "SELECT source_file FROM file_state WHERE source_file LIKE '%\\%'"
+        ).fetchall()
+        for row in legacy_file_states:
+            old_key = row["source_file"]
+            new_key = old_key.replace("\\", "/")
+            conflict = self._conn.execute(
+                "SELECT 1 FROM file_state WHERE source_file = ?", (new_key,)
+            ).fetchone()
+            if conflict is not None:
+                self._conn.execute(
+                    "DELETE FROM file_state WHERE source_file = ?", (old_key,)
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE file_state SET source_file = ? WHERE source_file = ?",
+                    (new_key, old_key),
+                )
+            changed = True
+
+        if changed:
+            # citation の source 表示が変わるため、prune_missing 等と同様に
+            # generation を進めてベクタキャッシュを無効化する。
+            self._bump_generation()
+        self._conn.commit()
 
     def _init_fts(self) -> None:
         # fts5 の trigram tokenizer は SQLite のビルドオプション次第で使えない

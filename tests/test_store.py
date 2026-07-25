@@ -1841,3 +1841,149 @@ class TestFtsRebuildFailureSelfHeals:
         # already_existed=False となり CREATE+バックフィルが再試行され、
         # store1 で投入済みの doc1#0 がヒットするはず。
         assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+class TestPathNormalization:
+    """【3】Windows で構築済みの既存 DB に残る `\` 区切りを POSIX 正規化
+    （personal 修正・personal tests との回帰テスト）"""
+
+    def _insert_legacy_chunk(self, store, source_path, chunk_id="doc1#0"):
+        """テスト用: DB に直接 chunk を INSERT し、後で正規化対象にする"""
+        import numpy as np
+
+        store._conn.execute(
+            "INSERT INTO chunks "
+            "(id, notebook, doc_id, source_path, seq, text, embedding, dim, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                chunk_id,
+                "physics",
+                "doc1",
+                source_path,
+                0,
+                "本文",
+                np.asarray((0.1, 0.2, 0.3, 0.4), dtype=np.float32).tobytes(),
+                4,
+                "body",
+            ),
+        )
+        store._conn.commit()
+
+    def _insert_legacy_file_state(self, store, source_file, model="model-x"):
+        """テスト用: DB に直接 file_state を INSERT し、後で正規化対象にする"""
+        store._conn.execute(
+            "INSERT INTO file_state (source_file, mtime, size, model) VALUES (?, ?, ?, ?)",
+            (source_file, 1.0, 100, model),
+        )
+        store._conn.commit()
+
+    def test_init_normalizes_backslash_source_path_in_chunks(self, tmp_path):
+        """【3】chunks.source_path の `\` を `/` へ正規化（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            # __init__ では実行されず、ここで手動実行（_force_windows=True でテスト）
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            chunk = store2.get_chunk("doc1#0")
+            assert chunk["source_path"] == "physics/a.md"
+        finally:
+            store2.close()
+
+    def test_init_normalizes_backslash_source_file_in_file_state(self, tmp_path, monkeypatch):
+        """【3】file_state.source_file の `\` を `/` へ正規化（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_file_state(store1, source_file="physics\\a.md")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            assert store2.get_file_state("physics\\a.md") is None
+            normalized = store2.get_file_state("physics/a.md")
+            assert normalized is not None
+            assert normalized["model"] == "model-x"
+        finally:
+            store2.close()
+
+    def test_init_resolves_conflicting_file_state_by_keeping_posix_row(self, tmp_path, monkeypatch):
+        """【3】PK 衝突時は posix 行を保持、旧行を DELETE（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        # 修正後のコードで既に posix 形式が書かれた後に旧 `\` 行が残存する
+        # ケース（PK 衝突を起こさず旧行を破棄する）を再現する。
+        self._insert_legacy_file_state(store1, source_file="physics\\a.md", model="old")
+        self._insert_legacy_file_state(store1, source_file="physics/a.md", model="new")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            assert store2.list_source_files() == ["physics/a.md"]
+            assert store2.get_file_state("physics/a.md")["model"] == "new"
+        finally:
+            store2.close()
+
+    def test_init_bumps_generation_when_rows_are_normalized(self, tmp_path, monkeypatch):
+        """【3】正規化実行時に generation が更新される（ベクタキャッシュ無効化）（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        generation_before = store1.get_meta("generation")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            generation_after = store2.get_meta("generation")
+            assert generation_after != generation_before
+        finally:
+            store2.close()
+
+    def test_init_migration_is_idempotent(self, tmp_path):
+        """【3】正規化は冪等（複数回実行しても結果が変わらない）（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        self._insert_legacy_file_state(store1, source_file="physics\\a.md")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を1回目実行
+        store2 = Store(db_path)
+        store2._migrate_normalize_path_separators(_force_windows=True)
+        gen_before = store2.get_meta("generation")
+        store2.close()
+
+        # 2回目開く時点で対象行が無いはずなので、正規化しても generation は変わらない
+        store3 = Store(db_path)
+        store3._migrate_normalize_path_separators(_force_windows=True)
+        gen_after = store3.get_meta("generation")
+        try:
+            assert gen_before == gen_after
+        finally:
+            store3.close()
+
+    def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(self, tmp_path):
+        """【3】POSIX 環境ではバックスラッシュが正当なファイル名として保留される"""
+        db_path = tmp_path / "posix.db"
+        store1 = Store(db_path)
+        # POSIX では `\` はファイル名として合法的
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        # POSIX 環境（os.name != "nt"）では正規化されないことを確認
+        store2 = Store(db_path)
+        try:
+            chunk = store2.get_chunk("doc1#0")
+            # POSIX では `\` がそのまま残る（正規化されない）
+            assert chunk["source_path"] == "physics\\a.md"
+        finally:
+            store2.close()
+
+

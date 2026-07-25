@@ -1366,7 +1366,7 @@ class ShelfService:
             # （add_directory と同じ「ファイル数分ではなく1回」の流儀）。
             for doc_id in generated:
                 path = self._corpus_dir / notebook / f"{doc_id}.md"
-                source_path = str(path.relative_to(self._corpus_dir))
+                source_path = path.relative_to(self._corpus_dir).as_posix()
                 self._store.delete_file_state(source_path)
             index_notebook(
                 self._corpus_dir, notebook, self._store, self._embedder, mask=self._mask
