@@ -26,6 +26,11 @@ packages = ["shelf"]
 line-length = 100
 target-version = "py311"
 
+# ruff 0.16.0 でデフォルトの有効ルールが拡大されたため、従来のデフォルトを明示して固定する。
+# 新ルール群の採用（59件の指摘対応）はバージョンアップとは別タスクで判断する。
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
 # エディタ(Pyright)が shelf/.venv を解決できるようにする（実行系は uv が解決）
 [tool.pyright]
 venvPath = "."
