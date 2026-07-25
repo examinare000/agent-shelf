@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-25
+
+### Fixed
+- **FTS プローブ失敗時の自己修復**: _init_fts で CREATE VIRTUAL TABLE は成功しても _probe_fts が一過性失敗（SQLITE_BUSY等）した場合、空の chunks_fts テーブルが残存するため次回起動で already_existed=True になり移行バックフィルが永久に走らず既存チャンクがキーワード検索から恒久的に漏れる問題を修正。probe 失敗時に DROP TABLE IF EXISTS chunks_fts を実行して次回再試行可能に
+
+### Tests Added
+- プローブ失敗時の自己修復テスト 1 件: test_probe_failure_drops_fts_table_so_next_open_retries_backfill
+
 ## [0.4.1] - 2026-07-25
 
 ### Fixed（personalから移植した堅牢化）
