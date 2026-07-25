@@ -1766,3 +1766,33 @@ class TestFtsIncrementalSync:
         store._fts_insert_rows(ids)
 
         assert call_sizes == [batch_size, 1]
+class TestFtsGhostRowDeletion:
+    """delete_document と prune_missing で削除されたチャンクが FTS 索引に残る
+    幽霊行バグを検証（personal 修正・personal tests との回帰テスト）。"""
+
+    def test_delete_document_removes_its_chunks_from_keyword_index(self, store):
+        """【1】delete_document: 削除済みチャンクが keyword_topk に残らないこと"""
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        assert len(store.keyword_topk("physics", "quantum", limit=10)) == 1
+
+        store.delete_document("doc1")
+
+        # 削除後は FTS に幽霊行が残らずキーワード検索で出現しないこと
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+    def test_prune_missing_removes_pruned_chunks_from_keyword_index(self, store):
+        """【1】prune_missing: 削除済みチャンクが keyword_topk に残らないこと"""
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store.set_file_state("corpus/physics/doc1.md", mtime=1.0, size=1, model="m")
+        assert len(store.keyword_topk("physics", "quantum", limit=10)) == 1
+
+        store.prune_missing(set())
+
+        # prune 後は FTS に幽霊行が残らずキーワード検索で出現しないこと
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+

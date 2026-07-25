@@ -525,7 +525,9 @@ class Store:
         return [dict(row) for row in rows]
 
     def delete_document(self, id: str) -> None:
+        old_fts_rows = self._fts_capture_rows("doc_id = ?", (id,))
         self._conn.execute("DELETE FROM chunks WHERE doc_id = ?", (id,))
+        self._fts_delete_rows(old_fts_rows)
         self._conn.execute("DELETE FROM study_notes WHERE doc_id = ?", (id,))
         self._conn.execute("DELETE FROM document_tags WHERE doc_id = ?", (id,))
         self._conn.execute("DELETE FROM documents WHERE id = ?", (id,))
@@ -882,7 +884,9 @@ class Store:
         tracked = self.list_source_files()
         stale = [f for f in tracked if f not in existing_source_files]
         for source_file in stale:
+            old_fts_rows = self._fts_capture_rows("source_path = ?", (source_file,))
             self._conn.execute("DELETE FROM chunks WHERE source_path = ?", (source_file,))
+            self._fts_delete_rows(old_fts_rows)
             self._conn.execute("DELETE FROM file_state WHERE source_file = ?", (source_file,))
         if stale:
             self._bump_generation()
