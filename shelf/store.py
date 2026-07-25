@@ -124,12 +124,25 @@ class UnknownNotebookError(ValueError):
 
 
 class Store:
+    # SQLite の busy_timeout(ms)。shelf は長命 MCP サーバ(server.py が Store を
+    # プロセス生存中保持)と別プロセスの `shelf index` CLI(cli.py が別 Store)が
+    # 同一 DB ファイルへ同時アクセスする構成のため、単発の database is locked を
+    # 即座に例外化させず SQLite 自身に自動リトライさせる猶予。これを設定しない
+    # と、単発ロックが sqlite3.Error として keyword_topk 等に伝播し、
+    # _fts_disable_after_failure がそのプロセスの生存中ずっとハイブリッド検索を
+    # 無効化してしまう(サーバ再起動まで回復しない)。
+    _BUSY_TIMEOUT_MS = 5000
+
     def __init__(self, db_path: str | Path) -> None:
         # DB_PATH の親ディレクトリを必要時に作成する（":memory:" はファイルではないのでスキップ）。
         if str(db_path) != ":memory:":
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
+        # 同時アクセスによる一時的なロック競合の頻度を下げる（上の _BUSY_TIMEOUT_MS
+        # コメント参照）。foreign_keys より前に設定しても問題ない（両方とも
+        # 接続スコープの PRAGMA）。
+        self._conn.execute(f"PRAGMA busy_timeout = {self._BUSY_TIMEOUT_MS}")
         # documents.notebook の FK 制約を有効化し、「未知 notebook への追加は失敗」を
         # SQLite に守らせる（アプリ側の二重チェックを避ける）。
         self._conn.execute("PRAGMA foreign_keys = ON")

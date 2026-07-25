@@ -1987,3 +1987,13 @@ class TestPathNormalization:
             store2.close()
 
 
+class TestBusyTimeout:
+    """【7】PRAGMA busy_timeout の設定を検証"""
+
+    def test_busy_timeout_pragma_is_set_to_nonzero_ms(self, store):
+        """Store 初期化時に PRAGMA busy_timeout = 5000 が設定されることを検証"""
+        row = store._conn.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == Store._BUSY_TIMEOUT_MS
+        assert row[0] != 0
+
+
