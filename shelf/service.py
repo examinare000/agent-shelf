@@ -1529,7 +1529,8 @@ class ShelfService:
             return f"reduce失敗: {reduce_raw.error}"
 
         reduced_notes, tags = parse_reduce(
-            reduce_raw.text, reduce_input_notes, max_notes=self._digest_max_notes
+            reduce_raw.text, reduce_input_notes, max_notes=self._digest_max_notes,
+            mask=self._mask,
         )
         if not reduced_notes:
             # reduce 応答が ok=True でも、JSON解析失敗や有効なノート0件は実質的な

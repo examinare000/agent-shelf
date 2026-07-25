@@ -2678,16 +2678,15 @@ def test_digest_reduce_success_with_empty_tags_persists_notes_and_clears_tags(
 def test_digest_dedups_tags_that_collapse_to_same_string_after_masking(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
-    """コードレビュー指摘#2: normalize_tags のタグ重複除去はマスク適用前にしか
-    働かない。マスク後に別々のタグが同一文字列へ衝突する場合
-    （例: token-abc1/token-xyz2 が共に token=<REDACTED> になる・extract.py の
-    マスク規則）、store.replace_document_tags は (doc_id, tag) が PRIMARY KEY の
-    プレーンな INSERT のため sqlite3.IntegrityError で digest ループ全体が
-    落ちてしまう。マスク後に順序維持で重複除去し、1行だけ保存されることを検証する。
-    タグにハイフンを使うのは、コードレビュー指摘#8で normalize_tag が文字種
-    許可リスト外の記号（コロン等）をマスク適用より前に除去するようになった
-    ため、コロンでは本テストが検証したい「マスク後の衝突」を再現できなく
-    なったため（ハイフンは許可リストに残る）。"""
+    """ADR 0004 最終決定4: digests.normalize_tags へ mask を additive
+    パラメータとして渡し、mask→許可リスト正規化の順で1回のパスに統合する
+    （反証検証で発見した OSS のバグ「normalize→mask の順だとmask後のプレース
+    ホルダの記号がDBへ持ち込まれる」の修正）。この設計変更の副次効果として、
+    別々のタグがマスク後に同一文字列へ衝突する場合
+    （例: token-abc1/token-xyz2 が共に mask 後 "token=<REDACTED>" になる）の重複も
+    normalize_tags 内の1回の重複除去だけで自然に解消され、service.py 側に
+    事後の dedup コードを必要としない（store.replace_document_tags の
+    (doc_id, tag) PRIMARY KEY への sqlite3.IntegrityError を未然に防ぐ）。"""
     store.create_notebook("nb", backend="codex")
     corpus_dir = tmp_path / "corpus"
     nb_dir = corpus_dir / "nb"
@@ -2715,7 +2714,11 @@ def test_digest_dedups_tags_that_collapse_to_same_string_after_masking(
     result = service.digest("nb")
 
     assert result == {"notebook": "nb", "generated": ["doc"], "skipped": [], "errors": []}
-    assert store.list_document_tags("nb", "doc") == ["token=<REDACTED>"]
+    tags = store.list_document_tags("nb", "doc")
+    assert len(tags) == 1
+    # mask 後の "token=<REDACTED>" は許可リスト外の '=' '<' '>' を含むため、
+    # 後続の正規化でこれらが除去された値のみが DB へ入る。
+    assert "<" not in tags[0] and ">" not in tags[0] and "=" not in tags[0]
 
 
 def test_digest_reduce_prompt_includes_existing_notebook_tag_catalog(

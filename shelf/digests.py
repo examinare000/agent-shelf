@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable
 
 from shelf.jsonutil import parse_json_object
 from shelf.ports import StudyNote
@@ -303,15 +304,26 @@ def build_reduce_prompt(
 
 
 def parse_reduce(
-    text: str, map_notes: list[StudyNote], *, max_notes: int = REDUCE_DEFAULT_NOTES
+    text: str,
+    map_notes: list[StudyNote],
+    *,
+    max_notes: int = REDUCE_DEFAULT_NOTES,
+    mask: Callable[[str], str] | None = None,
 ) -> tuple[list[StudyNote], list[str]]:
     """reduce フェーズのエンジン生出力を、統合済み StudyNote 列 + 正規化タグ列へ変換する。
 
     sources 配列（1 起点の [N番号]）を map_notes[index-1] へ機械解決し、
     参照元 chunk_ids の和集合（出現順維持・重複除去）を統合ノートの chunk_ids とする
-    （parse_map と対称の設計。§ chunk 接地を reduce 後も失わないため）。
+    （parse_map と対称の設計。chunk 接地を reduce 後も失わないため）。
     JSON 全体のパース失敗は ([], []) へ劣化させ、呼び出し側 service.py が
     map フェーズの結果へフォールバックするかを判断できるようにする。
+
+    mask は additive パラメータ（既定 None・省略時は OSS と同一挙動）。
+    ADR 0004 最終決定4: LLM 生成タグは正規化のみでは秘密文字列パターン
+    （例 sk-...）を検出できず、事後に service.py 側で mask を適用すると
+    mask が生成するプレースホルダ（例 '<REDACTED-KEY>'）が DB 保存される実測バグがあった。
+    mask を normalize_tags へ渡すことで「mask（指定時のみ）→ 従来の正規化パイプライン全体」
+    の順を保証する（normalize_tag 側の docstring 参照）。
     """
     data = parse_json_object(text)
     if data is None:
@@ -327,7 +339,7 @@ def parse_reduce(
         ][:max_notes]
 
     raw_tags = data.get("tags")
-    tags = normalize_tags(raw_tags) if isinstance(raw_tags, list) else []
+    tags = normalize_tags(raw_tags, mask=mask) if isinstance(raw_tags, list) else []
 
     return notes, tags
 
@@ -365,9 +377,18 @@ _TAG_DISALLOWED_CHARS = re.compile(r"[^\w\-]", re.UNICODE)
 _TAG_REPEATED_HYPHENS = re.compile(r"-+")
 
 
-def normalize_tag(raw: object) -> str | None:
-    """タグ 1 件を正規化する: NFKC 正規化 → strip → lower → 連続空白を "-" に置換
-    → 文字種許可リストで記号を除去 → 連続ハイフン圧縮・前後ハイフン除去。
+def normalize_tag(raw: object, *, mask: Callable[[str], str] | None = None) -> str | None:
+    """タグ 1 件を正規化する: (mask 指定時のみ) mask 適用 → NFKC 正規化 → strip → lower
+    → 連続空白を "-" に置換 → 文字種許可リストで記号を除去 → 連続ハイフン圧縮・
+    前後ハイフン除去。
+
+    mask は additive パラメータ（既定 None・省略時は従来と完全同一挙動）。
+    ADR 0004 最終決定4: LLM が抽出したタグに秘密文字列パターン（例 sk-...）が
+    含まれる場合、正規化のみでは検出できず、事後に呼び出し側で mask を適用すると
+    mask のプレースホルダ出力（例 '<REDACTED-KEY>'）が許可文字集合外の記号を
+    含んだまま返ってしまう。mask をこの関数の最初の操作として組み込むことで
+    「mask → 許可リスト正規化」の順を保証し、mask 後の文字列も正規化の対象にする
+    （OSS 側にこの optional mask パラメータ設計を逆輸入する価値がある）。
 
     unicodedata/re は json と並ぶ標準ライブラリであり、test_boundaries.py の
     _RESTRICTED_TO_OWNER（sqlite3/subprocess/fastembed 等の外部 SDK 限定）には
@@ -387,7 +408,8 @@ def normalize_tag(raw: object) -> str | None:
     """
     if not isinstance(raw, str):
         return None
-    normalized = unicodedata.normalize("NFKC", raw).strip().lower()
+    text = mask(raw) if mask is not None else raw
+    normalized = unicodedata.normalize("NFKC", text).strip().lower()
     normalized = "-".join(normalized.split())
     normalized = _TAG_DISALLOWED_CHARS.sub("", normalized)
     normalized = _TAG_REPEATED_HYPHENS.sub("-", normalized).strip("-")
@@ -396,13 +418,18 @@ def normalize_tag(raw: object) -> str | None:
     return normalized
 
 
-def normalize_tags(raws: list, *, max_tags: int = 8) -> list[str]:
+def normalize_tags(
+    raws: list, *, max_tags: int = 8, mask: Callable[[str], str] | None = None
+) -> list[str]:
     """タグ列を正規化する: normalize_tag で無効化された要素を除去し、
-    出現順維持で重複除去した上で max_tags にクランプする。"""
+    出現順維持で重複除去した上で max_tags にクランプする。
+
+    mask は normalize_tag へそのまま渡す additive パラメータ（既定 None）。
+    """
     seen: set[str] = set()
     result: list[str] = []
     for raw in raws:
-        tag = normalize_tag(raw)
+        tag = normalize_tag(raw, mask=mask)
         if tag is None or tag in seen:
             continue
         seen.add(tag)
