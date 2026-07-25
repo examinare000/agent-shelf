@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-25
+
+### Fixed（personalから移植した堅牢化）
+- **FTS 幽霊行バグ**: delete_document と prune_missing で削除済みチャンクが FTS 索引に残り、キーワード検索に出現する問題を修正。削除前に FTS 行を capture し、DELETE 後に削除する二段構え処理を導入
+- **FTS バックフィル自己修復**: _init_fts で chunks_fts テーブル CREATE 後のバックフィル失敗時、CREATE 済みテーブルが残るため次回起動で already_existed=True になり移行前チャンクが恒久的にキーワード検索から漏れる問題を修正。失敗時に DROP TABLE IF EXISTS chunks_fts を実行して次回再試行可能に
+- **Windows source_path OS 区切り混入**: Windows で構築済みの既存 DB に残る `\` 区切りの chunks.source_path / file_state.source_file を POSIX 区切りへ後追いで正規化する _migrate_normalize_path_separators を導入（POSIX では正当なファイル名の `\` を保護するため os.name == "nt" ゲート付き）。indexer.py:71 と service.py:1374 でも .as_posix() 正規化を確保
+- **Windows cp932 で consult 全滅**: engines/runner.py が text=True（locale 依存）で Windows cp932 になるため、encoding="utf-8", errors="replace" を明示化。cli.py に _reconfigure_stdio_utf8 を追加し main() で stdout/stderr を UTF-8 に固定
+- **Windows timeout 時の子プロセス放置**: runner.py の timeout 後 os.killpg/getpgid 直呼びで Windows では AttributeError が except Exception に飲まれ timed_out=False 化。hasattr(os, "killpg") フォールバックを導入し Windows では proc.kill() で直接の子のみ kill
+- **司書 backend 失敗の観測性**: Librarian.route() の戻り値を list[RouteTarget] から RouteOutcome（targets + router_error）に変更。backend 呼び出し失敗を router_error で伝搬し、service.consult() で warning 分岐で区別表示（従来は「資料からは分からない」に潰れていた）
+- **PRAGMA busy_timeout**: shelf は長命 MCP サーバと別プロセス shelf index CLI が同一 DB へ同時アクセスするため、単発ロックを SQLite 自身に自動リトライさせる PRAGMA busy_timeout = 5000 を Store.__init__ に設定
+
+### Tests Added（テスト件数 1002→1015: +13件、skip 0）
+- FTS 幽霊行削除の回帰テスト 2 件: test_delete_document_removes_its_chunks_from_keyword_index, test_prune_missing_removes_pruned_chunks_from_keyword_index
+- バックフィル自己修復テスト 1 件: test_rebuild_failure_drops_fts_table_so_next_open_retries_backfill
+- Windows パス正規化テスト 5 件（全実行・skip 0、monkeypatch._force_windows=True で実装依存性を排除）: test_init_normalizes_backslash_source_path_in_chunks, test_init_normalizes_backslash_source_file_in_file_state, test_init_resolves_conflicting_file_state_by_keeping_posix_row, test_init_bumps_generation_when_rows_are_normalized, test_init_migration_is_idempotent
+- POSIX パス保護テスト 1 件（常時実行・skip なし）: test_init_skips_normalization_on_posix_preserving_backslash_in_filenames
+- busy_timeout テスト 1 件: test_busy_timeout_pragma_is_set_to_nonzero_ms
+- router_error の検証テスト 2 件: test_backend_failure_with_conservative_fallback_returns_no_targets (assertion 追加), test_consult_reports_router_error_when_librarian_backend_fails
+- Windows timeout フォールバック分岐テスト 1 件（monkeypatch.delattr で killpg を削除して proc.kill() 分岐を強制実行）: test_timeout_with_windows_fallback_uses_proc_kill
+
+### Migration
+- 既存 DB は自動マイグレーション対応（Store 初期化時に _migrate_normalize_path_separators 実行）
+- POSIX 環境ではパス正規化は実行されない（`\` は合法的なファイル名）
+
+### Intentional Divergence from personal
+- **_migrate_normalize_path_separators に os.name == "nt" ゲート追加**: personal 版は無条件で正規化を行っていたが、OSS 版では POSIX 環境での正当なファイル名の `\` を保護するため Windows 環境でのみ実行（personal レビュー指摘を踏まえた改善）
+
 ## [0.4.0] - 2026-07-17
 
 ### Added
