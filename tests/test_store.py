@@ -1233,6 +1233,56 @@ class TestDocumentTags:
         assert store.list_notebook_tags("physics") == []
 
 
+class TestReplaceStudyNotesAndTags:
+    """study_notes/document_tags を単一トランザクションで書く統合メソッド
+    （コードレビュー指摘: _digest_one 末尾の2段書き込みが1段目成功後に2段目が
+    失敗すると notes は新パイプライン・新hashで確定するのに tags は古いまま残り、
+    skip判定（source_hash+pipeline のみ参照・tagsは見ない）が以後 skipped を
+    返し自己修復しない恒久劣化バグになるため、delete_notebook/delete_document と
+    同じ「複数テーブルを1コミットで書く」流儀に揃える）。
+    """
+
+    def test_writes_both_notes_and_tags_in_one_call(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes_and_tags(
+            "physics", "doc1", [{"text": "学び1", "pipeline": 2}], ["タグ1", "タグ2"]
+        )
+
+        notes = store.list_study_notes("physics", "doc1")
+        assert [n["text"] for n in notes] == ["学び1"]
+        assert store.list_document_tags("physics", "doc1") == ["タグ1", "タグ2"]
+
+    def test_rolls_back_notes_when_tags_write_fails(self, store, monkeypatch):
+        """2段目相当（tags書き込み）だけが失敗した場合、1段目（notes書き込み）も
+        コミットされず、呼び出し前の既存状態がそのまま残ることを固定する
+        （全体ロールバック。部分書き込みによる自己修復不能バグの再発防止）。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_study_notes(
+            "physics", "doc1", [{"text": "既存の学び", "pipeline": 1}]
+        )
+        store.replace_document_tags("physics", "doc1", ["既存タグ"])
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("tags write failed")
+
+        monkeypatch.setattr(store, "_replace_document_tags_no_commit", boom)
+
+        with pytest.raises(RuntimeError):
+            store.replace_study_notes_and_tags(
+                "physics", "doc1", [{"text": "新しい学び", "pipeline": 2}], ["新タグ"]
+            )
+
+        notes = store.list_study_notes("physics", "doc1")
+        assert len(notes) == 1
+        assert notes[0]["text"] == "既存の学び"
+        assert notes[0]["pipeline"] == 1
+        assert store.list_document_tags("physics", "doc1") == ["既存タグ"]
+
+
 class TestListChunks:
     """doc 単位・kind 別のチャンク一覧取得（map-reduce 学び抽出の入力用）。"""
 
@@ -1815,7 +1865,7 @@ class TestFtsGhostRowDeletion:
     幽霊行バグを検証（personal 修正・personal tests との回帰テスト）。"""
 
     def test_delete_document_removes_its_chunks_from_keyword_index(self, store):
-        """【1】delete_document: 削除済みチャンクが keyword_topk に残らないこと"""
+        """delete_document: 削除済みチャンクが keyword_topk に残らないこと"""
         _make_notebook(store, name="physics")
         _make_document(store, id_="doc1", notebook="physics")
         store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
@@ -1827,7 +1877,7 @@ class TestFtsGhostRowDeletion:
         assert store.keyword_topk("physics", "quantum", limit=10) == []
 
     def test_prune_missing_removes_pruned_chunks_from_keyword_index(self, store):
-        """【1】prune_missing: 削除済みチャンクが keyword_topk に残らないこと"""
+        """prune_missing: 削除済みチャンクが keyword_topk に残らないこと"""
         _make_notebook(store, name="physics")
         _make_document(store, id_="doc1", notebook="physics")
         store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
@@ -1841,7 +1891,7 @@ class TestFtsGhostRowDeletion:
 
 
 class TestFtsRebuildFailureSelfHeals:
-    """【2】_init_fts の移行バックフィル(_rebuild_fts)が失敗しても chunks_fts テーブル
+    """_init_fts の移行バックフィル(_rebuild_fts)が失敗しても chunks_fts テーブル
     自体は CREATE 済みのままコミットされてしまうと、次回起動時 already_existed=True
     となり二度とバックフィルが走らず、移行前の既存チャンクが恒久的にキーワード
     検索から漏れる(サイレント劣化)。rebuild 失敗時は chunks_fts
@@ -1851,7 +1901,7 @@ class TestFtsRebuildFailureSelfHeals:
     def test_rebuild_failure_drops_fts_table_so_next_open_retries_backfill(
         self, tmp_path, monkeypatch, caplog
     ):
-        """【2】rebuild 失敗時に chunks_fts を DROP して次回再試行"""
+        """rebuild 失敗時に chunks_fts を DROP して次回再試行"""
         db_path = tmp_path / "shelf.db"
         store1 = Store(db_path)
         store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
@@ -1888,7 +1938,7 @@ class TestFtsRebuildFailureSelfHeals:
 
 
 class TestPathNormalization:
-    """【3】Windows で構築済みの既存 DB に残る `\` 区切りを POSIX 正規化
+    """Windows で構築済みの既存 DB に残る `\` 区切りを POSIX 正規化
     （personal 修正・personal tests との回帰テスト）"""
 
     def _insert_legacy_chunk(self, store, source_path, chunk_id="doc1#0"):
@@ -1922,7 +1972,7 @@ class TestPathNormalization:
         store._conn.commit()
 
     def test_init_normalizes_backslash_source_path_in_chunks(self, tmp_path):
-        """【3】chunks.source_path の `\` を `/` へ正規化（Windows 環境）"""
+        """chunks.source_path の `\` を `/` へ正規化（Windows 環境）"""
         db_path = tmp_path / "legacy.db"
         store1 = Store(db_path)
         self._insert_legacy_chunk(store1, source_path="physics\\a.md")
@@ -1939,7 +1989,7 @@ class TestPathNormalization:
             store2.close()
 
     def test_init_normalizes_backslash_source_file_in_file_state(self, tmp_path, monkeypatch):
-        """【3】file_state.source_file の `\` を `/` へ正規化（Windows 環境）"""
+        """file_state.source_file の `\` を `/` へ正規化（Windows 環境）"""
         db_path = tmp_path / "legacy.db"
         store1 = Store(db_path)
         self._insert_legacy_file_state(store1, source_file="physics\\a.md")
@@ -1957,7 +2007,7 @@ class TestPathNormalization:
             store2.close()
 
     def test_init_resolves_conflicting_file_state_by_keeping_posix_row(self, tmp_path, monkeypatch):
-        """【3】PK 衝突時は posix 行を保持、旧行を DELETE（Windows 環境）"""
+        """PK 衝突時は posix 行を保持、旧行を DELETE（Windows 環境）"""
         db_path = tmp_path / "legacy.db"
         store1 = Store(db_path)
         # 修正後のコードで既に posix 形式が書かれた後に旧 `\` 行が残存する
@@ -1976,7 +2026,7 @@ class TestPathNormalization:
             store2.close()
 
     def test_init_bumps_generation_when_rows_are_normalized(self, tmp_path, monkeypatch):
-        """【3】正規化実行時に generation が更新される（ベクタキャッシュ無効化）（Windows 環境）"""
+        """正規化実行時に generation が更新される（ベクタキャッシュ無効化）（Windows 環境）"""
         db_path = tmp_path / "legacy.db"
         store1 = Store(db_path)
         self._insert_legacy_chunk(store1, source_path="physics\\a.md")
@@ -1993,7 +2043,7 @@ class TestPathNormalization:
             store2.close()
 
     def test_init_migration_is_idempotent(self, tmp_path):
-        """【3】正規化は冪等（複数回実行しても結果が変わらない）（Windows 環境）"""
+        """正規化は冪等（複数回実行しても結果が変わらない）（Windows 環境）"""
         db_path = tmp_path / "legacy.db"
         store1 = Store(db_path)
         self._insert_legacy_chunk(store1, source_path="physics\\a.md")
@@ -2016,7 +2066,7 @@ class TestPathNormalization:
             store3.close()
 
     def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(self, tmp_path):
-        """【3】POSIX 環境ではバックスラッシュが正当なファイル名として保留される"""
+        """POSIX 環境ではバックスラッシュが正当なファイル名として保留される"""
         db_path = tmp_path / "posix.db"
         store1 = Store(db_path)
         # POSIX では `\` はファイル名として合法的

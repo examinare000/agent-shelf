@@ -693,6 +693,85 @@ class TestNormalizeTags:
         assert normalize_tags([]) == []
 
 
+class TestNormalizeTagMaskOrder:
+    """ADR 0004 最終決定4: LLM生成タグに秘密文字列パターン（例 sk-...）が
+    含まれる場合、mask() が許可文字集合外のプレースホルダ（例 '<REDACTED-KEY>'）
+    へ置換する。OSS はタグ正規化(normalize_tag)→mask の順で、mask後の文字列を
+    再正規化しないため '<' '>' を含む文字列がそのままDBへ保存される実測バグが
+    あった。
+
+    personal は mask を許可制限より前の最初の操作として normalize_tag に
+    additive で組み込む（mask 未指定時は既定 None で OSS 挙動と完全一致）
+    ことで、mask→normalize の順を保証する。
+    """
+
+    @staticmethod
+    def _fake_mask(text: str) -> str:
+        # 本物の shelf.masking.mask と同じ「秘密文字列をプレースホルダへ置換する」
+        # 契約だけを最小再現する（許可文字集合 \w/- を破る '<' '>' を含む点が要）。
+        if text == "sk-abcdefghijkl0":
+            return "<REDACTED-KEY>"
+        return text
+
+    def test_without_mask_argument_behaves_identically_to_before(self):
+        # mask 未指定（既定 None）は OSS 既存契約と完全一致させる後方互換要件。
+        assert normalize_tag("sk-abcdefghijkl0") == "sk-abcdefghijkl0"
+
+    def test_masked_placeholder_is_stripped_of_disallowed_chars(self):
+        # マスク後にできる '<REDACTED-KEY>' の '<' '>' は許可リスト外のため、
+        # mask→normalize の順であれば最終的に除去されて DB へ持ち込まれない。
+        assert normalize_tag("sk-abcdefghijkl0", mask=self._fake_mask) == "redacted-key"
+
+    def test_mask_is_applied_before_nfkc_and_lowercasing(self):
+        # mask がまず走り、その出力（大文字含む）が通常の NFKC/lower 経路を
+        # 通ることを確認する（mask 後の再正規化が本当に効いていることの証拠）。
+        assert normalize_tag("SK-ABCDEFGHIJKL0".lower(), mask=self._fake_mask) == "redacted-key"
+
+    def test_non_matching_text_is_unaffected_by_mask(self):
+        assert normalize_tag("量子力学", mask=self._fake_mask) == "量子力学"
+
+
+class TestNormalizeTagsMaskOrder:
+    @staticmethod
+    def _fake_mask(text: str) -> str:
+        if text == "sk-abcdefghijkl0":
+            return "<REDACTED-KEY>"
+        return text
+
+    def test_masked_placeholder_never_reaches_output_with_disallowed_chars(self):
+        result = normalize_tags(["量子力学", "sk-abcdefghijkl0"], mask=self._fake_mask)
+
+        assert result == ["量子力学", "redacted-key"]
+        assert all("<" not in tag and ">" not in tag for tag in result)
+
+    def test_without_mask_argument_behaves_identically_to_before(self):
+        assert normalize_tags(["量子力学", "sk-abcdefghijkl0"]) == ["量子力学", "sk-abcdefghijkl0"]
+
+
+class TestParseReduceMaskOrder:
+    @staticmethod
+    def _fake_mask(text: str) -> str:
+        if text == "sk-abcdefghijkl0":
+            return "<REDACTED-KEY>"
+        return text
+
+    def test_mask_argument_threads_through_to_tag_normalization(self):
+        map_notes = [StudyNote(text="学び1", chunk_ids=("nb/doc#0",))]
+        text = json.dumps({"notes": [], "tags": ["sk-abcdefghijkl0"]})
+
+        _notes, tags = parse_reduce(text, map_notes, mask=self._fake_mask)
+
+        assert tags == ["redacted-key"]
+
+    def test_without_mask_argument_behaves_identically_to_before(self):
+        map_notes = [StudyNote(text="学び1", chunk_ids=("nb/doc#0",))]
+        text = json.dumps({"notes": [], "tags": ["sk-abcdefghijkl0"]})
+
+        _notes, tags = parse_reduce(text, map_notes)
+
+        assert tags == ["sk-abcdefghijkl0"]
+
+
 def _walk_forbids_additional_properties(node: object) -> None:
     """スキーマ内の全 object ノードが additionalProperties: False を持つことを検証する
     （test_prompts.TestAnswerSchema と同じ検証 = codex --output-schema の厳格 JSON 要件）。"""

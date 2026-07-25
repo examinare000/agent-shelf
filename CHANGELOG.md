@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.3] - 2026-07-25
+
+personal 環境への grounded digest 還流時のレビューで発見された 3 件の堅牢化を逆移植。
+
+### Fixed
+- **notes/tags の非原子 2 段書き込み**: `_digest_one` が `replace_study_notes` → `replace_document_tags` を独立 commit で連続実行しており、1 段目成功後に 2 段目が失敗すると notes は pipeline=2 + 新 source_hash・tags は古いままになり、skip 判定が以後 skipped を返して自己修復しなかった。`replace_study_notes_and_tags`（単一トランザクション・失敗時全体ロールバック）へ統合
+- **タグ正規化の mask 順序バグ**: normalize → mask の順序では mask 出力（`<REDACTED-KEY>` 等）が許可文字集合を破って DB へ保存されていた。`normalize_tag`/`normalize_tags`/`parse_reduce` へ mask を additive パラメータとして注入し、mask → 正規化の順を保証（mask 後の事後 dedup コードは正規化の重複除去に吸収され削除）
+
+### Added
+- `_digest_one` に doc_id・window 数の info ログを追加（map 呼び出し数＝コストの実行前可視化）
 
 ### Tests Removed & Consolidated
 - **重複テスト解消**: v0.4.2 の PR #9 で追加した test_probe_failure_drops_fts_table_for_retry_on_next_open（TestFtsInitProbe クラス）と v0.4.2 タグ前後の TestFtsProbeFailureSelfHeals.test_probe_failure_drops_fts_table_so_next_open_retries_backfill は同一シナリオのテストであったため、PR #9 版を残し TestFtsProbeFailureSelfHeals クラスごと削除（クラス内に他のテストなし、テスト数1017→1016に減少）
