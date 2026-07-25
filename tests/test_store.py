@@ -1538,6 +1538,50 @@ class TestFtsInitProbe:
         finally:
             store2.close()
 
+    def test_probe_failure_drops_fts_table_for_retry_on_next_open(
+        self, tmp_path, monkeypatch
+    ):
+        # プローブ失敗時に chunks_fts を DROP して、次回オープンで再作成・バックフィルを
+        # 実行できるようにする（SQLITE_BUSY 等の一過性失敗から回復する手段）。
+        # バックフィルが必要な移行前 DB シナリオ: chunks は生存・chunks_fts は不在。
+        db_path = tmp_path / "shelf.db"
+
+        # step 0: 移行前 DB を作成（chunks あり・chunks_fts なし）
+        store0 = Store(str(db_path))
+        _make_notebook(store0)
+        _make_document(store0)
+        store0.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store0._conn.execute("DROP TABLE chunks_fts")  # FTS 未導入を模す
+        store0._conn.commit()
+        store0.close()
+
+        # step 1: プローブ失敗を強制（CREATE 直後・バックフィル前に失敗）
+        call_count = [0]
+
+        def failing_probe_once(self):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise sqlite3.OperationalError("simulated: SQLITE_BUSY")
+            # 2 回目以降は成功
+
+        monkeypatch.setattr(Store, "_probe_fts", failing_probe_once)
+
+        store1 = Store(str(db_path))
+        store1.close()
+        # fts_enabled は False（プローブ失敗により disable）。
+        # 修正がある場合: chunks_fts は DROP されているため already_existed=False
+        # 修正がない場合: chunks_fts は空テーブルのまま残り already_existed=True → バックフィルが実行されない
+
+        # step 2: 2 回目オープン
+        store2 = Store(str(db_path))
+        try:
+            # 修正あり: chunks_fts が再作成されバックフィルされているため keyword_topk が結果を返す
+            # 修正なし: chunks_fts は空のまま（バックフィル未実行）のため keyword_topk は []
+            hits = store2.keyword_topk("physics", "quantum", limit=10)
+            assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+        finally:
+            store2.close()
+
 
 class TestFtsIncrementalSync:
     """コードレビュー指摘#10: 読み取りパス(keyword_topk)での全コーパス再構築を
