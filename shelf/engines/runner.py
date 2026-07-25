@@ -72,7 +72,15 @@ def run_command(
             stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
+            # エンジン CLI（codex 等）は stdin を UTF-8 必須で読むため、
+            # locale.getpreferredencoding（Windows では既定 cp932）に依存させず
+            # 明示的に UTF-8 へ固定する（encoding 指定でテキストモードになるため
+            # text=True は不要）。errors="replace" は子プロセスの不正バイト出力で
+            # runner 自体が例外落ちしないための頑健化。同ポリシーは stdin 書き込み側
+            # にも適用され、エンコード不能文字（lone surrogate 等）は例外にならず
+            # 置換される点に注意。
+            encoding="utf-8",
+            errors="replace",
             cwd=workdir,
             start_new_session=True,
         )
@@ -86,13 +94,21 @@ def run_command(
                 timed_out=False,
             )
         except subprocess.TimeoutExpired:
-            # 子プロセスグループを確実に殺す（communicate がタイムアウトした場合）。
-            try:
-                pgid = os.getpgid(proc.pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                # プロセスがすでに終了している場合など
-                pass
+            # 子プロセスを確実に殺す（communicate がタイムアウトした場合）。
+            # os.killpg/getpgid は Windows には存在せず AttributeError になり、
+            # 外側の except Exception に飲まれて timed_out=False の runner error に
+            # 化けて子プロセスが放置されていた（実証: TestRunCommandTimeout の red）。
+            if hasattr(os, "killpg"):
+                # POSIX: プロセスグループごと殺す（孫プロセスまで確実に殺すため）。
+                try:
+                    pgid = os.getpgid(proc.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    # プロセスがすでに終了している場合など
+                    pass
+            else:
+                # Windows: プロセスグループ kill 手段がないため直接の子のみ kill。
+                proc.kill()
 
             # タイムアウト後の残り出力を回収
             try:
