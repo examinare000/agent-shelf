@@ -1507,6 +1507,12 @@ class ShelfService:
                 "notebook=%s doc_id=%s kept=%d total=%d",
                 notebook, doc_id, len(reduce_input_notes), len(map_notes),
             )
+        _logger.info(
+            "digest map→reduce: doc_id=%s windows=%d",
+            doc_id,
+            len(windows),
+        )
+
         reduce_prompt = build_reduce_prompt(
             reduce_input_notes,
             tag_catalog=tuple(tag_catalog),
