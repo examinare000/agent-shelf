@@ -1233,6 +1233,56 @@ class TestDocumentTags:
         assert store.list_notebook_tags("physics") == []
 
 
+class TestReplaceStudyNotesAndTags:
+    """study_notes/document_tags を単一トランザクションで書く統合メソッド
+    （コードレビュー指摘: _digest_one 末尾の2段書き込みが1段目成功後に2段目が
+    失敗すると notes は新パイプライン・新hashで確定するのに tags は古いまま残り、
+    skip判定（source_hash+pipeline のみ参照・tagsは見ない）が以後 skipped を
+    返し自己修復しない恒久劣化バグになるため、delete_notebook/delete_document と
+    同じ「複数テーブルを1コミットで書く」流儀に揃える）。
+    """
+
+    def test_writes_both_notes_and_tags_in_one_call(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+
+        store.replace_study_notes_and_tags(
+            "physics", "doc1", [{"text": "学び1", "pipeline": 2}], ["タグ1", "タグ2"]
+        )
+
+        notes = store.list_study_notes("physics", "doc1")
+        assert [n["text"] for n in notes] == ["学び1"]
+        assert store.list_document_tags("physics", "doc1") == ["タグ1", "タグ2"]
+
+    def test_rolls_back_notes_when_tags_write_fails(self, store, monkeypatch):
+        """2段目相当（tags書き込み）だけが失敗した場合、1段目（notes書き込み）も
+        コミットされず、呼び出し前の既存状態がそのまま残ることを固定する
+        （全体ロールバック。部分書き込みによる自己修復不能バグの再発防止）。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.replace_study_notes(
+            "physics", "doc1", [{"text": "既存の学び", "pipeline": 1}]
+        )
+        store.replace_document_tags("physics", "doc1", ["既存タグ"])
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("tags write failed")
+
+        monkeypatch.setattr(store, "_replace_document_tags_no_commit", boom)
+
+        with pytest.raises(RuntimeError):
+            store.replace_study_notes_and_tags(
+                "physics", "doc1", [{"text": "新しい学び", "pipeline": 2}], ["新タグ"]
+            )
+
+        notes = store.list_study_notes("physics", "doc1")
+        assert len(notes) == 1
+        assert notes[0]["text"] == "既存の学び"
+        assert notes[0]["pipeline"] == 1
+        assert store.list_document_tags("physics", "doc1") == ["既存タグ"]
+
+
 class TestListChunks:
     """doc 単位・kind 別のチャンク一覧取得（map-reduce 学び抽出の入力用）。"""
 

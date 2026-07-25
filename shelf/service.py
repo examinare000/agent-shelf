@@ -1555,20 +1555,15 @@ class ShelfService:
             }
             for note in reduced_notes
         ]
-        self._store.replace_study_notes(notebook, doc_id, note_dicts)
-        raw_masked_tags = [self._mask(tag) if self._mask is not None else tag for tag in tags]
-        # 順序維持の重複除去。マスクの結果 空文字列/None になった要素は除外する
-        # （コードレビュー指摘#2: 別々のタグがマスク後に同一文字列へ衝突する場合
-        # （例: token:abc1/token:xyz2 が共に token=<REDACTED> になる）、
-        # store.replace_document_tags は (doc_id, tag) が PRIMARY KEY のプレーンな
-        # INSERT のため、重複したまま渡すと sqlite3.IntegrityError で digest
-        # ループ全体が落ちてしまう。normalize_tags のタグ重複除去はマスク適用前
-        # にしか働かないため、ここで改めてマスク後の重複除去が必要）。
-        masked_tags = list(dict.fromkeys(tag for tag in raw_masked_tags if tag))
-        self._store.replace_document_tags(notebook, doc_id, masked_tags)
+        # 【1】notes と tags を1コミットで原子的に書き込む。replace_study_notes/
+        # replace_document_tags を独立呼び出しすると、1段目成功後に2段目が失敗する
+        # 場合に notes は新 pipeline・新 source_hash で確定するのに tags は古いままに
+        # なり、以後の skip 判定（source_hash+pipeline のみ参照）が再生成不要と
+        # 誤判定して自己修復しない恒久劣化バグになる。
+        self._store.replace_study_notes_and_tags(notebook, doc_id, note_dicts, tags)
         # 後続文書の reduce プロンプトにこの文書のタグを反映させるため、
         # 呼び出し元と共有する tag_catalog にその場で追記する（DB再問い合わせなし）。
-        for tag in masked_tags:
+        for tag in tags:
             if tag not in tag_catalog:
                 tag_catalog.append(tag)
         return "generated"

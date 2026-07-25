@@ -790,13 +790,47 @@ class Store:
     def replace_document_tags(self, notebook: str, doc_id: str, tags: list[str]) -> None:
         """doc_id の既存タグを全削除してから tags を書き込む（replace_study_notes と
         同じ delete-then-insert の流儀。再生成時に前回分が残留しないようにする）。
+
+        notes と同時に更新したい呼び出し元は replace_study_notes_and_tags を使うこと
+        （該当メソッドの docstring 参照）。
         """
+        self._replace_document_tags_no_commit(notebook, doc_id, tags)
+        self._conn.commit()
+
+    def _replace_document_tags_no_commit(
+        self, notebook: str, doc_id: str, tags: list[str]
+    ) -> None:
+        """replace_document_tags の本体（コミットなし）。replace_study_notes_and_tags
+        と共有する。"""
         self._conn.execute("DELETE FROM document_tags WHERE doc_id = ?", (doc_id,))
         if tags:
             self._conn.executemany(
                 "INSERT INTO document_tags (doc_id, notebook, tag) VALUES (?, ?, ?)",
                 [(doc_id, notebook, tag) for tag in tags],
             )
+
+    def replace_study_notes_and_tags(
+        self, notebook: str, doc_id: str, notes: list[dict], tags: list[str]
+    ) -> None:
+        """study_notes と document_tags を単一トランザクション（1コミット）で更新する。
+
+        service._digest_one の reduce フェーズ完了後は notes（新 pipeline・新
+        source_hash）と tags を必ず両方セットで確定させる必要がある。
+        replace_study_notes()/replace_document_tags() を別々に呼ぶ2段書き込みだと、
+        1段目（notes）成功後に2段目（tags）が失敗した場合、notes は新 pipeline・
+        新 source_hash で確定するのに tags だけ古いまま残り、以後の skip 判定
+        （source_hash と pipeline の一致のみを見る。tags は見ない）が
+        再生成不要と誤判定し続け、--force なしでは自己修復しない恒久劣化バグに
+        なる（コードレビュー指摘）。delete_notebook/delete_document が複数テーブルを
+        1コミットで更新するのと同じ流儀に揃え、途中で例外が起きた場合は
+        rollback() して呼び出し前の状態を保つ（全体アトミック）。
+        """
+        try:
+            self._replace_study_notes_no_commit(notebook, doc_id, notes)
+            self._replace_document_tags_no_commit(notebook, doc_id, tags)
+        except Exception:
+            self._conn.rollback()
+            raise
         self._conn.commit()
 
     def list_document_tags(self, notebook: str, doc_id: str) -> list[str]:
@@ -855,6 +889,20 @@ class Store:
         source_chunk_ids は接地元チャンク id の list[str] を渡す（store 層で
         JSON 文字列に変換して永続化する。呼び出し側=service は list のまま
         扱えばよい）。
+
+        notes と document_tags を同時に更新したい呼び出し元（service._digest_one）は
+        このメソッドを単独で使わず replace_study_notes_and_tags を使うこと
+        （1コミットで両方書かないと、片方だけ成功した場合に自己修復不能な
+        不整合が残る。該当メソッドのdocstring参照）。
+        """
+        self._replace_study_notes_no_commit(notebook, doc_id, notes)
+        self._conn.commit()
+
+    def _replace_study_notes_no_commit(
+        self, notebook: str, doc_id: str, notes: list[dict]
+    ) -> None:
+        """replace_study_notes の本体（コミットなし）。呼び出し元がトランザクション
+        境界を制御できるよう分離する（replace_study_notes_and_tags と共有）。
         """
         self._conn.execute(
             "DELETE FROM study_notes WHERE notebook = ? AND doc_id = ?", (notebook, doc_id)
@@ -890,7 +938,6 @@ class Store:
                 """,
                 values,
             )
-        self._conn.commit()
 
     def list_study_notes(self, notebook: str, doc_id: str | None = None) -> list[dict]:
         query = (
