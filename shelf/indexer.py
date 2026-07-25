@@ -68,7 +68,9 @@ def index_notebook(
     existing_source_files: set[str] = set()
 
     for path in sorted(notebook_dir.glob("*.md")):
-        source_path = str(path.relative_to(corpus_dir))
+        # source_path は DB・FTS・citation に永続化される識別子のため、
+        # OS 依存の区切り文字ではなく常に POSIX 形式("/")で保持する。
+        source_path = path.relative_to(corpus_dir).as_posix()
         doc_id = path.stem
 
         try:

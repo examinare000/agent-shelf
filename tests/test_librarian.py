@@ -50,7 +50,7 @@ class TestRouteWiring:
         result = librarian.route("質問", [])
 
         assert len(backend.calls) == 1
-        assert result == []
+        assert result.targets == []
 
 
 class TestRouteHappyPath:
@@ -66,7 +66,7 @@ class TestRouteHappyPath:
 
         result = librarian.route("スピンとは何ですか", [_card(name="quantum-mechanics")])
 
-        assert result == [
+        assert result.targets == [
             RouteTarget(
                 notebook="quantum-mechanics",
                 score=0.9,
@@ -81,7 +81,7 @@ class TestRouteHappyPath:
 
         result = librarian.route("質問", [_card()])
 
-        assert result == []
+        assert result.targets == []
 
     def test_hallucinated_notebook_names_are_filtered_via_apply_fallback(self):
         canned = (
@@ -97,7 +97,7 @@ class TestRouteHappyPath:
 
         result = librarian.route("質問", [_card(name="real-notebook")])
 
-        assert [t.notebook for t in result] == ["real-notebook"]
+        assert [t.notebook for t in result.targets] == ["real-notebook"]
 
     def test_top_n_is_threaded_through_to_apply_fallback(self):
         canned = (
@@ -115,7 +115,7 @@ class TestRouteHappyPath:
             "質問", [_card(name="nb-a"), _card(name="nb-b")]
         )
 
-        assert [t.notebook for t in result] == ["nb-b"]
+        assert [t.notebook for t in result.targets] == ["nb-b"]
 
 
 class TestRouteBackendFailure:
@@ -131,7 +131,9 @@ class TestRouteBackendFailure:
 
         result = librarian.route("質問", [_card()])
 
-        assert result == []
+        assert result.targets == []
+        # 【6】backend 呼び出し失敗時に router_error が格納される
+        assert result.router_error == "timeout"
 
     def test_backend_failure_with_all_fallback_routes_across_catalog(self):
         backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="500"))
@@ -140,8 +142,8 @@ class TestRouteBackendFailure:
 
         result = librarian.route("元の質問", cards)
 
-        assert [t.notebook for t in result] == ["nb-a", "nb-b"]
-        assert all(t.subquery == "元の質問" for t in result)
+        assert [t.notebook for t in result.targets] == ["nb-a", "nb-b"]
+        assert all(t.subquery == "元の質問" for t in result.targets)
 
     def test_backend_failure_does_not_raise(self):
         backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="boom"))
@@ -165,4 +167,4 @@ class TestRouteMalformedResponse:
 
         result = librarian.route("質問", [_card(name="nb-a")])
 
-        assert result == []
+        assert result.targets == []

@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
-from shelf.ports import AnswerBackend, NotebookCard, RouteTarget, RoutingDecision
+from shelf.ports import AnswerBackend, NotebookCard, RouteOutcome, RoutingDecision
 from shelf.routing import ROUTING_SCHEMA, apply_fallback, build_routing_prompt, parse_routing
 
 
@@ -38,7 +38,7 @@ class Librarian:
         self._top_n = top_n
         self._fallback = fallback
 
-    def route(self, question: str, catalog: Sequence[NotebookCard]) -> list[RouteTarget]:
+    def route(self, question: str, catalog: Sequence[NotebookCard]) -> RouteOutcome:
         """質問 + カタログから最終的なルーティング対象を返す（設計書 §6-D）。
 
         backend 呼び出し失敗（RawAnswer.ok=False）はエラーで潰さず、パース失敗
@@ -47,14 +47,20 @@ class Librarian:
         立てるのは、answerable=False 分岐（専門家を絶対に呼ばない・分岐2）ではなく
         fallback 設定（既定 conservative=対象ゼロ／all=カタログ横断）に判断を
         委ねるため。これにより backend の一時的な不調が例外として呼び出し元へ
-        伝播せず、常に安全側（既定は対象ゼロ）へ倒れる。
+        伝播せず、常に安全側（既定は対象ゼロ）へ倒れる。診断は
+        RouteOutcome.router_error で表面化する（backend 呼び出し失敗時のみ非
+        None・parse 失敗時は None のまま）。フォールバック判断自体はこの診断に
+        左右されない（観測性のみ追加）。
         """
         prompt = build_routing_prompt(question, catalog)
         raw = self._backend.answer(prompt, workdir=self._workdir, schema=ROUTING_SCHEMA)
 
+        router_error: str | None = None
         if raw.ok:
             decision = parse_routing(raw.text)
         else:
+            router_error = raw.error or "backend call failed"
             decision = RoutingDecision(answerable=True, parse_ok=False, targets=[])
 
-        return apply_fallback(decision, catalog, question, self._top_n, self._fallback)
+        targets = apply_fallback(decision, catalog, question, self._top_n, self._fallback)
+        return RouteOutcome(targets=targets, router_error=router_error)

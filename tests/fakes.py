@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 
 from shelf.convert import ConvertResult
-from shelf.ports import RawAnswer, RouteTarget
+from shelf.ports import RawAnswer, RouteOutcome, RouteTarget
 
 
 class FakeEmbedder:
@@ -82,7 +82,7 @@ class FakeAnswerBackend:
 
 
 class FakeLibrarian:
-    """Librarian.route と同じシグネチャ(question, catalog) -> list[RouteTarget] を持つ
+    """Librarian.route と同じシグネチャ(question, catalog) -> RouteOutcome を持つ
     決定論的ダブル。routing.py の判断ロジック(プロンプト構成・パース・フォールバック)を
     経由せず、固定の RouteTarget リストを返す。consult() の集約ロジック(層1 のルーティング
     判断をモックしつつ、層2 の fan-out・集約だけを検証したい)テスト用（設計書 §9-B）。
@@ -92,9 +92,9 @@ class FakeLibrarian:
         self._targets = targets
         self.calls: list[dict] = []
 
-    def route(self, question: str, catalog) -> list[RouteTarget]:
+    def route(self, question: str, catalog):
         self.calls.append({"question": question, "catalog": catalog})
-        return self._targets
+        return RouteOutcome(targets=self._targets, router_error=None)
 
 
 class FakeConverter:

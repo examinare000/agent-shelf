@@ -1766,3 +1766,234 @@ class TestFtsIncrementalSync:
         store._fts_insert_rows(ids)
 
         assert call_sizes == [batch_size, 1]
+class TestFtsGhostRowDeletion:
+    """delete_document と prune_missing で削除されたチャンクが FTS 索引に残る
+    幽霊行バグを検証（personal 修正・personal tests との回帰テスト）。"""
+
+    def test_delete_document_removes_its_chunks_from_keyword_index(self, store):
+        """【1】delete_document: 削除済みチャンクが keyword_topk に残らないこと"""
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        assert len(store.keyword_topk("physics", "quantum", limit=10)) == 1
+
+        store.delete_document("doc1")
+
+        # 削除後は FTS に幽霊行が残らずキーワード検索で出現しないこと
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+    def test_prune_missing_removes_pruned_chunks_from_keyword_index(self, store):
+        """【1】prune_missing: 削除済みチャンクが keyword_topk に残らないこと"""
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store.set_file_state("corpus/physics/doc1.md", mtime=1.0, size=1, model="m")
+        assert len(store.keyword_topk("physics", "quantum", limit=10)) == 1
+
+        store.prune_missing(set())
+
+        # prune 後は FTS に幽霊行が残らずキーワード検索で出現しないこと
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+
+class TestFtsRebuildFailureSelfHeals:
+    """【2】_init_fts の移行バックフィル(_rebuild_fts)が失敗しても chunks_fts テーブル
+    自体は CREATE 済みのままコミットされてしまうと、次回起動時 already_existed=True
+    となり二度とバックフィルが走らず、移行前の既存チャンクが恒久的にキーワード
+    検索から漏れる(サイレント劣化)。rebuild 失敗時は chunks_fts
+    を DROP して次回起動時に CREATE+バックフィルを再試行させる自己修復を検証する。
+    """
+
+    def test_rebuild_failure_drops_fts_table_so_next_open_retries_backfill(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """【2】rebuild 失敗時に chunks_fts を DROP して次回再試行"""
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(db_path)
+        store1.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store1._conn.execute("DROP TABLE chunks_fts")  # FTS 未導入の旧 DB を模す
+        store1._conn.commit()
+        store1.close()
+
+        def failing_rebuild(self):
+            import sqlite3
+            raise sqlite3.OperationalError("simulated rebuild failure")
+
+        monkeypatch.setattr(Store, "_rebuild_fts", failing_rebuild)
+
+        with caplog.at_level("WARNING"):
+            store2 = Store(db_path)
+        try:
+            assert store2.fts_enabled is False
+        finally:
+            store2.close()
+
+        # 失敗した _rebuild_fts の差し替えを戻し、実装本来の rebuild で再オープンする。
+        monkeypatch.undo()
+
+        store3 = Store(db_path)
+        try:
+            hits = store3.keyword_topk("physics", "quantum", limit=10)
+        finally:
+            store3.close()
+
+        # chunks_fts が自己修復で DROP されていたなら、store3 の起動時に
+        # already_existed=False となり CREATE+バックフィルが再試行され、
+        # store1 で投入済みの doc1#0 がヒットするはず。
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+class TestPathNormalization:
+    """【3】Windows で構築済みの既存 DB に残る `\` 区切りを POSIX 正規化
+    （personal 修正・personal tests との回帰テスト）"""
+
+    def _insert_legacy_chunk(self, store, source_path, chunk_id="doc1#0"):
+        """テスト用: DB に直接 chunk を INSERT し、後で正規化対象にする"""
+        import numpy as np
+
+        store._conn.execute(
+            "INSERT INTO chunks "
+            "(id, notebook, doc_id, source_path, seq, text, embedding, dim, kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                chunk_id,
+                "physics",
+                "doc1",
+                source_path,
+                0,
+                "本文",
+                np.asarray((0.1, 0.2, 0.3, 0.4), dtype=np.float32).tobytes(),
+                4,
+                "body",
+            ),
+        )
+        store._conn.commit()
+
+    def _insert_legacy_file_state(self, store, source_file, model="model-x"):
+        """テスト用: DB に直接 file_state を INSERT し、後で正規化対象にする"""
+        store._conn.execute(
+            "INSERT INTO file_state (source_file, mtime, size, model) VALUES (?, ?, ?, ?)",
+            (source_file, 1.0, 100, model),
+        )
+        store._conn.commit()
+
+    def test_init_normalizes_backslash_source_path_in_chunks(self, tmp_path):
+        """【3】chunks.source_path の `\` を `/` へ正規化（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            # __init__ では実行されず、ここで手動実行（_force_windows=True でテスト）
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            chunk = store2.get_chunk("doc1#0")
+            assert chunk["source_path"] == "physics/a.md"
+        finally:
+            store2.close()
+
+    def test_init_normalizes_backslash_source_file_in_file_state(self, tmp_path, monkeypatch):
+        """【3】file_state.source_file の `\` を `/` へ正規化（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_file_state(store1, source_file="physics\\a.md")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            assert store2.get_file_state("physics\\a.md") is None
+            normalized = store2.get_file_state("physics/a.md")
+            assert normalized is not None
+            assert normalized["model"] == "model-x"
+        finally:
+            store2.close()
+
+    def test_init_resolves_conflicting_file_state_by_keeping_posix_row(self, tmp_path, monkeypatch):
+        """【3】PK 衝突時は posix 行を保持、旧行を DELETE（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        # 修正後のコードで既に posix 形式が書かれた後に旧 `\` 行が残存する
+        # ケース（PK 衝突を起こさず旧行を破棄する）を再現する。
+        self._insert_legacy_file_state(store1, source_file="physics\\a.md", model="old")
+        self._insert_legacy_file_state(store1, source_file="physics/a.md", model="new")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            assert store2.list_source_files() == ["physics/a.md"]
+            assert store2.get_file_state("physics/a.md")["model"] == "new"
+        finally:
+            store2.close()
+
+    def test_init_bumps_generation_when_rows_are_normalized(self, tmp_path, monkeypatch):
+        """【3】正規化実行時に generation が更新される（ベクタキャッシュ無効化）（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        generation_before = store1.get_meta("generation")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を明示的に実行
+        store2 = Store(db_path)
+        try:
+            store2._migrate_normalize_path_separators(_force_windows=True)
+            generation_after = store2.get_meta("generation")
+            assert generation_after != generation_before
+        finally:
+            store2.close()
+
+    def test_init_migration_is_idempotent(self, tmp_path):
+        """【3】正規化は冪等（複数回実行しても結果が変わらない）（Windows 環境）"""
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        self._insert_legacy_file_state(store1, source_file="physics\\a.md")
+        store1.close()
+
+        # Store を生成し、Windows 正規化を1回目実行
+        store2 = Store(db_path)
+        store2._migrate_normalize_path_separators(_force_windows=True)
+        gen_before = store2.get_meta("generation")
+        store2.close()
+
+        # 2回目開く時点で対象行が無いはずなので、正規化しても generation は変わらない
+        store3 = Store(db_path)
+        store3._migrate_normalize_path_separators(_force_windows=True)
+        gen_after = store3.get_meta("generation")
+        try:
+            assert gen_before == gen_after
+        finally:
+            store3.close()
+
+    def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(self, tmp_path):
+        """【3】POSIX 環境ではバックスラッシュが正当なファイル名として保留される"""
+        db_path = tmp_path / "posix.db"
+        store1 = Store(db_path)
+        # POSIX では `\` はファイル名として合法的
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        # POSIX 環境（os.name != "nt"）では正規化されないことを確認
+        store2 = Store(db_path)
+        try:
+            chunk = store2.get_chunk("doc1#0")
+            # POSIX では `\` がそのまま残る（正規化されない）
+            assert chunk["source_path"] == "physics\\a.md"
+        finally:
+            store2.close()
+
+
+class TestBusyTimeout:
+    """【7】PRAGMA busy_timeout の設定を検証"""
+
+    def test_busy_timeout_pragma_is_set_to_nonzero_ms(self, store):
+        """Store 初期化時に PRAGMA busy_timeout = 5000 が設定されることを検証"""
+        row = store._conn.execute("PRAGMA busy_timeout").fetchone()
+        assert row[0] == Store._BUSY_TIMEOUT_MS
+        assert row[0] != 0
+
+

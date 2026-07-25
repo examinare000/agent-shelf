@@ -14,12 +14,25 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 
 from shelf import config, emit_mcp, setup
 from shelf.server import build_transport_security, create_server
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
+
+
+def _reconfigure_stdio_utf8() -> None:
+    """stdout/stderr を UTF-8 に固定する。
+
+    ensure_ascii=False の日本語 JSON を出力する設計上、stdout は UTF-8 前提だが、
+    Windows ではパイプ/リダイレクト時に cp932 となり UTF-8 端末で化ける。
+    reconfigure を持たないストリーム(テストの capture 等)は黙って無視する。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -457,6 +470,7 @@ def _cmd_rm(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    _reconfigure_stdio_utf8()
     args = build_parser().parse_args(argv)
 
     if args.command == "serve":

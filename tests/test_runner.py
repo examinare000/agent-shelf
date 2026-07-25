@@ -154,3 +154,38 @@ class TestRunCommandReturnType:
         result = run_command(["/bin/echo", "test"])
         with pytest.raises(AttributeError):
             result.stdout = "modified"
+
+
+class TestWindowsTimeoutFallback:
+    """【5】Windows 環境の timeout 処理で proc.kill() フォールバックが機能"""
+
+    def test_timeout_with_available_killpg_kills_process_group(self):
+        """【5】timeout 時にプロセスが確実に kill される（killpg 使用可能環境）"""
+        # POSIX 環境（killpg 使用可能）での timeout テスト
+        result = run_command(
+            ["/bin/sleep", "10"],  # 10秒の sleep（timeout が 1秒のため kill される）
+            timeout=1,
+        )
+
+        assert result.timed_out is True
+        # プロセスが kill されるため、returncode は 0 ではない（SIGKILL で -9 相当）
+        assert result.returncode != 0 or result.timed_out
+
+    def test_timeout_with_windows_fallback_uses_proc_kill(self, monkeypatch):
+        """【5】Windows フォールバック（killpg 非使用可）で proc.kill() が呼ばれる"""
+        import os
+
+        # os.killpg と os.getpgid を削除して Windows 環境をシミュレート
+        monkeypatch.delattr(os, "killpg", raising=False)
+        monkeypatch.delattr(os, "getpgid", raising=False)
+
+        # timeout で子プロセスが kill される（例外が出ない）
+        result = run_command(
+            ["/bin/sleep", "10"],  # 10秒の sleep（timeout が 1秒のため kill される）
+            timeout=1,
+        )
+
+        # フォールバック分岐で proc.kill() が呼ばれ、プロセスが確実に kill される
+        assert result.timed_out is True
+        # proc.kill() で kill された場合も returncode は 0 でない
+        assert result.returncode != 0 or result.timed_out

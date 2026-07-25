@@ -98,6 +98,16 @@ class RoutingDecision:
 
 
 @dataclass(frozen=True)
+class RouteOutcome:
+    """Librarian.route() の最終結果。targets に加え、backend 呼び出し失敗の
+    診断（router_error）を service.consult まで運ぶ。フォールバック判断自体は
+    従来通り apply_fallback に委ね、診断は判断に影響しない（観測性のみ追加）。"""
+
+    targets: list[RouteTarget] = field(default_factory=list)
+    router_error: str | None = None  # raw.ok=False の時のみ非 None（安全な要約）
+
+
+@dataclass(frozen=True)
 class StudyNote:
     """学びノート 1 件（設計書 §7-B）。map-reduce 学び抽出パイプライン
     （digests.parse_map() が MAP_SCHEMA、digests.parse_reduce() が REDUCE_SCHEMA から）
