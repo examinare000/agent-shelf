@@ -850,6 +850,14 @@ class ShelfService:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(markdown, encoding="utf-8")
 
+        # title は取込資料が持ち込む生メタデータであり、攻撃者が制御可能な入力
+        # （設計書 §7-A「backend へ送る全テキストは mask 済み」）。description/persona と
+        # 同じ流儀で永続化前に mask を通す（レビュー指摘 must#1: 未 mask のまま保存すると
+        # NotebookCard.titles 経由で司書ルーティングプロンプトへ恒常露出してしまう）。
+        masked_title = (
+            self._mask(title) if title is not None and self._mask is not None else title
+        )
+
         content_hash = _content_hash_of(markdown)
         now = datetime.now(UTC).isoformat()
         self._store.upsert_document(
@@ -860,7 +868,7 @@ class ShelfService:
             normalized_path=normalized_path,
             converter=converter,
             added_at=now,
-            title=title,
+            title=masked_title,
             content_hash=content_hash,
             fetched_at=now if is_url else None,
             description=description,

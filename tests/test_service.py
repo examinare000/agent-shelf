@@ -1025,6 +1025,39 @@ def test_add_source_applies_mask_before_writing_corpus_file(
     assert "<REDACTED>" in written
 
 
+# -- add_source: mask を title 永続化前にも適用（レビュー指摘 must#1: 未 mask のまま
+# documents.title へ保存され、NotebookCard.titles 経由で司書ルーティングプロンプトへ
+# 恒常露出していた） -------------------------------------------------------------
+
+
+def test_add_source_masks_title_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """title は取込資料の生メタデータ（攻撃者制御可能）であり、description/persona と
+    同じく永続化前に mask を通す（設計書 §7-A「backend へ送る全テキストは mask 済み」）。
+    """
+    store.create_notebook("nb", backend="codex")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("placeholder content, unused by fake converter", encoding="utf-8")
+    converter = _FakeConverter(markdown="# Doc\n\nbody\n", title=f"秘密資料 {secret}")
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path,
+        converter=converter, mask=fake_mask,
+    )
+
+    result = service.add_source("nb", str(source_file), auto_summary=False)
+
+    document = store.get_document(result["doc_id"])
+    assert document is not None
+    assert secret not in document["title"]
+    assert "<REDACTED>" in document["title"]
+
+
 # -- add_source: doc_id が notebook 依存になり、別 notebook への同一 origin 投入で
 # documents 行が移動しない（中位指摘#3） -----------------------------------------
 
@@ -4165,6 +4198,40 @@ def test_shelve_converts_each_file_once_uses_summary_as_description_and_recommen
     assert result["notes"] == [
         "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
     ]
+
+
+def test_shelve_apply_masks_title_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """shelve() 経路（_prepare_shelve_candidates→_persist_converted）でも title は
+    mask を通す（レビュー指摘 must#1・add_source と同じ不変条件）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(
+        markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n",
+        title=f"秘密資料 {secret}",
+    )
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    result = service.shelve(str(root), dry_run=False)
+
+    document = store.get_document(result["added"][0]["doc_id"])
+    assert document is not None
+    assert secret not in document["title"]
+    assert "<REDACTED>" in document["title"]
 
 
 def test_consult_reports_router_error_when_librarian_backend_fails(store, embedder, tmp_path):
