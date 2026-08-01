@@ -11,7 +11,10 @@ close する（未作成パスに対して Store を構築し新規スキーマ�
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from shelf.doctor import (
     CheckResult,
@@ -101,6 +104,10 @@ class TestCheckDbParentDir:
 
         assert result.ok is True
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="chmod 0o500 は Windows のディレクトリ書込み可否に影響しないため無効",
+    )
     def test_ok_false_when_nearest_existing_ancestor_is_not_writable(self, tmp_path):
         readonly_dir = tmp_path / "readonly"
         readonly_dir.mkdir()
