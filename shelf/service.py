@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -276,6 +277,14 @@ class ShelfService:
         # （_get_librarian）。テストは FakeLibrarian や FakeAnswerBackend 経由でここへ
         # 差し込める（設計書 §9-B）。
         self._librarian = librarian
+        # _get_librarian の遅延構築を複数ワーカースレッドから安全に行うための
+        # double-checked locking 用ロック（タスク A2）。ask() 主目的の呼び出し元
+        # （router 未使用）で backend_factory を毎回呼ばずに済ませる既存の遅延方針
+        # （__init__ 時ではなく初回 consult() まで構築を遅らせる理由。下記
+        # _get_librarian の docstring 参照）は維持しつつ、check（if self._librarian
+        # is None）と set（self._librarian = ...）の間に別スレッドが割り込んで
+        # backend_factory を二重に呼ぶ・Librarian を二重構築するレースを防ぐ。
+        self._librarian_lock = threading.Lock()
         # shelve() 専用の推論バックエンド名（config.SHELVE_BACKEND 由来・既定 "ollama"）。
         # service.py は config を import しない既存流儀（default_backend と同じ）に
         # 揃え、呼び出し側（cli.py。V8 の担当）が明示的に値を渡す前提のコンストラクタ
@@ -285,6 +294,9 @@ class ShelfService:
         # 注入されなければ shelve() 初回呼び出し時に backend_factory から遅延構築し、
         # 以後キャッシュする（_get_shelver・_get_librarian と同型のパターン）。
         self._shelver = shelver
+        # _get_shelver 用の double-checked locking ロック（_librarian_lock と同型・
+        # タスク A2）。
+        self._shelver_lock = threading.Lock()
         # config.MAX_FILE_MB(env SHELF_MAX_FILE_MB)。ローカルファイル投入
         # （add_source/add_directory、および _iter_directory_candidates の走査規則を
         # 共有する shelve）のサイズ上限（MB）。service.py は config を import しない
@@ -1019,12 +1031,18 @@ class ShelfService:
         遅延構築して以後キャッシュする（_get_librarian と同型・設計書 §13.3）。
         Shelver は corpus_dir 直下を workdir として使う（分類時点ではまだ投入先
         notebook が確定していないため、notebook 別サブディレクトリを持てない）。
+
+        _get_librarian と同じ理由で double-checked locking により保護する
+        （タスク A2。複数ワーカースレッドから同時に shelve() が呼ばれても
+        backend_factory の二重呼び出し・Shelver の二重構築を起こさない）。
         """
         if self._shelver is None:
-            backend = self._backend_factory(self._shelve_backend)
-            self._shelver = Shelver(
-                backend, workdir=self._corpus_dir, notebook_backend=self._shelve_backend
-            )
+            with self._shelver_lock:
+                if self._shelver is None:
+                    backend = self._backend_factory(self._shelve_backend)
+                    self._shelver = Shelver(
+                        backend, workdir=self._corpus_dir, notebook_backend=self._shelve_backend
+                    )
         return self._shelver
 
     def _summarize_for_shelve(
@@ -1249,15 +1267,23 @@ class ShelfService:
         設計書 §6-D）。ask() を主目的に ShelfService を構築する呼び出し元
         （router 未使用）で余計な backend_factory 呼び出しを起こさないよう、
         __init__ 時ではなく初回 consult() 呼び出し時まで構築を遅らせる。
+
+        複数ワーカースレッドから同時に consult() が呼ばれうる構成（タスク A2）を
+        考慮し、double-checked locking で保護する: ロック外の1回目のチェックで
+        大半の呼び出し（既に構築済み）はロック取得コストなしで早期リターンでき、
+        未構築時のみ _librarian_lock を取ってから再チェック（ロック待ちの間に
+        別スレッドが構築済みかもしれない）した上で構築する。
         """
         if self._librarian is None:
-            backend_name = self._router_backend or self._default_backend
-            self._librarian = Librarian(
-                self._backend_factory(backend_name),
-                workdir=self._corpus_dir,
-                top_n=self._route_top_n,
-                fallback=self._route_fallback,
-            )
+            with self._librarian_lock:
+                if self._librarian is None:
+                    backend_name = self._router_backend or self._default_backend
+                    self._librarian = Librarian(
+                        self._backend_factory(backend_name),
+                        workdir=self._corpus_dir,
+                        top_n=self._route_top_n,
+                        fallback=self._route_fallback,
+                    )
         return self._librarian
 
     def consult(self, question: str) -> dict:

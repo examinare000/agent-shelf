@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 
 import numpy as np
 import pytest
@@ -2398,5 +2399,117 @@ class TestJournalModeWAL:
         finally:
             blocker.rollback()
             blocker.close()
+
+
+class TestThreadSafety:
+    """後続タスクで MCP ツールを async def + anyio.to_thread 化する際、複数
+    ワーカースレッドが同一 Store を叩く。単一 sqlite3 接続 + check_same_thread=False +
+    RLock でメソッド全体を保護する設計（タスク A2）の検証。"""
+
+    def test_store_usable_from_other_thread(self, store):
+        """check_same_thread=True のままだと別スレッドからの呼び出しは
+        sqlite3.ProgrammingError になる。まずこれが起きないことを確認する。"""
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                store.list_notebooks()
+            except BaseException as exc:  # noqa: BLE001 - 何が起きても記録して検証する
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert errors == []
+
+    def test_concurrent_upsert_chunks_and_load_vectors_stay_consistent(self, store):
+        """一方のスレッドが upsert_chunks を連打し、もう一方が load_vectors を
+        連打しても例外なく完走し、最終状態（件数・次元）が整合すること。"""
+        _make_notebook(store, name="physics")
+        n = 20
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            for i in range(n):
+                try:
+                    store.upsert_chunks([_chunk_row(id_=f"doc1#{i}", seq=i)])
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+        def reader() -> None:
+            for _ in range(n):
+                try:
+                    store.load_vectors("physics")
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+        t_writer = threading.Thread(target=writer)
+        t_reader = threading.Thread(target=reader)
+        t_writer.start()
+        t_reader.start()
+        t_writer.join(timeout=10)
+        t_reader.join(timeout=10)
+
+        assert errors == []
+        ids, matrix = store.load_vectors("physics")
+        assert len(ids) == n
+        assert matrix.shape == (n, 4)
+
+    def test_mutator_holds_lock_for_entire_method_not_only_final_commit(
+        self, store, monkeypatch
+    ):
+        """upsert_document は INSERT → _bump_generation（内部 commit を含む）→
+        最終 commit という複数ステップの mutator。ロック粒度がメソッド全体でなければ、
+        _bump_generation の途中で別スレッドの get_notebook 呼び出しが割り込める。
+        _bump_generation を意図的に遅くし、その間 get_notebook が完了しない
+        （ロック待ちでブロックされる）ことを確認する。"""
+        _make_notebook(store, name="physics")
+        entered_bump = threading.Event()
+        release_bump = threading.Event()
+        original_bump = store._bump_generation
+
+        def slow_bump() -> None:
+            entered_bump.set()
+            release_bump.wait(timeout=5)
+            original_bump()
+
+        monkeypatch.setattr(store, "_bump_generation", slow_bump)
+
+        def writer() -> None:
+            store.upsert_document(
+                id="doc1",
+                notebook="physics",
+                origin="a.pdf",
+                origin_type="pdf",
+                normalized_path="corpus/physics/a.md",
+                converter="pymupdf4llm",
+                added_at="2026-01-01T00:00:00Z",
+            )
+
+        t_writer = threading.Thread(target=writer)
+        t_writer.start()
+        assert entered_bump.wait(timeout=5), "writer が _bump_generation に到達しなかった"
+
+        reader_done = threading.Event()
+
+        def reader() -> None:
+            store.get_notebook("physics")  # writer と別の公開メソッド
+            reader_done.set()
+
+        t_reader = threading.Thread(target=reader)
+        t_reader.start()
+
+        # writer がロックを保持中なら、reader は release_bump まで完了しないはず。
+        assert not reader_done.wait(timeout=0.2), (
+            "reader が writer の完了前に終了した = ロックがメソッド全体を"
+            "保護できていない"
+        )
+
+        release_bump.set()
+        t_writer.join(timeout=5)
+        t_reader.join(timeout=5)
+        assert reader_done.is_set()
 
 
