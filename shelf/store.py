@@ -176,6 +176,18 @@ class Store:
         # generation が現在値と一致する間は SQLite に再クエリしない（§ ベクタキャッシュ）。
         self._vector_cache: dict[str, tuple[int, list[str], np.ndarray]] = {}
         self.fts_enabled = False
+        # FTS ラッチ回復用の状態（_fts_disable_after_failure・keyword_topk 参照）。
+        # _fts_retry_available: 一度きりの再試行予算。__init__ 時点では直前まで
+        # 有効化された実績がないため False のままにしておく（初回から壊れている
+        # 環境でのリトライ無駄撃ちを避ける）。
+        # _fts_retry_in_progress: リトライ実行中(_init_fts の再試行〜その呼び出し元
+        # keyword_topk 内で続けて行われる実クエリまで)を示す。この期間中に発生した
+        # 失敗は「直前まで健全だった」の誤認（コードレビュー指摘 must-2a）を防ぐため
+        # 再アームの対象から除外する。
+        # 申し送り: この2つのフラグは fts_enabled とセットで、後続の RLock 化
+        # タスク（複数スレッド/接続からの同時アクセス保護）で保護範囲に含めること。
+        self._fts_retry_available = False
+        self._fts_retry_in_progress = False
         self._init_fts()
 
     def close(self) -> None:
@@ -397,6 +409,32 @@ class Store:
                     self._fts_disable_after_failure("初期化", exc)
         self._conn.commit()
 
+    def _retry_fts_init(self) -> None:
+        """FTS ラッチ回復の1回きりの再試行本体（keyword_topk から呼ばれる）。
+
+        コードレビュー指摘 must-2b（backfill 欠落の回帰）: 通常の _init_fts は
+        「chunks_fts が既存かどうか(already_existed)」を見て、既存なら
+        バックフィルを省略する。しかし chunks_fts の DROP を伴わない一過性失敗
+        （MATCH 自体の読み取りエラー等）では、テーブル自体は残存したまま
+        fts_enabled=False になるため、通常の _init_fts を再度呼ぶだけだと
+        already_existed=True と判定されバックフィルがスキップされてしまう。
+        その結果、劣化中（fts_enabled=False の間）に upsert された行が
+        chunks_fts に一切同期されないまま復旧し、静かに検索から永久欠落する
+        （サイレント劣化）。
+
+        これを避けるため、リトライ時は already_existed の値に関わらず
+        chunks_fts を強制的に DROP してから _init_fts を呼び、常に
+        CREATE+全件バックフィルの経路を通す。DROP 自体の失敗は握り潰す
+        （既に劣化ルートなので追加の例外を波及させる意味がない。それでも
+        _init_fts 側の CREATE ... IF NOT EXISTS が最終的な整合性を保証する）。
+        """
+        try:
+            self._conn.execute("DROP TABLE IF EXISTS chunks_fts")
+            self._conn.commit()
+        except sqlite3.Error:
+            pass
+        self._init_fts()
+
     def _probe_fts(self) -> None:
         # 既存テーブルに対する CREATE ... IF NOT EXISTS はモジュール検証を行わない
         # ため、実際に MATCH を実行して fts5 モジュール + trigram tokenizer が
@@ -422,6 +460,31 @@ class Store:
         # `if not self.fts_enabled: return` に自然に短絡し、警告ログも
         # この失敗時の1回だけで済む（毎回ログを連発しない）。
         _logger.warning("chunks_fts の%sに失敗したためキーワード検索を無効化します: %r", context, exc)
+        # FTS ラッチ回復: 次回のキーワード検索での1回きりの自己修復リトライ
+        # （keyword_topk 参照）を許可するかどうかをここで決める。
+        #
+        # コードレビュー指摘 must-2a（不変条件違反の回帰）: 当初は
+        # 「self.fts_enabled が直前まで True だったか」だけで判定していたが、
+        # これはリトライ実行中の失敗を誤って「直前まで健全だった」と誤認して
+        # 再アームしてしまう欠陥があった。_init_fts はテーブル作成・probe に
+        # 成功した時点で一旦 self.fts_enabled=True を立てるため、その直後の
+        # backfill 失敗（または、リトライ成功後に keyword_topk 内で続けて実行
+        # される実クエリの失敗）はいずれも self.fts_enabled=True の状態で
+        # このメソッドに到達する。障害が持続的な場合、これを毎回再アームすると
+        # 毎クエリ無限リトライになってしまう。
+        #
+        # そのため「直前まで True だったか」に加えて「今がリトライ実行中
+        # (_fts_retry_in_progress) ではないか」も条件に加える。リトライ実行中の
+        # 失敗からは絶対に再アームしない。次の場合のみ次回リトライを許可する:
+        #   - リトライ実行中ではない状態で、直前まで実際に fts_enabled=True で
+        #     動いていたものが今回初めて壊れた場合（別プロセスによる
+        #     chunks_fts の DROP・MATCH 読み取りの一過性エラー等）
+        # 次の場合は意図的にリトライを許可しない（毎クエリ再試行はコストであり、
+        # 無限リトライ禁止のため）:
+        #   - 初回 __init__ からこの環境で一度も有効化できていない場合
+        #     （fts5/trigram 非対応ビルド等の恒久的条件。リトライしても無駄）
+        #   - リトライ実行中に発生した失敗（上記の誤再アーム防止）
+        self._fts_retry_available = self.fts_enabled and not self._fts_retry_in_progress
         self.fts_enabled = False
 
     def _fts_capture_rows(self, where_clause: str, params: tuple) -> list[tuple[int, str]]:
@@ -825,30 +888,59 @@ class Store:
         のみにフォールバックできるように）。chunks_fts の同期は upsert_chunks 等の
         書き込み経路側で完了済みのため、ここでは読み取りのみを行う（コードレビュー
         指摘#10）。
+
+        FTS ラッチ回復: 長命 MCP サーバ(shelf serve)のプロセス生存中に一過性の要因
+        （別プロセスによる chunks_fts の DROP、MATCH 読み取り自体の一時的エラー等）
+        で fts_enabled=False に落ちた場合、サーバ再起動なしでは永久にキーワード
+        検索を失う。これを避けるため、直前まで有効だったものが今回初めて壊れた
+        場合に限り(_fts_disable_after_failure 参照)、劣化後最初のこの呼び出しで
+        chunks_fts を強制的に作り直して(_retry_fts_init)1回だけ再試行する。
+        already_existed に関わらず常に全件バックフィルする設計のため、劣化中
+        （fts_enabled=False の間）に upsert された行も復旧時に取りこぼさない
+        （コードレビュー指摘 must-2b）。この1回きりの再試行の実行中に発生した
+        失敗（backfill 自体の失敗・成功直後にこの呼び出し内で続けて実行される
+        実クエリの失敗のいずれも）は「直前まで健全だった」と誤認されないよう
+        再アームされない（コードレビュー指摘 must-2a）。毎クエリ再試行はコスト
+        なので、この予算は再試行の成否に関わらず使い切りで、以後は無限リトライ
+        しない。
         """
-        if not self.fts_enabled:
-            return []
-        if not fts_query.strip():
-            return []
+        retried = not self.fts_enabled and self._fts_retry_available
+        if retried:
+            self._fts_retry_available = False
+            self._fts_retry_in_progress = True
         try:
-            rows = self._conn.execute(
-                """
-                SELECT c.id AS id, bm25(chunks_fts) AS score
-                FROM chunks_fts
-                JOIN chunks c ON c.rowid = chunks_fts.rowid
-                WHERE chunks_fts MATCH ? AND c.notebook = ?
-                ORDER BY score
-                LIMIT ?
-                """,
-                (fts_query, notebook, limit),
-            ).fetchall()
-        except sqlite3.Error as exc:
-            # コードレビュー指摘#1: MATCH SELECT 自体の失敗（read-only DB・
-            # fts5 モジュール消失等）も例外にせず劣化させる。以前は書き込みを
-            # 伴う遅延同期がこの try/except の外側にあり、この契約を破っていた。
-            self._fts_disable_after_failure("読み取り", exc)
-            return []
-        return [(row["id"], row["score"]) for row in rows]
+            if retried:
+                self._retry_fts_init()
+            if not self.fts_enabled:
+                return []
+            if not fts_query.strip():
+                return []
+            try:
+                rows = self._conn.execute(
+                    """
+                    SELECT c.id AS id, bm25(chunks_fts) AS score
+                    FROM chunks_fts
+                    JOIN chunks c ON c.rowid = chunks_fts.rowid
+                    WHERE chunks_fts MATCH ? AND c.notebook = ?
+                    ORDER BY score
+                    LIMIT ?
+                    """,
+                    (fts_query, notebook, limit),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                # コードレビュー指摘#1: MATCH SELECT 自体の失敗（read-only DB・
+                # fts5 モジュール消失等）も例外にせず劣化させる。以前は書き込みを
+                # 伴う遅延同期がこの try/except の外側にあり、この契約を破っていた。
+                self._fts_disable_after_failure("読み取り", exc)
+                return []
+            return [(row["id"], row["score"]) for row in rows]
+        finally:
+            # リトライ実行中フラグは、この呼び出し内で発生した失敗（backfill
+            # 失敗・成功直後の実クエリ失敗）が _fts_disable_after_failure で
+            # 誤って再アームされないためのガード。この呼び出しを抜けたら
+            # 次回以降は通常の（新規の失敗のみ再アームする）判定に戻す。
+            if retried:
+                self._fts_retry_in_progress = False
 
     # -- document_tags（文書タグ。学び抽出パイプラインが付与） -------------------
 

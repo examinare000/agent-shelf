@@ -1449,13 +1449,18 @@ class TestKeywordTopK:
 
         assert store.keyword_topk("physics", "quantum", limit=10) == []
 
-    def test_keyword_topk_degrades_and_disables_fts_on_broken_read_state(
+    def test_keyword_topk_disables_fts_then_retries_once_and_stays_quiet_after(
         self, store, monkeypatch, caplog
     ):
-        """コードレビュー指摘#1: 読み取り(MATCH SELECT)自体が壊れている(read-only DB・
-        fts5 モジュール消失等)場合も keyword_topk の docstring 契約どおり例外にせず
-        [] に劣化させ、以後の呼び出しでは fts_enabled を落として静かにスキップし
-        続けることを検証する(壊れたクエリを毎回再実行して警告ログを連発しない)。
+        """コードレビュー指摘#1の回帰に加え、FTS ラッチ回復(1回だけの自己修復
+        リトライ)を検証する。読み取り(MATCH SELECT)自体が壊れている(read-only DB・
+        fts5 モジュール消失等)場合、初回は keyword_topk の docstring 契約どおり
+        例外にせず [] に劣化させ fts_enabled を落とす。次回のキーワード検索では
+        _init_fts を1回だけ再試行する(別プロセスによる chunks_fts の DROP 等、
+        一過性の要因からの自己修復機会)。再試行も失敗すれば、以後は無限リトライ
+        せず静かにスキップし続ける(壊れたクエリを毎回再実行して警告ログを
+        連発しない)。回復に成功するケースは
+        test_keyword_topk_recovers_when_retry_succeeds で別途検証する。
         """
         _make_notebook(store, name="physics")
         _make_document(store, id_="doc1", notebook="physics")
@@ -1466,9 +1471,21 @@ class TestKeywordTopK:
             assert store.keyword_topk("physics", "quantum", limit=10) == []
 
         assert store.fts_enabled is False
-        assert len(caplog.records) == 1  # 警告は初回失敗時に1回だけ
+        assert len(caplog.records) == 1  # 初回失敗の警告
 
-        # フラグが立った後、壊れた接続へ再クエリしないことを保証する。
+        # 次回検索での1回きりの再試行も失敗する状況を作る(retry 自体の失敗を模す)。
+        def failing_probe(self):
+            raise sqlite3.OperationalError("simulated: retry probe also fails")
+
+        monkeypatch.setattr(Store, "_probe_fts", failing_probe)
+
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+        assert store.fts_enabled is False
+        assert len(caplog.records) == 2  # 再試行1回分の警告が追加される
+
+        # 再試行を使い切った後、壊れた接続へ再クエリしないことを保証する。
         # sqlite3.Connection は C 拡張型でメソッドの直接差し替えができないため、
         # Store._conn 自体を MagicMock に差し替えて execute 未呼び出しを検証する。
         from unittest.mock import MagicMock
@@ -1479,7 +1496,155 @@ class TestKeywordTopK:
         with caplog.at_level("WARNING"):
             assert store.keyword_topk("physics", "quantum", limit=10) == []
         fake_conn.execute.assert_not_called()
-        assert len(caplog.records) == 1  # 2回目の呼び出しで警告が増えない(黙ってスキップ)
+        assert len(caplog.records) == 2  # 3回目の呼び出しで警告が増えない(黙ってスキップ)
+
+    def test_keyword_topk_recovers_when_retry_succeeds(self, store):
+        """FTS ラッチ回復: 別プロセスが chunks_fts を DROP した一過性の障害から、
+        次回のキーワード検索が1回だけ _init_fts を再試行して自己修復できることを
+        検証する(プロセス再起動なしでハイブリッド検索が復活する)。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store._conn.execute("DROP TABLE chunks_fts")  # 別プロセスが DROP した状況を模す
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []  # 初回は失敗して劣化
+        assert store.fts_enabled is False
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)  # 次回検索で1回だけ再試行
+
+        assert store.fts_enabled is True
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_retry_backfill_failure_does_not_rearm(self, store, monkeypatch, caplog):
+        """コードレビュー指摘(must-2a-i): リトライ自身の CREATE+probe は成功して
+        一瞬 fts_enabled=True になるが、その直後のバックフィル(_rebuild_fts)が
+        失敗するケース。_fts_disable_after_failure がこの時点の fts_enabled=True
+        を「直前まで健全だった」と誤認して再アームすると、障害が持続的な場合に
+        毎クエリ無限リトライになってしまう(不変条件違反)。リトライ実行中に
+        発生した失敗からは再アームされないことを検証する。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store._conn.execute("DROP TABLE chunks_fts")  # 読み取りが壊れた状態を人工的に作る
+
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []  # 初回失敗、リトライ予算がアーム
+        assert store.fts_enabled is False
+        assert len(caplog.records) == 1
+
+        def failing_rebuild(self):
+            raise sqlite3.OperationalError("simulated: retry backfill fails")
+
+        monkeypatch.setattr(Store, "_rebuild_fts", failing_rebuild)
+
+        with caplog.at_level("WARNING"):
+            # リトライ本体: CREATE+probe は成功(fts_enabled が一瞬 True になる)が
+            # backfill が失敗し、最終的に fts_enabled=False へ戻る。
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert store.fts_enabled is False
+        assert len(caplog.records) == 2  # リトライの失敗分の警告が1件追加される
+
+        # 再アームされていないため、以後の呼び出しでは接続へ再クエリしない。
+        from unittest.mock import MagicMock
+
+        fake_conn = MagicMock()
+        monkeypatch.setattr(store, "_conn", fake_conn)
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+        fake_conn.execute.assert_not_called()
+        assert len(caplog.records) == 2
+
+    def test_retry_success_followed_by_immediate_query_failure_does_not_rearm(
+        self, store, monkeypatch
+    ):
+        """コードレビュー指摘(must-2a-ii): リトライ自身(chunks_fts の再作成・
+        backfill)は成功するが、同じ keyword_topk 呼び出し内で直後に実行される
+        実クエリ(MATCH)がユーザー由来の不正な構文で失敗するケース。この失敗を
+        「直前まで健全だった」と誤認して再アームしないことを検証する。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store._conn.execute("DROP TABLE chunks_fts")
+        assert store.keyword_topk("physics", "quantum", limit=10) == []  # 初回失敗、リトライ予算がアーム
+        assert store.fts_enabled is False
+
+        # 次回呼び出し: リトライ自体(chunks_fts 再作成+backfill)は成功するが、
+        # 渡されたクエリが不正な MATCH 構文のため直後の実クエリが失敗する。
+        assert store.keyword_topk("physics", '"unterminated', limit=10) == []
+
+        # リトライが成功していた証拠として chunks_fts テーブル自体は再作成されている。
+        recreated = store._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+        ).fetchone()
+        assert recreated is not None
+        assert store.fts_enabled is False  # 直後の実クエリ失敗で再度無効化される
+
+        # 再アームされていないため、以後の呼び出しでは接続へ再クエリしない。
+        from unittest.mock import MagicMock
+
+        fake_conn = MagicMock()
+        monkeypatch.setattr(store, "_conn", fake_conn)
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        fake_conn.execute.assert_not_called()
+
+    class _OneShotMatchFailureProxy:
+        """最初に MATCH を含む SQL が実行された時だけ sqlite3.OperationalError を
+        送出し、以後は実接続へそのまま委譲するプロキシ。chunks_fts を DROP せずに
+        一過性の読み取り失敗だけを模すために使う(sqlite3.Connection は C拡張型で
+        メソッドの直接差し替えができないため、既存の _CountingConnProxy と同様の
+        流儀で Store._conn 自体を差し替える)。
+        """
+
+        def __init__(self, real_conn):
+            self._real = real_conn
+            self._triggered = False
+
+        def execute(self, sql, *args, **kwargs):
+            if not self._triggered and "MATCH" in sql:
+                self._triggered = True
+                raise sqlite3.OperationalError("simulated: transient MATCH read failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def test_recovers_via_forced_rebuild_and_finds_rows_written_while_disabled(
+        self, store, monkeypatch
+    ):
+        """コードレビュー指摘(must-2b): chunks_fts の DROP を伴わない一過性失敗
+        (MATCH 自体の読み取り失敗等)では、修正前は already_existed=True と
+        誤判定されリトライ時に backfill がスキップされていた。そのため
+        fts_enabled=False の間に upsert された行が chunks_fts に同期されず、
+        復旧後も永久に検索から漏れていた(サイレント劣化)。リトライ時は
+        already_existed に関わらず強制的に DROP+全件 rebuild することで、
+        劣化中に書き込まれた行も復旧後にヒットすることを検証する。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        proxy = self._OneShotMatchFailureProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+
+        # 1回目: chunks_fts は DROP されず残存したまま、MATCH の読み取りだけが
+        # 一過性障害で失敗する。
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert store.fts_enabled is False
+
+        # 劣化中に新しいチャンクを upsert する。_fts_capture_rows/_fts_insert_rows
+        # は fts_enabled=False のため早期リターンし、chunks_fts への同期をスキップ
+        # する(=このチャンクは chunks_fts に存在しないまま)。
+        store.upsert_chunks([_chunk_row(id_="doc1#1", seq=1, text="written while degraded")])
+
+        # 2回目: 次回検索で1回だけリトライ。already_existed の値に関わらず強制的に
+        # DROP+全件 rebuild するため、劣化中に書かれた行も backfill される。
+        hits = store.keyword_topk("physics", "written", limit=10)
+
+        assert store.fts_enabled is True
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#1"]
 
     def test_keyword_topk_hits_japanese_natural_sentence_via_build_fts_query(self, store):
         # コードレビュー指摘#1の再現/回帰テスト: build_fts_query が空白分割のままだと
