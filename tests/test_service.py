@@ -2367,6 +2367,8 @@ def test_consult_returns_answered_false_when_no_notebooks_exist(
 def test_consult_returns_answered_false_when_librarian_finds_no_targets(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
+    """司書が有効な JSON をパースした上で answerable=false と判断した場合
+    （タスク B7-2）。「解析失敗」ではなく「回答不能」である旨を明示する。"""
     _seed_notebook(store, embedder, tmp_path, notebook="nb")
     backend = FakeAnswerBackend(canned=_routing_answer([], answerable=False))
     service = ShelfService(store, embedder, lambda name: backend, tmp_path)
@@ -2377,9 +2379,30 @@ def test_consult_returns_answered_false_when_librarian_finds_no_targets(
         "question": "何か質問",
         "answered": False,
         "routed": [],
-        "warning": "資料からは分からない",
+        "warning": "資料からは分からないと判断しました",
     }
     assert len(backend.calls) == 1  # ルーティングのみ呼ばれ、専門家推論は呼ばれない
+
+
+def test_consult_reports_parse_failure_warning_when_routing_response_is_malformed(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """司書応答が JSON として解釈できず、fallback も空（既定=conservative）の場合
+    （タスク B7-2）。answerable=false（回答不能）と文言を区別し、原因が解析失敗で
+    あることを利用者に伝える。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb")
+    backend = FakeAnswerBackend(canned="これはJSONではない壊れたテキスト")
+    service = ShelfService(store, embedder, lambda name: backend, tmp_path)
+
+    result = service.consult("何か質問")
+
+    assert result == {
+        "question": "何か質問",
+        "answered": False,
+        "routed": [],
+        "warning": "ルーティング応答の解析に失敗しました",
+    }
+    assert len(backend.calls) == 1
 
 
 def test_consult_routes_to_single_expert_and_aggregates_answer(

@@ -46,6 +46,7 @@ from shelf.ports import (
     FileSummary,
     NotebookCard,
     RetrievedChunk,
+    RouteOutcome,
     RouteTarget,
     StudyNote,
 )
@@ -1433,11 +1434,7 @@ class ShelfService:
         librarian = self._get_librarian()
         outcome = librarian.route(question, catalog)
         if not outcome.targets:
-            warning = (
-                f"司書ルーティングの backend 呼び出しに失敗: {outcome.router_error}"
-                if outcome.router_error is not None
-                else "資料からは分からない"
-            )
+            warning = self._consult_no_targets_warning(outcome)
             return {
                 "question": question,
                 "answered": False,
@@ -1451,6 +1448,23 @@ class ShelfService:
             "routed": self._consult_targets(outcome.targets),
             "warning": None,
         }
+
+    def _consult_no_targets_warning(self, outcome: RouteOutcome) -> str:
+        """targets が空の consult() 応答に添える warning 文言を、原因ごとに出し分ける
+        （タスク B7-2）。優先順位は Librarian.route の診断情報の確度順:
+        1. router_error（backend 呼び出し自体の失敗・既存の文言のまま維持）。
+        2. parse_ok=False（司書応答が JSON として解釈できなかった「解析失敗」。
+           parse_routing は総崩れ時に answerable も強制的に False にするため
+           （routing.py 参照）、parse_ok を router_error の次に優先して判定しないと
+           「回答不能」と誤表示してしまう）。
+        3. それ以外（parse は成功したが answerable=false、または targets 空で
+           fallback=conservative）は総称して「回答不能」寄りの文言にする。
+        """
+        if outcome.router_error is not None:
+            return f"司書ルーティングの backend 呼び出しに失敗: {outcome.router_error}"
+        if not outcome.parse_ok:
+            return "ルーティング応答の解析に失敗しました"
+        return "資料からは分からないと判断しました"
 
     def _consult_targets(self, targets: list[RouteTarget]) -> list[dict]:
         """target ごとの専門家推論を実行し、ルーティング順のリストで返す（タスク A4）。

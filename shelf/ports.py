@@ -109,6 +109,12 @@ class RouteOutcome:
 
     targets: list[RouteTarget] = field(default_factory=list)
     router_error: str | None = None  # raw.ok=False の時のみ非 None（安全な要約）
+    # RoutingDecision.parse_ok をそのまま運ぶ（タスク B7-2）。service.consult が
+    # 「answerable=false（回答不能）」と「parse_ok=false（解析失敗）」を区別した
+    # warning 文言を出し分けるための情報。既定 True は tags/titles と同じ
+    # additive 拡張の後方互換方針（tests/fakes.py の FakeLibrarian 等、既存の
+    # RouteOutcome() 構築箇所を壊さない）。
+    parse_ok: bool = True
 
 
 @dataclass(frozen=True)

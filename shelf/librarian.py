@@ -63,4 +63,4 @@ class Librarian:
             decision = RoutingDecision(answerable=True, parse_ok=False, targets=[])
 
         targets = apply_fallback(decision, catalog, question, self._top_n, self._fallback)
-        return RouteOutcome(targets=targets, router_error=router_error)
+        return RouteOutcome(targets=targets, router_error=router_error, parse_ok=decision.parse_ok)

@@ -82,6 +82,9 @@ class TestRouteHappyPath:
         result = librarian.route("質問", [_card()])
 
         assert result.targets == []
+        # 有効な JSON としてパースでき、司書が明示的に answerable=false と判断した
+        # （タスク B7-2: service.consult の warning 分離が区別に使う情報）。
+        assert result.parse_ok is True
 
     def test_hallucinated_notebook_names_are_filtered_via_apply_fallback(self):
         canned = (
@@ -134,6 +137,10 @@ class TestRouteBackendFailure:
         assert result.targets == []
         # 【6】backend 呼び出し失敗時に router_error が格納される
         assert result.router_error == "timeout"
+        # backend 呼び出し失敗は「解析失敗」ではないが、router_error で別途識別できる
+        # ため consult() 側の分岐では router_error を優先判定する（parse_ok 自体は
+        # answerable=True を補う合成 decision（librarian.py）に由来し False のまま）。
+        assert result.parse_ok is False
 
     def test_backend_failure_with_all_fallback_routes_across_catalog(self):
         backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="500"))
@@ -168,3 +175,6 @@ class TestRouteMalformedResponse:
         result = librarian.route("質問", [_card(name="nb-a")])
 
         assert result.targets == []
+        # JSON として解釈できなかったため parse_ok=False（タスク B7-2: consult() の
+        # warning 分離が「回答不能」ではなく「解析失敗」と判定するための情報）。
+        assert result.parse_ok is False
