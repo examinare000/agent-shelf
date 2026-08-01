@@ -663,7 +663,13 @@ def test_ask_hybrid_search_clamps_digest_overrepresentation_and_promotes_body(
     result = service.ask("nb_clamp", "clamp_anchor_word")
 
     assert len(result["insights"]) == 2
+    # note_id は study_notes.id 形式へ正規化される（chunk.id はこのフィクスチャの
+    # ように DIGEST_SEQ_BASE(-2) 未満の digest_seq を仮定しない合成値のため、
+    # 変換式 n = DIGEST_SEQ_BASE - digest_seq をそのまま適用した値になる）。
     assert {i["note_id"] for i in result["insights"]} == {
+        "nb_clamp/doc#d-1", "nb_clamp/doc#d0",
+    }
+    assert {i["chunk_id"] for i in result["insights"]} == {
         "nb_clamp/doc#-1", "nb_clamp/doc#-2",
     }
     assert len(result["citations"]) == 4
@@ -2160,7 +2166,11 @@ def test_ask_returns_insights_built_from_retrieved_digest_chunks(
     assert result["insights"] == [
         {
             "l": 1,
-            "note_id": "nb_digest/doc#-2",
+            # note_id は study_notes.id 形式("{notebook}/{doc_id}#d{n}")に正規化される
+            # (indexer.DIGEST_SEQ_BASE=-2 かつ seq=0 の学びノート → digest chunk id
+            # "nb_digest/doc#-2" から復元)。chunk.id は additive に chunk_id で残す。
+            "note_id": "nb_digest/doc#d0",
+            "chunk_id": "nb_digest/doc#-2",
             "source": "nb_digest/doc.md",
             "text": "whales migrate long distances",
             "section": None,
@@ -2173,6 +2183,83 @@ def test_ask_returns_insights_built_from_retrieved_digest_chunks(
             "section": None, "page": None, "quote": _CHUNK_TEXT,
         }
     ]
+
+
+def test_ask_insight_note_id_for_non_first_digest_seq(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """seq=0 の退化ケースだけでなく、2件目以降の学びノート(digest_seq=-3=DIGEST_SEQ_BASE-1)
+    でも study_notes.id への変換式が正しいことを確認する。"""
+    store.create_notebook("nb_digest", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_digest/doc#-3", "notebook": "nb_digest", "doc_id": "doc",
+                "source_path": "nb_digest/doc.md", "section": None, "page": None,
+                "seq": -3, "text": "second learning note", "embedding": _KNOWN_VEC,
+                "kind": "digest",
+            },
+        ]
+    )
+    local_embedder = FakeEmbedder(dim=8, known={_QUERY_TEXT: _KNOWN_VEC})
+    payload = {
+        "answer": "second note [L1]",
+        "citations": [],
+        "insights": [{"l": 1}],
+        "confident": True,
+    }
+    backend = FakeAnswerBackend(canned=RawAnswer(text=json.dumps(payload), ok=True, error=None))
+    service = ShelfService(store, local_embedder, lambda name: backend, tmp_path)
+
+    result = service.ask("nb_digest", _QUERY_TEXT)
+
+    assert result["insights"][0]["note_id"] == "nb_digest/doc#d1"
+    assert result["insights"][0]["chunk_id"] == "nb_digest/doc#-3"
+
+
+def test_ask_insight_with_malformed_digest_chunk_id_is_skipped_and_logs_warning(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, caplog
+) -> None:
+    """フェイルソフト方針: _digest_chunk_id_to_note_id が想定外形式の chunk.id
+    （"#" 区切り無し・digest_seq が非数値等）で ValueError を送出しても ask() 全体を
+    落とさず、該当 insight だけをスキップして warning ログに留める。現状の
+    indexer.py の生成規則では到達不能だが、フェイルソフト方針(design doc既定)に
+    合わせる防御。"""
+    store.create_notebook("nb_malformed", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_malformed/doc#0", "notebook": "nb_malformed", "doc_id": "doc",
+                "source_path": "nb_malformed/doc.md", "section": None, "page": None,
+                "seq": 0, "text": _CHUNK_TEXT, "embedding": _KNOWN_VEC, "kind": "body",
+            },
+            {
+                # "#" 区切りが無い想定外形式の digest チャンク id。
+                "id": "malformed-digest-id-without-hash", "notebook": "nb_malformed",
+                "doc_id": "doc", "source_path": "nb_malformed/doc.md", "section": None,
+                "page": None, "seq": -2, "text": "malformed digest note",
+                "embedding": _KNOWN_VEC, "kind": "digest",
+            },
+        ]
+    )
+    local_embedder = FakeEmbedder(dim=8, known={_QUERY_TEXT: _KNOWN_VEC})
+    payload = {
+        "answer": "whales eat krill [S1] and migrate [L1]",
+        "citations": [{"s": 1}],
+        "insights": [{"l": 1}],
+        "confident": True,
+    }
+    backend = FakeAnswerBackend(canned=RawAnswer(text=json.dumps(payload), ok=True, error=None))
+    service = ShelfService(store, local_embedder, lambda name: backend, tmp_path)
+
+    with caplog.at_level("WARNING"):
+        result = service.ask("nb_malformed", _QUERY_TEXT)
+
+    assert result["insights"] == []
+    assert result["citations"][0]["chunk_id"] == "nb_malformed/doc#0"
+    assert any(
+        "malformed-digest-id-without-hash" in record.message for record in caplog.records
+    )
 
 
 def test_ask_insight_includes_section_and_page_from_digest_chunk(
@@ -2210,7 +2297,8 @@ def test_ask_insight_includes_section_and_page_from_digest_chunk(
     assert result["insights"] == [
         {
             "l": 1,
-            "note_id": "nb_digest/doc#-2",
+            "note_id": "nb_digest/doc#d0",
+            "chunk_id": "nb_digest/doc#-2",
             "source": "nb_digest/doc.md",
             "text": "whales migrate long distances",
             "section": "§2.3",
