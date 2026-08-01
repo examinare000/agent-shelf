@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import numpy as np
@@ -2091,5 +2092,137 @@ class TestBusyTimeout:
         row = store._conn.execute("PRAGMA busy_timeout").fetchone()
         assert row[0] == Store._BUSY_TIMEOUT_MS
         assert row[0] != 0
+
+
+class TestJournalModeWAL:
+    """WAL 化: 長命 MCP サーバ(shelf serve)と別プロセス CLI(shelf index/digest)が
+    同一 DB ファイルに同時アクセスする構成では、rollback-journal だと CLI の
+    書き込みがサーバの読み取りをブロックする(WAL は reader/writer が互いを
+    ブロックしない)。
+    """
+
+    def test_store_enables_wal_on_file_db(self, tmp_path):
+        db_path = tmp_path / "shelf.db"
+        store = Store(str(db_path))
+        try:
+            row = store._conn.execute("PRAGMA journal_mode").fetchone()
+            assert row[0] == "wal"
+        finally:
+            store.close()
+
+    def test_store_sets_synchronous_normal_on_file_db(self, tmp_path):
+        # WAL では NORMAL でも(FULL ほど厳密でなくとも)整合性が保たれる一方、
+        # fsync 頻度を減らせる。SQLite の内部表現で NORMAL は 1。
+        db_path = tmp_path / "shelf.db"
+        store = Store(str(db_path))
+        try:
+            row = store._conn.execute("PRAGMA synchronous").fetchone()
+            assert row[0] == 1
+        finally:
+            store.close()
+
+    def test_memory_db_skips_wal_and_stays_functional(self, store):
+        # store フィクスチャは ":memory:" で構築済み。WAL は共有メモリを要求する
+        # ため :memory: では機能せず journal_mode は "memory" のままで正常動作する。
+        row = store._conn.execute("PRAGMA journal_mode").fetchone()
+        assert row[0] == "memory"
+        store.create_notebook("physics", description="物理の論文", backend="codex")
+        assert store.get_notebook("physics")["name"] == "physics"
+
+    def test_wal_failure_is_fail_soft_and_logs_warning(self, tmp_path, monkeypatch, caplog):
+        # 読み取り専用ファイルシステムやネットワーク共有等、journal_mode=WAL の
+        # 要求が無視される環境(戻り値が "wal" 以外)を模す。既存の FTS 劣化と
+        # 同じ流儀で、例外にせず warning ログに留めて構築が成功することを検証する。
+        db_path = tmp_path / "shelf.db"
+        original = Store._read_pragma_value
+
+        def fake_read_pragma_value(self, sql):
+            if sql == "PRAGMA journal_mode=WAL":
+                return "delete"
+            return original(self, sql)
+
+        monkeypatch.setattr(Store, "_read_pragma_value", fake_read_pragma_value)
+
+        with caplog.at_level("WARNING"):
+            store = Store(str(db_path))
+        try:
+            assert len(caplog.records) == 1
+        finally:
+            store.close()
+
+    def test_reopening_existing_db_upgrades_to_wal(self, tmp_path):
+        # journal_mode は DB ファイルに永続する属性なので、旧コードで delete
+        # モードのまま作られた既存 DB も新コードで開くだけで自動的に WAL 化
+        # される(migration スクリプト不要)。
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        store1._conn.execute("PRAGMA journal_mode=DELETE")
+        store1.close()
+
+        store2 = Store(str(db_path))
+        try:
+            row = store2._conn.execute("PRAGMA journal_mode").fetchone()
+            assert row[0] == "wal"
+        finally:
+            store2.close()
+
+    def test_readonly_db_file_does_not_crash_init(self, tmp_path):
+        """コードレビュー指摘(must-1a): 読み取り専用ファイル(chmod)を開くと、
+        journal_mode を delete から wal へ書き換えようとする PRAGMA が実際に
+        sqlite3.OperationalError("attempt to write a readonly database")を送出する。
+        この修正前は __init__ にこの例外がそのまま伝播しクラッシュしていた(退行)。
+        既存の test_wal_failure_is_fail_soft_and_logs_warning は「例外を投げず
+        別文字列を返す」monkeypatch のみで、try/except の実在は裏付けていなかった。
+        """
+        db_path = tmp_path / "shelf.db"
+        store0 = Store(str(db_path))
+        store0._conn.execute("PRAGMA journal_mode=DELETE")  # WAL 化前の状態を人工的に作る
+        store0.close()
+
+        os.chmod(db_path, 0o444)
+        try:
+            store1 = Store(str(db_path))  # 修正前はここで例外が伝播していた
+            try:
+                row = store1._conn.execute("PRAGMA journal_mode").fetchone()
+                # 書き込めないため wal へ昇格できず、rollback-journal のまま
+                assert row[0] == "delete"
+            finally:
+                store1.close()
+        finally:
+            os.chmod(db_path, 0o644)  # tmp_path の後片付けに支障が出ないよう戻す
+
+    def test_wal_upgrade_lock_contention_does_not_crash_init(self, tmp_path, monkeypatch):
+        """コードレビュー指摘(must-1b): 別接続(別プロセスを模す)が BEGIN IMMEDIATE
+        で書き込みロックを保持している間に Store を開くと、journal_mode=WAL への
+        昇格が "database is locked" で失敗しうる。この修正前は _enable_wal が
+        busy_timeout の設定より前に呼ばれていたため busy_timeout の恩恵を受けられず、
+        かつ例外を捕捉していなかったため __init__ がクラッシュしていた(退行)。
+        busy_timeout を _enable_wal より前に設定した上で例外を捕捉し、
+        rollback-journal のまま fail-soft することを検証する。
+        """
+        monkeypatch.setattr(Store, "_BUSY_TIMEOUT_MS", 50)  # busy_timeout の待ちでテストが遅くならないようにする
+        db_path = tmp_path / "shelf.db"
+        store0 = Store(str(db_path))  # スキーマ作成
+        store0._conn.execute("PRAGMA journal_mode=DELETE")  # WAL 化前の状態を人工的に作る
+        store0.close()
+
+        blocker = sqlite3.connect(str(db_path))
+        blocker.execute("BEGIN IMMEDIATE")
+        # BEGIN IMMEDIATE 単独では RESERVED ロックが実際の書き込みまで確定しない
+        # ことがあるため、実データを書いて別プロセスが書き込みロックを保持して
+        # いる状況を確実に再現する(コミットは finally で rollback するまで
+        # 保留し続ける)。
+        blocker.execute("INSERT INTO meta (key, value) VALUES ('probe', '1')")
+        try:
+            store = Store(str(db_path))  # 修正前はここで例外が伝播していた
+            try:
+                row = store._conn.execute("PRAGMA journal_mode").fetchone()
+                # ロック競合で昇格に失敗しても rollback-journal のまま動作継続する
+                assert row[0] == "delete"
+            finally:
+                store.close()
+        finally:
+            blocker.rollback()
+            blocker.close()
 
 

@@ -134,15 +134,34 @@ class Store:
     _BUSY_TIMEOUT_MS = 5000
 
     def __init__(self, db_path: str | Path) -> None:
+        # ":memory:" はファイルではないため、親ディレクトリ作成・WAL 化のいずれも
+        # スキップする対象になる。1変数にまとめて判定を一本化する
+        # （コードレビュー指摘: 以前は同じ文字列比較が2箇所に重複していた）。
+        is_memory_db = str(db_path) == ":memory:"
         # DB_PATH の親ディレクトリを必要時に作成する（":memory:" はファイルではないのでスキップ）。
-        if str(db_path) != ":memory:":
+        if not is_memory_db:
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(db_path))
         self._conn.row_factory = sqlite3.Row
-        # 同時アクセスによる一時的なロック競合の頻度を下げる（上の _BUSY_TIMEOUT_MS
-        # コメント参照）。foreign_keys より前に設定しても問題ない（両方とも
-        # 接続スコープの PRAGMA）。
+        # 同時アクセスによる一時的なロック競合の頻度を下げる（_BUSY_TIMEOUT_MS の
+        # クラス変数コメント参照）。_enable_wal より前に設定すること
+        # （コードレビュー指摘 must-1b: 以前は _enable_wal の後にこの PRAGMA を
+        # 発行していたため、WAL 化の PRAGMA 自体が busy_timeout の恩恵を受けられず、
+        # 別接続が書き込みロックを保持しているだけで待たずに即 "database is
+        # locked" となっていた）。foreign_keys より前に設定しても問題ない
+        # （いずれも接続スコープの PRAGMA）。
         self._conn.execute(f"PRAGMA busy_timeout = {self._BUSY_TIMEOUT_MS}")
+        # WAL 化: rollback-journal(既定)では書き込みトランザクションが読み取りを
+        # ブロックするため、`shelf index`/`shelf digest` CLI の書き込みが長命
+        # サーバ(shelf serve)の読み取りをブロックしうる。WAL は reader/writer が
+        # 互いをブロックしないため、この構成での busy_timeout 頼みの待ち合わせを
+        # 減らせる。connect 直後・スキーマ作成前に発行する。:memory: DB は
+        # WAL が要求する共有メモリに対応しないためスキップする（journal_mode は
+        # "memory" のままで正常動作）。journal_mode は DB ファイルに永続する
+        # 属性のため、既存 DB も次回オープンで自動的に WAL 化される
+        # （migration スクリプト不要）。
+        if not is_memory_db:
+            self._enable_wal()
         # documents.notebook の FK 制約を有効化し、「未知 notebook への追加は失敗」を
         # SQLite に守らせる（アプリ側の二重チェックを避ける）。
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -161,6 +180,52 @@ class Store:
 
     def close(self) -> None:
         self._conn.close()
+
+    def _enable_wal(self) -> None:
+        """journal_mode=WAL・synchronous=NORMAL を設定する（fail-soft）。
+
+        読み取り専用ファイルシステムやネットワーク共有（例: OneDrive 同期
+        フォルダ）上の DB では WAL の要求が無視され、戻り値が "wal" 以外に
+        なることがある(mode != "wal" 分岐)。加えて、読み取り専用パーミッション
+        のファイルや、別接続が書き込みロックを保持している一過性の競合では
+        PRAGMA 発行自体が sqlite3.OperationalError を送出しうる(コードレビュー
+        指摘 must-1a/b の回帰: 修正前はこれが __init__ にそのまま伝播し
+        Store の構築自体がクラッシュしていた)。既存の FTS 劣化
+        （_fts_disable_after_failure）と同じ流儀で、いずれの失敗も例外にせず
+        warning ログに留めて rollback-journal のまま処理を継続する。DB は
+        次回 open 時に競合が解消していれば自動的に WAL 化される（§ __init__
+        のコメント参照、migration スクリプト不要）。
+        """
+        try:
+            mode = self._read_pragma_value("PRAGMA journal_mode=WAL")
+            if mode != "wal":
+                _logger.warning(
+                    "PRAGMA journal_mode=WAL が有効化されませんでした（実際の mode=%r）。"
+                    "読み取り専用ファイルシステムやネットワーク共有上の DB では WAL が"
+                    "機能しない場合があります。rollback-journal のまま動作を継続します。",
+                    mode,
+                )
+            # WAL 下では FULL ほど厳密でなくとも整合性が保たれるため、fsync 頻度を
+            # 減らして書き込みコストを下げる。
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error as exc:
+            _logger.warning(
+                "WAL 化用の PRAGMA 発行に失敗したため rollback-journal のまま"
+                "動作を継続します（読み取り専用ファイル・別接続によるロック競合等の"
+                "一過性要因が考えられます。次回 open 時に競合が解消していれば"
+                "自動的に再試行されます）: %r",
+                exc,
+            )
+
+    def _read_pragma_value(self, sql: str) -> str | None:
+        """PRAGMA の単一列の戻り値を読む小さな seam。
+
+        なぜ execute から分離するか: テストで「WAL 要求が無視される環境」を
+        monkeypatch で模すため（TestFtsInitProbe が _probe_fts を monkeypatch
+        する既存流儀と同様）。
+        """
+        row = self._conn.execute(sql).fetchone()
+        return row[0] if row is not None else None
 
     def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
         # CREATE TABLE IF NOT EXISTS は既存テーブルに列を足さないため、
