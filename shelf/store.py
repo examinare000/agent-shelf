@@ -793,6 +793,28 @@ class Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def find_documents_by_content_hash(
+        self, content_hash: str, *, exclude_doc_id: str | None = None
+    ) -> list[dict]:
+        """content_hash（変換後 markdown の sha256）で全 notebook を横断検索する。
+
+        find_documents_by_origin と同じ設計（notebook 引数を取らず全表走査）——
+        同一内容の資料が別パス・別 notebook から投入された場合も検出する必要が
+        あるため（B3: notebook 跨ぎの内容重複検出）。exclude_doc_id は「自分自身を
+        除いた重複」を返したい呼び出し元（add_source の重複警告）向け。
+        content_hash が NULL（未計算・バックフィル前）の行は、SQL の NULL 比較
+        セマンティクス（`= ?` は NULL に対して常に偽）により自然に除外される。
+        """
+        query = "SELECT id, notebook FROM documents WHERE content_hash = ?"
+        params: list[str] = [content_hash]
+        if exclude_doc_id is not None:
+            query += " AND id != ?"
+            params.append(exclude_doc_id)
+        query += " ORDER BY id"
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+            return [dict(row) for row in rows]
+
     def delete_document(self, id: str) -> None:
         with self._lock:
             old_fts_rows = self._fts_capture_rows("doc_id = ?", (id,))

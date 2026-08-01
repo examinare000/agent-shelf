@@ -84,10 +84,13 @@ _SHELVE_DIGEST_RECOMMENDATION = (
 class IngestResult:
     """_ingest_file の戻り値。doc_id に加え、converter からの利用者向け通知
     （例: OCRスキップ）を notes として運ぶ。notes は既定で空タプル（該当なし）。
+    duplicates は同一 content_hash を持つ他資料（自分自身を除く。B3）——
+    notebook 横断の内容重複を利用者へ warn するためのもので、既定で空タプル。
     """
 
     doc_id: str
     notes: tuple[str, ...] = ()
+    duplicates: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -163,6 +166,19 @@ def _stem_for(origin: str) -> str:
     if _is_url(origin):
         return Path(urlparse(origin).path).stem or "doc"
     return Path(origin).stem
+
+
+def _content_hash_of(markdown: str) -> str:
+    """変換後 markdown の sha256 hexdigest。documents.content_hash（内容重複検出・
+    B3）と digest の skip 判定用 source_hash（「内容が変わったか」を問う）が
+    同じ問いを扱うため、算出レシピを1箇所に統一する。
+
+    注意: ハッシュ対象は変換「後」の markdown であり、コンバータのバージョンに
+    依存する（例: pymupdf4llm の出力仕様が変われば同一の元ファイルでも markdown の
+    文字列表現が変わり、このハッシュ値も変わり得る）。「原本ファイルの同一性」
+    ではなく「現在の変換パイプラインが生成した内容の同一性」を表す点に注意。
+    """
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
 
 
 def _validate_file_origin(origin: str, *, max_file_mb: int) -> dict | None:
@@ -794,6 +810,7 @@ class ShelfService:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(markdown, encoding="utf-8")
 
+        content_hash = _content_hash_of(markdown)
         now = datetime.now(UTC).isoformat()
         self._store.upsert_document(
             id=doc_id,
@@ -804,11 +821,21 @@ class ShelfService:
             converter=converter,
             added_at=now,
             title=title,
+            content_hash=content_hash,
             fetched_at=now if is_url else None,
             description=description,
             description_source=description_source,
         )
-        return IngestResult(doc_id=doc_id, notes=conversion_notes)
+        # notebook 横断の内容重複検出（B3）: 自分自身を除いた同一 content_hash の
+        # 資料を warn 対象として持ち帰る。skip はしない（同一書籍を複数の棚に
+        # 意図的に置く運用は正当なため、拒否ではなく記録に留める）。
+        duplicate_rows = self._store.find_documents_by_content_hash(
+            content_hash, exclude_doc_id=doc_id
+        )
+        duplicates = tuple(
+            {"doc_id": row["id"], "notebook": row["notebook"]} for row in duplicate_rows
+        )
+        return IngestResult(doc_id=doc_id, notes=conversion_notes, duplicates=duplicates)
 
     def add_source(
         self,
@@ -883,6 +910,9 @@ class ShelfService:
         if ingest_result.notes:
             # notes が空のときはキー自体を付けない(JSONノイズを避ける)。
             response["notes"] = list(ingest_result.notes)
+        if ingest_result.duplicates:
+            # duplicates も同じ流儀（空なら省略）。B3: notebook 横断の内容重複警告。
+            response["duplicates"] = list(ingest_result.duplicates)
         return response
 
     # -- add_directory ---------------------------------------------------------
@@ -1002,6 +1032,9 @@ class ShelfService:
             if ingest_result.notes:
                 # add_source と同様、notes は非空のときだけエントリに付与する。
                 added_entry["notes"] = list(ingest_result.notes)
+            if ingest_result.duplicates:
+                # 同上。B3: notebook 横断の内容重複警告をファイル単位で伝える。
+                added_entry["duplicates"] = list(ingest_result.duplicates)
             added.append(added_entry)
 
         chunks_written = 0
@@ -1496,7 +1529,7 @@ class ShelfService:
         except OSError:
             return "資料ファイルを読み取れませんでした"
 
-        content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        content_hash = _content_hash_of(markdown)
 
         if not force:
             # skip 判定は「source_hash 一致」だけでなく「既存ノートが現行パイプライン
