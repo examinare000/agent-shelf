@@ -217,3 +217,7 @@ class ShelvePlan:
     created: list[NewNotebookSpec] = field(default_factory=list)
     skipped: list[dict] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
+    # classify_step が検出した silent fallback（LLM 提案名の既定名への強制リマップ・
+    # タスク B7-3）の注記。既存の service.shelve() "notes" キーと同じ str リストの
+    # 流儀に合わせる（additive・既存 ShelvePlan() 構築箇所を壊さない）。
+    notes: list[str] = field(default_factory=list)

@@ -1265,6 +1265,7 @@ class ShelfService:
                 ],
                 "skipped": skipped,
                 "errors": errors,
+                "notes": plan.notes,
             }
 
         for spec in plan.created:
@@ -1314,7 +1315,9 @@ class ShelfService:
             "skipped": skipped,
             "errors": errors,
             "chunks_written": chunks_written,
-            "notes": [_SHELVE_DIGEST_RECOMMENDATION],
+            # plan.notes（タスク B7-3: silent な notebook 名リマップの注記）を、
+            # 既存の digest 案内メッセージより先に並べる（発生順・分類段が先）。
+            "notes": [*plan.notes, _SHELVE_DIGEST_RECOMMENDATION],
         }
 
     # -- index -----------------------------------------------------------------

@@ -87,13 +87,27 @@ def normalize_notebook_name(raw: str) -> str:
     構成上、返り値は必ず `validate_notebook_name` を通る
     （§13.10 V2 の検証ステップ）。
     """
+    return normalize_notebook_name_with_fallback_flag(raw)[0]
+
+
+def normalize_notebook_name_with_fallback_flag(raw: str) -> tuple[str, bool]:
+    """normalize_notebook_name と同じ正規化を行い、raw の全文字が非対応（多くは
+    全角/非ASCII文字や記号のみ）で構成され、既定名 "notebook" へサイレントに
+    フォールバックしたかどうかも合わせて返す（タスク B7-3）。
+
+    LLM が英小文字・数字・-/_ のみという指示を無視し、提案名の全体が非対応文字
+    だった場合にのみ2要素目が True になる（compressed が空になる経路のみを対象と
+    する）。予約デバイス名リマップ（con→con-nb 等）は compressed が空にならない
+    別経路のため対象外——呼び出し側（shelving.classify_step）はこの旗を使い、
+    LLM が指示を無視した silent fallback を利用者へ可視化する。
+    """
     lowered = raw.lower()
     compressed = _NOTEBOOK_NAME_NON_ALLOWED.sub("-", lowered).strip("-")
     if not compressed:
-        return _DEFAULT_NOTEBOOK_NAME
+        return _DEFAULT_NOTEBOOK_NAME, True
     truncated = compressed[:_NOTEBOOK_NAME_MAX_LEN].rstrip("-")
     result = truncated or _DEFAULT_NOTEBOOK_NAME
-    return _remap_reserved_device_name(result)
+    return _remap_reserved_device_name(result), False
 
 
 def _remap_reserved_device_name(name: str) -> str:

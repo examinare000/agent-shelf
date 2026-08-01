@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from shelf.jsonutil import extract_json_payload
-from shelf.names import assign_unique_name, normalize_notebook_name
+from shelf.names import assign_unique_name, normalize_notebook_name_with_fallback_flag
 from shelf.ports import (
     ClassificationDecision,
     FileSummary,
@@ -156,6 +156,11 @@ class StepResult:
 
     assignment: ShelfAssignment
     new_notebook: NewNotebookSpec | None = None
+    # LLM が名前提案の指示（英小文字・数字・-/_ のみ）を無視し、全角/記号のみの名前を
+    # 提案した結果 normalize_notebook_name_with_fallback_flag が既定名 "notebook" へ
+    # サイレントにリマップした場合のみ非 None（タスク B7-3）。呼び出し側（Shelver）が
+    # ShelvePlan.notes へ集約し、利用者へ可視化する。
+    note: str | None = None
 
 
 def _resolve_new_notebook_description(decision: ClassificationDecision, summary: FileSummary) -> str:
@@ -206,11 +211,23 @@ def classify_step(
     # (c) parse_ok=False のいずれか。(a)/(b) はモデルが提案した名前を正規化し、
     # (c) は手がかりが無いため既定名（"" → normalize で "notebook"）に倒す。
     raw_name = decision.notebook if decision.parse_ok else ""
-    normalized = normalize_notebook_name(raw_name)
+    normalized, used_default_fallback = normalize_notebook_name_with_fallback_flag(raw_name)
     unique_name = assign_unique_name(normalized, known_names)
 
     description = _resolve_new_notebook_description(decision, summary)
     reason = decision.reason if decision.parse_ok else _PARSE_FAILURE_REASON
+
+    # raw_name が空（parse_ok=False）の既定フォールバックは「そもそも名前を提案
+    # できていない」経路であり対象外。raw_name が非空なのに既定名へ落ちた場合のみ、
+    # LLM が「英小文字・数字・-/_ のみ」の指示を無視した silent fallback とみなす
+    # （タスク B7-3: names.py の判定を可視化するだけで、判定ロジック自体は
+    # normalize_notebook_name_with_fallback_flag に閉じ込める）。
+    note = (
+        f"分類提案名 '{raw_name}' が英小文字・数字・-/_ を含まないため"
+        f"既定名 '{unique_name}' へ自動リマップしました（資料: {summary.origin}）"
+        if raw_name and used_default_fallback
+        else None
+    )
 
     new_notebook = NewNotebookSpec(name=unique_name, description=description, backend=backend)
     assignment = ShelfAssignment(
@@ -220,4 +237,4 @@ def classify_step(
         summary=summary.summary,
         reason=reason,
     )
-    return StepResult(assignment=assignment, new_notebook=new_notebook)
+    return StepResult(assignment=assignment, new_notebook=new_notebook, note=note)

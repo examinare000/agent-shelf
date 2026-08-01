@@ -12,6 +12,7 @@ from shelf.names import (
     assign_unique_name,
     doc_id_for,
     normalize_notebook_name,
+    normalize_notebook_name_with_fallback_flag,
     validate_notebook_name,
 )
 
@@ -236,6 +237,41 @@ class TestNormalizeNotebookName:
         # 値を返す（§13.5・§13.10 V2 検証ステップ）。
         normalized = normalize_notebook_name(raw)
         assert validate_notebook_name(normalized) == normalized
+
+
+class TestNormalizeNotebookNameWithFallbackFlag:
+    """タスク B7-3: LLM が全非ASCII/記号のみの名前を提案し、既定名 "notebook" へ
+    サイレントにリマップされる経路を検出するための補助関数。"""
+
+    def test_returns_same_result_as_normalize_notebook_name(self):
+        result, _ = normalize_notebook_name_with_fallback_flag("Cooking Recipes!!")
+        assert result == normalize_notebook_name("Cooking Recipes!!")
+
+    def test_flags_fallback_when_input_is_entirely_non_ascii(self):
+        result, used_fallback = normalize_notebook_name_with_fallback_flag("物理学")
+        assert result == "notebook"
+        assert used_fallback is True
+
+    def test_flags_fallback_when_input_is_entirely_symbols(self):
+        result, used_fallback = normalize_notebook_name_with_fallback_flag("!!!")
+        assert result == "notebook"
+        assert used_fallback is True
+
+    def test_does_not_flag_fallback_for_valid_input(self):
+        _, used_fallback = normalize_notebook_name_with_fallback_flag("physics-papers")
+        assert used_fallback is False
+
+    def test_does_not_flag_fallback_when_input_already_literally_notebook(self):
+        """"notebook" という語自体を LLM が正当に提案した場合はリマップではない
+        （全て有効な英字のため compressed が空にならず、fallback 分岐を通らない）。"""
+        _, used_fallback = normalize_notebook_name_with_fallback_flag("notebook")
+        assert used_fallback is False
+
+    def test_does_not_flag_fallback_for_reserved_device_name(self):
+        """予約デバイス名リマップ（con→con-nb）は別経路であり、既定名フォールバック
+        とは区別する（compressed は空にならないため fallback 判定に該当しない）。"""
+        _, used_fallback = normalize_notebook_name_with_fallback_flag("con")
+        assert used_fallback is False
 
 
 class TestAssignUniqueName:

@@ -4366,6 +4366,60 @@ def test_shelve_converts_each_file_once_uses_summary_as_description_and_recommen
     ]
 
 
+def test_shelve_dry_run_surfaces_silent_notebook_name_remap_note(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """LLM が名前提案の指示を無視し、全角のみの notebook 名を提案した場合
+    （タスク B7-3）。既定名へサイレントにリマップされたことを dry-run の
+    計画結果にも可視化する。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned='{"action": "new", "notebook": "量子力学", "description": "d", "reason": "r"}'
+    )
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+
+    result = service.shelve(str(root), dry_run=True)
+
+    assert len(result["notes"]) == 1
+    assert "notebook" in result["notes"][0]
+
+
+def test_shelve_apply_surfaces_silent_notebook_name_remap_note_before_digest_recommendation(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned='{"action": "new", "notebook": "量子力学", "description": "d", "reason": "r"}'
+    )
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+
+    result = service.shelve(str(root), dry_run=False)
+
+    assert len(result["notes"]) == 2
+    assert "notebook" in result["notes"][0]
+    assert result["notes"][1] == (
+        "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
+    )
+
+
 def test_shelve_apply_masks_title_before_persisting(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
