@@ -25,7 +25,7 @@ class ConvertResult:
     """テキスト変換結果。"""
 
     markdown: str
-    converter: str  # 'pymupdf4llm' | 'markitdown' | 'raw'
+    converter: str  # 'pymupdf4llm' | 'pymupdf4llm-reflow' | 'markitdown' | 'raw'
     title: str | None
     # 利用者への明示的な通知（例: OCRスキップ）。空タプルが既定で、全構築箇所が
     # キーワード引数呼び出しのため末尾追加でも非破壊(design doc/計画で grep 確認済み)。
@@ -51,7 +51,7 @@ def pick_converter(origin: str) -> str:
         origin: ファイルパスまたは URL。
 
     Returns:
-        'pymupdf4llm' | 'markitdown' | 'raw'
+        'pymupdf4llm' | 'pymupdf4llm-reflow' | 'markitdown' | 'raw'
 
     Raises:
         ConversionError: 未対応形式の場合。
@@ -74,6 +74,12 @@ def pick_converter(origin: str) -> str:
     # PDF: pymupdf4llm
     if ext == ".pdf":
         return "pymupdf4llm"
+
+    # リフロー形式(EPUB/FB2/XPS): pymupdf4llm を使うが、PDF の "pymupdf4llm" とは
+    # 別の converter 名にする。これらのページ番号は再レイアウトの副産物であり
+    # 読者の版と一致しないため、由来を documents.converter で区別できるようにする。
+    if ext in (".epub", ".fb2", ".xps"):
+        return "pymupdf4llm-reflow"
 
     # Office/HTML: markitdown
     if ext in (".docx", ".xlsx", ".xls", ".pptx", ".html", ".htm"):
@@ -98,6 +104,7 @@ def pick_converter(origin: str) -> str:
     # 未対応
     supported = [
         ".pdf (PDF)",
+        ".epub, .fb2, .xps (リフロー)",
         ".docx, .xlsx, .xls, .pptx, .html, .htm (Office/HTML)",
         ".md, .txt, .rst, .py, .js, .ts, .sh, .toml, .yaml, .yml, .json (Code/Text)",
         "http://, https:// (URL)",

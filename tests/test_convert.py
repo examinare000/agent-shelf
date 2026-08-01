@@ -138,6 +138,24 @@ class TestPickConverter:
         assert "対応形式" in str(exc_info.value)
 
 
+class TestPickConverterReflowFormats:
+    """EPUB/FB2/XPS はリフロー形式として PDF ('pymupdf4llm') とは別の
+    'pymupdf4llm-reflow' 経路に振り分ける。documents.converter へ記録される
+    値でリフロー由来と判別できるようにするため、名称を分ける(タスク要件)。"""
+
+    def test_epub_extension(self):
+        assert pick_converter("book.epub") == "pymupdf4llm-reflow"
+
+    def test_fb2_extension(self):
+        assert pick_converter("book.fb2") == "pymupdf4llm-reflow"
+
+    def test_xps_extension(self):
+        assert pick_converter("book.xps") == "pymupdf4llm-reflow"
+
+    def test_epub_extension_case_insensitive(self):
+        assert pick_converter("Book.EPUB") == "pymupdf4llm-reflow"
+
+
 class TestInsertPageMarkers:
     """PDF の page_chunks 結果（dict のリスト）から <!-- page: N --> マーカーを挿入する純粋関数のテスト。
 
