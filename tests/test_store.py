@@ -916,6 +916,59 @@ class TestFindDocumentsByOrigin:
         }
 
 
+class TestFindDocumentsByContentHash:
+    """B3: 同一内容の資料が別パス・別 notebook から投入されるケースの重複検出。
+    find_documents_by_origin と同じ設計（notebook を跨いで全表検索）だが、
+    キーが origin ではなく content_hash である点が異なる。
+    """
+
+    def test_returns_hits_across_notebooks_for_matching_hash(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf",
+            content_hash="abc123",
+        )
+        _make_document(
+            store, id_="doc2", notebook="math", origin="b.pdf",
+            content_hash="abc123",
+        )
+
+        hits = store.find_documents_by_content_hash("abc123")
+
+        assert {(h["id"], h["notebook"]) for h in hits} == {
+            ("doc1", "physics"), ("doc2", "math"),
+        }
+
+    def test_returns_empty_list_when_hash_not_found(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics", content_hash="abc123")
+
+        assert store.find_documents_by_content_hash("not-a-hash") == []
+
+    def test_excludes_given_doc_id(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf", content_hash="abc123",
+        )
+        _make_document(
+            store, id_="doc2", notebook="physics", origin="b.pdf", content_hash="abc123",
+        )
+
+        hits = store.find_documents_by_content_hash("abc123", exclude_doc_id="doc1")
+
+        assert [h["id"] for h in hits] == ["doc2"]
+
+    def test_null_content_hash_rows_are_never_matched(self, store):
+        # content_hash が未計算(NULL)の行は、どんなハッシュ値の問い合わせでもヒット
+        # しない（SQL の NULL 比較セマンティクス通り、= 演算子は NULL に対して常に
+        # 偽になるため、明示フィルタなしで自然に除外できる）。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics", origin="a.pdf", content_hash=None)
+
+        assert store.find_documents_by_content_hash("abc123") == []
+
+
 class TestMeta:
     def test_get_meta_returns_none_when_absent(self, store):
         assert store.get_meta("model") is None
