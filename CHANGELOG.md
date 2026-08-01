@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **ask/consult の insights[].note_id が chunks.id を誤って返していた**: `_build_insights` が本来 `study_notes.id`（`{notebook}/{doc_id}#d{n}` 形式・設計書 §217 の契約）を返すべき `note_id` に、索引用の `chunks.id`（`{notebook}/{doc_id}#{digest_seq}` 形式）をそのまま入れていた。`note_id` の値を `study_notes.id` 形式へ正規化し、従来の値（`chunks.id`）は応答互換のため新設の `chunk_id` キーへ additive に残した。**外部クライアントへの影響**: `insights[].note_id` の値の意味が変わる（従来の生値が必要な場合は新設の `chunk_id` を参照すること）
+
 ### Added
 - **SQLite WAL 化**: shelf は長命 MCP サーバ(`shelf serve`)と別プロセスの CLI(`shelf index`/`shelf digest`)が同一 DB ファイルへ同時アクセスする構成のため、既定の rollback-journal では CLI の書き込みトランザクションがサーバの読み取りをブロックしていた（`busy_timeout` 頼みの待ち合わせのみ）。`Store.__init__` で `PRAGMA busy_timeout` の設定直後・スキーマ作成前に `PRAGMA journal_mode=WAL`・`PRAGMA synchronous=NORMAL` を発行し、reader/writer が互いをブロックしない WAL モードへ移行。journal_mode は DB ファイルに永続する属性のため、既存 DB も新コードで開くだけで自動的に WAL 化される（migration スクリプト不要）。読み取り専用ファイルシステムやネットワーク共有等で WAL が有効化できない場合や、これらの PRAGMA 発行自体が読み取り専用パーミッション・別接続との書き込みロック競合で `sqlite3.OperationalError` を送出する場合も、例外にせず warning ログへフェイルソフトし rollback-journal のまま起動を継続する（既存の FTS 劣化と同じ流儀）。次回 open 時に競合が解消していれば自動的に WAL 化される
   - **注意**: WAL モードでは DB ファイル本体に加えて `-wal`・`-shm` のサイドカーファイルが増える。DB を OneDrive 等のクラウド同期フォルダやネットワーク共有（SMB/NFS）に置いている場合、WAL が要求する共有メモリ・ロック機構が動作せず機能しないことがある（その場合は自動的に rollback-journal のままフェイルソフトする）。バックアップを取る際は `-wal`・`-shm` を含めたサイドカー込みでコピーするか、整合性の取れた単一ファイルを得られる `VACUUM INTO` を推奨する
