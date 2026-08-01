@@ -243,6 +243,52 @@ class TestLsCommand:
         assert args.notebook == "physics"
 
 
+class TestLsDispatch:
+    """ls コマンドの main() が引数の有無で service.list_notebooks() /
+    store.list_documents() のどちらへ到達するかを、_build_service/_build_store を
+    fake に差し替えて検証する(TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_without_notebook_calls_list_notebooks_via_build_service(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+
+        class _FakeService:
+            def list_notebooks(self):
+                calls.append("list_notebooks")
+                return [
+                    {
+                        "notebook": "nb", "description": None, "backend": "codex",
+                        "sources": 1, "chunks": 2,
+                    }
+                ]
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["ls"])
+
+        assert calls == ["list_notebooks"]
+        assert "nb" in capsys.readouterr().out
+
+    def test_with_notebook_calls_list_documents_via_build_store(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeStore:
+            def list_documents(self, notebook):
+                calls.append(notebook)
+                return [
+                    {"id": "doc1", "origin": "file.txt", "origin_type": "txt", "added_at": "now"}
+                ]
+
+        monkeypatch.setattr(cli, "_build_store", lambda: _FakeStore())
+
+        cli.main(["ls", "physics"])
+
+        assert calls == ["physics"]
+        assert "doc1" in capsys.readouterr().out
+
+
 class TestNewCommand:
     def test_parses_required_notebook_only(self):
         args = build_parser().parse_args(["new", "physics"])
@@ -266,6 +312,27 @@ class TestNewCommand:
         """ローカル LLM バックエンド追加（design doc §10-4）。"""
         args = build_parser().parse_args(["new", "physics", "--backend", "ollama"])
         assert args.backend == "ollama"
+
+
+class TestNewDispatch:
+    """new コマンドの main() が service.create_notebook へ description/backend を
+    正しく橋渡しすることを、_build_service を fake に差し替えて検証する
+    (TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_calls_create_notebook_with_description_and_backend(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeService:
+            def create_notebook(self, name, description=None, backend=None):
+                calls.append((name, description, backend))
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["new", "physics", "--desc", "物理の論文", "--backend", "gemini"])
+
+        assert calls == [("physics", "物理の論文", "gemini")]
+        assert "physics" in capsys.readouterr().out
 
 
 class TestAddCommand:
@@ -355,12 +422,56 @@ class TestIndexCommand:
         assert args.all is True
 
 
+class TestIndexDispatch:
+    """index コマンドの main() が service.index へ notebook/full を橋渡しし、結果を
+    _print_index_stats で出力することを、_build_service を fake に差し替えて検証する
+    (TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_calls_service_index_with_full_flag_and_prints_stats(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeService:
+            def index(self, notebook, full=False):
+                calls.append((notebook, full))
+                return IndexStats(indexed=1, skipped=0, pruned=0, chunks_written=3, errors=[])
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["index", "physics", "--all"])
+
+        assert calls == [("physics", True)]
+        assert "chunks_written=3" in capsys.readouterr().out
+
+
 class TestAskCommand:
     def test_parses_notebook_and_question(self):
         args = build_parser().parse_args(["ask", "physics", "何が書いてある?"])
         assert args.command == "ask"
         assert args.notebook == "physics"
         assert args.question == "何が書いてある?"
+
+
+class TestAskDispatch:
+    """ask コマンドの main() が service.ask へ notebook/question を橋渡しし、結果を
+    JSON で出力することを、_build_service を fake に差し替えて検証する
+    (TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_calls_service_ask_and_prints_json_result(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeService:
+            def ask(self, notebook, question):
+                calls.append((notebook, question))
+                return {"answer": "42", "citations": []}
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["ask", "physics", "何が書いてある?"])
+
+        assert calls == [("physics", "何が書いてある?")]
+        assert json.loads(capsys.readouterr().out) == {"answer": "42", "citations": []}
 
 
 class TestConsultCommand:
