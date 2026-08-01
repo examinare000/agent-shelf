@@ -535,8 +535,8 @@ def main(argv: list[str] | None = None) -> None:
         result = _build_service().shelve(args.directory, dry_run=args.dry_run)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "persona":
-        service = _build_service()
         if args.set_persona is not None:
+            service = _build_service()
             try:
                 service.set_persona(args.notebook, args.set_persona)
                 print(f"ペルソナを設定しました: {args.notebook}")
@@ -545,6 +545,7 @@ def main(argv: list[str] | None = None) -> None:
             except ValueError as e:
                 print(f"エラー: {e}")
         elif args.clear:
+            service = _build_service()
             try:
                 service.set_persona(args.notebook, None)
                 print(f"ペルソナをクリアしました: {args.notebook}")
