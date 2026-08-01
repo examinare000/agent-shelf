@@ -64,7 +64,11 @@ def build_codex_toml_text(*, transport: str, url: str | None, repo_root: Path) -
 def build_gemini_json_text(*, transport: str, url: str | None, repo_root: Path) -> str:
     """gemini `mcpServers` 設定断片を組み立てる。"""
     if transport == "http":
-        server: dict = {"url": url}
+        # Gemini CLI 公式ドキュメント（settings.json の mcpServers 仕様）では、
+        # streamable-http 接続は "httpUrl" キーで指定し、"url" キーは SSE
+        # transport 用と区別されている。ただし実機（実 Gemini CLI 起動）では
+        # 未検証のため、Gemini CLI のバージョンによっては挙動が異なる可能性がある。
+        server: dict = {"httpUrl": url}
     else:
         argv = build_stdio_argv(repo_root)
         server = {"command": argv[0], "args": argv[1:]}
