@@ -35,6 +35,23 @@ def _reconfigure_stdio_utf8() -> None:
             stream.reconfigure(encoding="utf-8")
 
 
+_ALL_INTERFACES_HOSTS = frozenset({"0.0.0.0", "::"})
+
+
+def _bind_warning(host: str) -> str | None:
+    """--host が全インターフェース bind を意味する値なら警告文を返す(純関数)。
+
+    0.0.0.0 / :: は VPN 境界を越えて LAN 全体・場合によっては外部からも
+    到達可能になり得るため、意図しない公開に気付けるよう警告する。
+    """
+    if host not in _ALL_INTERFACES_HOSTS:
+        return None
+    return (
+        "警告: 全インターフェースに bind します。VPN インターフェースの IP または "
+        "127.0.0.1 (IPv6 の場合は ::1) を推奨します"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="shelf", description="書籍・資料コーパスへの委譲QA")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -490,6 +507,9 @@ def main(argv: list[str] | None = None) -> None:
             if args.allowed_host:
                 allowed_hosts.extend(args.allowed_host)
             server.settings.transport_security = build_transport_security(allowed_hosts)
+            warning = _bind_warning(args.host)
+            if warning is not None:
+                print(warning, file=sys.stderr)
             server.run(transport="streamable-http")
         else:
             server.run()

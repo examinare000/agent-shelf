@@ -74,6 +74,41 @@ class TestServeCommand:
         assert args.allowed_host == ["avalon.tailxxxx.ts.net:8765", "otherhost:8765"]
 
 
+class TestBindWarning:
+    """--host が全インターフェース bind を意味する値のとき、意図しない公開を
+    避けるための警告メッセージを返す純関数(_bind_warning)を検証する。
+    """
+
+    def test_none_for_localhost(self):
+        assert cli._bind_warning("127.0.0.1") is None
+
+    def test_none_for_arbitrary_single_interface(self):
+        assert cli._bind_warning("100.64.0.1") is None
+
+    def test_warns_for_ipv4_all_interfaces(self):
+        warning = cli._bind_warning("0.0.0.0")
+        assert warning is not None
+        assert "全インターフェース" in warning
+
+    def test_warning_message_mentions_ipv6_loopback_alternative(self):
+        # IPv4 の 127.0.0.1 だけでなく IPv6 の ::1 にも触れ、IPv6 で bind
+        # している利用者にも推奨先が伝わるようにする。
+        warning = cli._bind_warning("0.0.0.0")
+        assert warning is not None
+        assert "::1" in warning
+
+    def test_warns_for_ipv6_all_interfaces(self):
+        warning = cli._bind_warning("::")
+        assert warning is not None
+        assert "全インターフェース" in warning
+
+    def test_none_for_ipv6_loopback(self):
+        assert cli._bind_warning("::1") is None
+
+    def test_none_for_ipv6_arbitrary_address(self):
+        assert cli._bind_warning("2001:db8::1") is None
+
+
 class TestLsCommand:
     def test_notebook_defaults_to_none(self):
         args = build_parser().parse_args(["ls"])
@@ -275,7 +310,9 @@ class TestServeDispatch:
     差し替え」作法の応用。実サーバ・実ソケットには一切触れない)。
     """
 
-    def test_default_dispatch_runs_stdio_without_touching_settings(self, monkeypatch):
+    def test_default_dispatch_runs_stdio_without_touching_settings(
+        self, monkeypatch, capsys
+    ):
         fake_server = _FakeMcpServer()
         monkeypatch.setattr(cli, "_build_service", lambda: object())
         monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
@@ -285,6 +322,9 @@ class TestServeDispatch:
         assert fake_server.run_calls == [None]
         assert fake_server.settings.host == "127.0.0.1"
         assert fake_server.settings.port == 8000
+        # stdio ディスパッチは bind 警告の対象外(--host は --http 時のみ使う)
+        # なので stderr には何も出ないはずである。
+        assert capsys.readouterr().err == ""
 
     def test_http_dispatch_sets_host_port_and_streamable_http_transport(
         self, monkeypatch
@@ -362,6 +402,28 @@ class TestServeDispatch:
             "http://100.113.69.62",
             "http://avalon.tailxxxx.ts.net:8765",
         ]
+
+    def test_http_dispatch_warns_on_stderr_when_binding_all_interfaces(
+        self, monkeypatch, capsys
+    ):
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+
+        cli.main(["serve", "--http", "--host", "0.0.0.0", "--port", "8765"])
+
+        assert "全インターフェース" in capsys.readouterr().err
+        # 警告があってもサーバ起動自体は妨げない
+        assert fake_server.run_calls == ["streamable-http"]
+
+    def test_http_dispatch_does_not_warn_for_localhost(self, monkeypatch, capsys):
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+
+        cli.main(["serve", "--http", "--host", "127.0.0.1", "--port", "8765"])
+
+        assert capsys.readouterr().err == ""
 
 
 class TestConsultDispatch:

@@ -76,12 +76,16 @@ class TestBuildGeminiJsonText:
         assert server["command"] == "uv"
         assert server["args"] == ["run", "--directory", str(tmp_path), "shelf", "serve"]
 
-    def test_http_produces_url_form(self, tmp_path):
+    def test_http_produces_http_url_form(self, tmp_path):
+        # Gemini CLI は "url" キーを SSE transport とみなすため、streamable-http
+        # では "httpUrl" キーでないと接続できない。
         text = emit_mcp.build_gemini_json_text(
             transport="http", url="http://127.0.0.1:8765/mcp", repo_root=tmp_path
         )
         data = json.loads(text)
-        assert data["mcpServers"]["shelf"]["url"] == "http://127.0.0.1:8765/mcp"
+        server = data["mcpServers"]["shelf"]
+        assert server["httpUrl"] == "http://127.0.0.1:8765/mcp"
+        assert "url" not in server
 
 
 class TestBuildReadmeText:

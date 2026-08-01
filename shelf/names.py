@@ -21,14 +21,29 @@ _NOTEBOOK_NAME_MAX_LEN = 64
 _NOTEBOOK_NAME_NON_ALLOWED = re.compile(r"[^a-z0-9_-]+")
 _DEFAULT_NOTEBOOK_NAME = "notebook"
 
+# notebook 名は corpus/ 配下のディレクトリ名にそのまま使われるため、Windows の
+# 予約デバイス名（大文字小文字不問・拡張子なしの完全一致で予約される）を許すと
+# ディレクトリ作成不能・誤動作につながる。
+_RESERVED_DEVICE_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+_RESERVED_NAME_SUFFIX = "-nb"
+
+
+def _is_reserved_device_name(name: str) -> bool:
+    return name.lower() in _RESERVED_DEVICE_NAMES
+
 
 def validate_notebook_name(name: str) -> str:
     """notebook 名が `[a-z0-9_-]+`・長さ1〜64であることを検証し、そのまま返す。
 
-    不正な場合は ValueError を送出する。エラーメッセージには入力値を含めてよいが、
-    ログ肥大やメッセージ汚染を防ぐため64字で切り詰める。
+    Windows 予約デバイス名（con/prn/aux/nul/com1-9/lpt1-9、大文字小文字不問）
+    も拒否する。不正な場合は ValueError を送出する。エラーメッセージには
+    入力値を含めてよいが、ログ肥大やメッセージ汚染を防ぐため64字で切り詰める。
     """
-    if _NOTEBOOK_NAME_PATTERN.match(name):
+    if _NOTEBOOK_NAME_PATTERN.match(name) and not _is_reserved_device_name(name):
         return name
     truncated = name[:_ERROR_MESSAGE_MAX_LEN]
     raise ValueError(f"不正な notebook 名です: {truncated!r}")
@@ -77,7 +92,22 @@ def normalize_notebook_name(raw: str) -> str:
     if not compressed:
         return _DEFAULT_NOTEBOOK_NAME
     truncated = compressed[:_NOTEBOOK_NAME_MAX_LEN].rstrip("-")
-    return truncated or _DEFAULT_NOTEBOOK_NAME
+    result = truncated or _DEFAULT_NOTEBOOK_NAME
+    return _remap_reserved_device_name(result)
+
+
+def _remap_reserved_device_name(name: str) -> str:
+    """Windows 予約デバイス名なら例外を投げず、サフィックスを付けて安全な名前へ
+    リマップする（validate_notebook_name を必ず通す構成上の契約を維持する）。
+
+    LLM 提案名の自動正規化（shelve の自動命名経路）は例外を投げず処理を
+    続行する必要があるため、validate 側の拒否とは対照的にリマップで対応する。
+    """
+    if not _is_reserved_device_name(name):
+        return name
+    max_base_len = _NOTEBOOK_NAME_MAX_LEN - len(_RESERVED_NAME_SUFFIX)
+    truncated_base = name[:max_base_len].rstrip("-")
+    return f"{truncated_base}{_RESERVED_NAME_SUFFIX}"
 
 
 def assign_unique_name(base: str, taken: Iterable[str]) -> str:
