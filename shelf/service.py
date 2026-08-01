@@ -46,6 +46,7 @@ from shelf.ports import (
     FileSummary,
     NotebookCard,
     RetrievedChunk,
+    RouteOutcome,
     RouteTarget,
     StudyNote,
 )
@@ -79,6 +80,16 @@ _SHELVE_SUMMARY_FALLBACK_EXCERPT_LEN = 500
 _SHELVE_DIGEST_RECOMMENDATION = (
     "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
 )
+
+# _build_catalog が NotebookCard.titles へ投影する文書タイトルの件数上限（タスク B7-1）。
+# tags と違い digest 実行なしでも常に存在する既存 DB 情報（documents.title）を使い、
+# 未 digest notebook のカタログ痩せを緩和する。件数を絞るのはプロンプト肥大防止
+# （司書ルーティングプロンプトは notebook 数 × カード情報量に比例して膨らむ）。
+_CATALOG_TITLE_LIMIT = 5
+
+# 投影する各タイトルの切り詰め長（タスク B7-1）。長大なタイトル1件がプロンプトを
+# 支配しないよう、代表資料の目安が伝わる程度の短さに抑える境界防御。
+_CATALOG_TITLE_MAX_LEN = 60
 
 
 @dataclass(frozen=True)
@@ -850,6 +861,14 @@ class ShelfService:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(markdown, encoding="utf-8")
 
+        # title は取込資料が持ち込む生メタデータであり、攻撃者が制御可能な入力
+        # （設計書 §7-A「backend へ送る全テキストは mask 済み」）。description/persona と
+        # 同じ流儀で永続化前に mask を通す（レビュー指摘 must#1: 未 mask のまま保存すると
+        # NotebookCard.titles 経由で司書ルーティングプロンプトへ恒常露出してしまう）。
+        masked_title = (
+            self._mask(title) if title is not None and self._mask is not None else title
+        )
+
         content_hash = _content_hash_of(markdown)
         now = datetime.now(UTC).isoformat()
         self._store.upsert_document(
@@ -860,7 +879,7 @@ class ShelfService:
             normalized_path=normalized_path,
             converter=converter,
             added_at=now,
-            title=title,
+            title=masked_title,
             content_hash=content_hash,
             fetched_at=now if is_url else None,
             description=description,
@@ -1220,7 +1239,9 @@ class ShelfService:
             root, summarize_backend
         )
 
-        catalog = self._build_catalog()
+        # shelving._format_card は titles を使わないため、titles 投影クエリを
+        # 発行させない（レビュー指摘 must#2）。
+        catalog = self._build_catalog(include_titles=False)
         plan = self._get_shelver().plan(summaries, catalog)
         errors = [*errors, *plan.errors]
 
@@ -1244,6 +1265,7 @@ class ShelfService:
                 ],
                 "skipped": skipped,
                 "errors": errors,
+                "notes": plan.notes,
             }
 
         for spec in plan.created:
@@ -1293,7 +1315,9 @@ class ShelfService:
             "skipped": skipped,
             "errors": errors,
             "chunks_written": chunks_written,
-            "notes": [_SHELVE_DIGEST_RECOMMENDATION],
+            # plan.notes（タスク B7-3: silent な notebook 名リマップの注記）を、
+            # 既存の digest 案内メッセージより先に並べる（発生順・分類段が先）。
+            "notes": [*plan.notes, _SHELVE_DIGEST_RECOMMENDATION],
         }
 
     # -- index -----------------------------------------------------------------
@@ -1313,13 +1337,20 @@ class ShelfService:
 
     # -- consult（司書ルーティング入口・設計書 §5-A/§6） -------------------------
 
-    def _build_catalog(self) -> list[NotebookCard]:
+    def _build_catalog(self, *, include_titles: bool = True) -> list[NotebookCard]:
         """Librarian.route() に渡す投影 DTO を store.list_notebooks() から組み立てる。
 
         Librarian は store を一切知らない（設計書 §3「カタログは service が組み立てて
         Librarian に渡す」）ため、この変換は service の責務。tags は
         store.list_tags_by_notebook() を1回だけ引いて notebook 名で引き当てる
-        （notebook 数ぶん個別クエリを発行しない・N+1 回避）。
+        （notebook 数ぶん個別クエリを発行しない・N+1 回避）。titles は tags と異なり
+        digest 未実行でも常に取得できる既存情報だが、store.list_document_titles は
+        notebook 単位の API のため notebook ごとに個別クエリになる（タスク B7-1:
+        LLM 追加呼び出しゼロの範囲でのコスト規律のため、DB read 側の N+1 は許容する）。
+
+        include_titles=False（shelve() 経由）では titles クエリ自体を発行しない
+        （レビュー指摘 must#2）: shelving._format_card は titles を使わないため、
+        shelve() の分類プロンプト経路で毎ファイルぶん無駄な DB read が発生していた。
         """
         tags_by_notebook = self._store.list_tags_by_notebook()
         return [
@@ -1329,9 +1360,33 @@ class ShelfService:
                 persona=row["persona"],
                 doc_count=row["documents"],
                 tags=tuple(tags_by_notebook.get(row["name"], ())),
+                titles=(
+                    self._project_notebook_titles(row["name"]) if include_titles else ()
+                ),
             )
             for row in self._store.list_notebooks()
         ]
+
+    def _project_notebook_titles(self, notebook: str) -> tuple[str, ...]:
+        """notebook の代表資料タイトルを、投入順（added_at 昇順）で先頭
+        _CATALOG_TITLE_LIMIT 件、_CATALOG_TITLE_MAX_LEN 字へ切り詰めて返す
+        （タスク B7-1）。
+
+        store.list_document_titles が「投入順・タイトルありのみ・SQL 側 LIMIT」を
+        保証する（レビュー指摘 must#2: id はスラグ+ハッシュでアルファベット順であり
+        投入順ではないため、投入順の並びは store 層の ORDER BY added_at に委ねる）。
+
+        mask は description/persona と同じく service 側の不変条件（設計書 §7-A）だが、
+        ここでも重ねて適用する（レビュー指摘 must#1(a)）: _persist_converted 側の
+        永続化時 mask（(b)）は新規行のみの恒久対処であり、それ以前に保存された
+        既存 DB 行はカバーできない。mask は冪等（正規表現置換は一度マッチした文字列に
+        再度マッチしない）ため、二重適用しても安全。
+        """
+        titles = self._store.list_document_titles(notebook, _CATALOG_TITLE_LIMIT)
+        return tuple(
+            (self._mask(title) if self._mask is not None else title)[:_CATALOG_TITLE_MAX_LEN]
+            for title in titles
+        )
 
     def _get_librarian(self) -> Librarian:
         """注入された Librarian があればそれを使い、無ければ backend_factory から
@@ -1365,10 +1420,13 @@ class ShelfService:
         catalog が空の場合は Librarian.route() 自体を呼ばずに短絡する（apply_fallback
         も同じ分岐で対象ゼロを返すが、catalog が空だと事前に分かっている以上、
         無駄な backend 呼び出しを避けるほうがレイテンシ・コスト面で望ましい）。
-        route() が空リストを返す理由（カタログ空／answerable=false／パース失敗／
-        backend失敗のいずれか）は routing.apply_fallback 内部で吸収され Librarian の
-        外からは区別できないため、ここでは一律「資料からは分からない」型の返却
-        （grounded=false・専門家を呼ばない）に倒す（部品からの申し送り事項）。
+        route() が空リストを返す理由は grounded=false（専門家を呼ばない）へ一律で
+        倒すが、warning 文言は RouteOutcome の診断情報（router_error/parse_ok）を
+        使って3通りに出し分ける（タスク B7-2・_consult_no_targets_warning 参照）:
+        (1) backend 呼び出し自体の失敗（router_error）、(2) 司書応答が JSON として
+        解釈できなかった解析失敗（parse_ok=False）、(3) 解析は成功したが
+        answerable=false、または targets 空で fallback=conservative という
+        「回答不能」寄りの経路。
         """
         catalog = self._build_catalog()
         if not catalog:
@@ -1382,11 +1440,7 @@ class ShelfService:
         librarian = self._get_librarian()
         outcome = librarian.route(question, catalog)
         if not outcome.targets:
-            warning = (
-                f"司書ルーティングの backend 呼び出しに失敗: {outcome.router_error}"
-                if outcome.router_error is not None
-                else "資料からは分からない"
-            )
+            warning = self._consult_no_targets_warning(outcome)
             return {
                 "question": question,
                 "answered": False,
@@ -1400,6 +1454,23 @@ class ShelfService:
             "routed": self._consult_targets(outcome.targets),
             "warning": None,
         }
+
+    def _consult_no_targets_warning(self, outcome: RouteOutcome) -> str:
+        """targets が空の consult() 応答に添える warning 文言を、原因ごとに出し分ける
+        （タスク B7-2）。優先順位は Librarian.route の診断情報の確度順:
+        1. router_error（backend 呼び出し自体の失敗・既存の文言のまま維持）。
+        2. parse_ok=False（司書応答が JSON として解釈できなかった「解析失敗」。
+           parse_routing は総崩れ時に answerable も強制的に False にするため
+           （routing.py 参照）、parse_ok を router_error の次に優先して判定しないと
+           「回答不能」と誤表示してしまう）。
+        3. それ以外（parse は成功したが answerable=false、または targets 空で
+           fallback=conservative）は総称して「回答不能」寄りの文言にする。
+        """
+        if outcome.router_error is not None:
+            return f"司書ルーティングの backend 呼び出しに失敗: {outcome.router_error}"
+        if not outcome.parse_ok:
+            return "ルーティング応答の解析に失敗しました"
+        return "資料からは分からないと判断しました"
 
     def _consult_targets(self, targets: list[RouteTarget]) -> list[dict]:
         """target ごとの専門家推論を実行し、ルーティング順のリストで返す（タスク A4）。

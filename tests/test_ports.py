@@ -102,6 +102,20 @@ class TestNotebookCard:
 
         assert card.tags == ("量子力学", "スピン")
 
+    def test_titles_defaults_to_empty_tuple(self):
+        """tags と同じ後方互換方針: 既存呼び出し箇所は titles を渡さない（additive 拡張）。"""
+        card = NotebookCard(name="nb", description=None, persona=None, doc_count=0)
+
+        assert card.titles == ()
+
+    def test_titles_can_be_set_explicitly(self):
+        card = NotebookCard(
+            name="nb", description=None, persona=None, doc_count=0,
+            titles=("量子力学入門", "スピンとは何か"),
+        )
+
+        assert card.titles == ("量子力学入門", "スピンとは何か")
+
 
 class TestRouteTarget:
     def test_constructs_with_notebook_score_subquery_reason(self):

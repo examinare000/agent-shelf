@@ -1025,6 +1025,39 @@ def test_add_source_applies_mask_before_writing_corpus_file(
     assert "<REDACTED>" in written
 
 
+# -- add_source: mask を title 永続化前にも適用（レビュー指摘 must#1: 未 mask のまま
+# documents.title へ保存され、NotebookCard.titles 経由で司書ルーティングプロンプトへ
+# 恒常露出していた） -------------------------------------------------------------
+
+
+def test_add_source_masks_title_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """title は取込資料の生メタデータ（攻撃者制御可能）であり、description/persona と
+    同じく永続化前に mask を通す（設計書 §7-A「backend へ送る全テキストは mask 済み」）。
+    """
+    store.create_notebook("nb", backend="codex")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("placeholder content, unused by fake converter", encoding="utf-8")
+    converter = _FakeConverter(markdown="# Doc\n\nbody\n", title=f"秘密資料 {secret}")
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path,
+        converter=converter, mask=fake_mask,
+    )
+
+    result = service.add_source("nb", str(source_file), auto_summary=False)
+
+    document = store.get_document(result["doc_id"])
+    assert document is not None
+    assert secret not in document["title"]
+    assert "<REDACTED>" in document["title"]
+
+
 # -- add_source: doc_id が notebook 依存になり、別 notebook への同一 origin 投入で
 # documents 行が移動しない（中位指摘#3） -----------------------------------------
 
@@ -2334,6 +2367,8 @@ def test_consult_returns_answered_false_when_no_notebooks_exist(
 def test_consult_returns_answered_false_when_librarian_finds_no_targets(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
+    """司書が有効な JSON をパースした上で answerable=false と判断した場合
+    （タスク B7-2）。「解析失敗」ではなく「回答不能」である旨を明示する。"""
     _seed_notebook(store, embedder, tmp_path, notebook="nb")
     backend = FakeAnswerBackend(canned=_routing_answer([], answerable=False))
     service = ShelfService(store, embedder, lambda name: backend, tmp_path)
@@ -2344,9 +2379,30 @@ def test_consult_returns_answered_false_when_librarian_finds_no_targets(
         "question": "何か質問",
         "answered": False,
         "routed": [],
-        "warning": "資料からは分からない",
+        "warning": "資料からは分からないと判断しました",
     }
     assert len(backend.calls) == 1  # ルーティングのみ呼ばれ、専門家推論は呼ばれない
+
+
+def test_consult_reports_parse_failure_warning_when_routing_response_is_malformed(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """司書応答が JSON として解釈できず、fallback も空（既定=conservative）の場合
+    （タスク B7-2）。answerable=false（回答不能）と文言を区別し、原因が解析失敗で
+    あることを利用者に伝える。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb")
+    backend = FakeAnswerBackend(canned="これはJSONではない壊れたテキスト")
+    service = ShelfService(store, embedder, lambda name: backend, tmp_path)
+
+    result = service.consult("何か質問")
+
+    assert result == {
+        "question": "何か質問",
+        "answered": False,
+        "routed": [],
+        "warning": "ルーティング応答の解析に失敗しました",
+    }
+    assert len(backend.calls) == 1
 
 
 def test_consult_routes_to_single_expert_and_aggregates_answer(
@@ -2426,6 +2482,149 @@ def test_consult_catalog_includes_notebook_tags_saved_by_digest(
     # store.list_tags_by_notebook は doc_count 降順・同数はタグ名昇順で返す
     # （同一doc上の2タグは doc_count 同点のためタグ名の Unicode 順）。
     assert set(catalog[0].tags) == {"量子力学", "スピン"}
+
+
+def _upsert_doc_with_title(
+    store: Store,
+    notebook: str,
+    doc_id: str,
+    title: str | None,
+    added_at: str = "2024-01-01T00:00:00+00:00",
+) -> None:
+    store.upsert_document(
+        id=doc_id, notebook=notebook, origin=f"{doc_id}.md", origin_type="md",
+        normalized_path=f"{notebook}/{doc_id}.md", converter="raw",
+        added_at=added_at, title=title,
+    )
+
+
+def test_consult_catalog_projects_up_to_5_document_titles_in_insertion_order(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """未 digest（tags 空）の notebook でも既存 DB 情報（文書タイトル）だけで
+    カタログを補い、ルーティング精度低下を緩和する（タスク B7-1）。上限 5 件は
+    プロンプト肥大防止のための境界防御で、6 件目以降は投影しない。
+
+    id（=doc_id_for が生成するスラグ+ハッシュ）は投入順とは無関係のアルファベット順
+    になるため（レビュー指摘 must#2）、id の辞書順とは逆順になる added_at を割り当てて
+    「投入順（added_at）で並ぶこと」を実質的に検証する（id 昇順で読むと誤って
+    タイトル6〜タイトル2 が返る＝本テストで検出できる）。
+    """
+    store.create_notebook("nb", backend="codex")
+    for i in range(1, 7):
+        _upsert_doc_with_title(
+            store, "nb", f"doc{7 - i}", f"タイトル{i}",
+            added_at=f"2024-01-0{i}T00:00:00+00:00",
+        )
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("タイトル1", "タイトル2", "タイトル3", "タイトル4", "タイトル5")
+
+
+def test_consult_catalog_truncates_titles_to_60_chars(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """長大なタイトルがプロンプトを肥大させないよう、投影時に60字へ切り詰める
+    （タスク B7-1）。"""
+    store.create_notebook("nb", backend="codex")
+    long_title = "あ" * 100
+    _upsert_doc_with_title(store, "nb", "doc1", long_title)
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("あ" * 60,)
+
+
+def test_consult_catalog_omits_documents_without_title(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    _upsert_doc_with_title(store, "nb", "doc1", None)
+    _upsert_doc_with_title(store, "nb", "doc2", "タイトル2")
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("タイトル2",)
+
+
+def test_consult_catalog_masks_titles_from_pre_existing_unmasked_rows(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """レビュー指摘 must#1(a): _project_notebook_titles 自体でも self._mask を適用し、
+    本修正以前に永続化された未 mask の既存 DB 行もカバーする（(b) の永続化時 mask は
+    新規行のみの恒久対処であり、既存行には遡及しないため）。"""
+    store.create_notebook("nb", backend="codex")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    _upsert_doc_with_title(store, "nb", "doc1", f"秘密資料 {secret}")
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        librarian=fake_librarian, mask=fake_mask,
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert secret not in catalog[0].titles[0]
+    assert "<REDACTED>" in catalog[0].titles[0]
+
+
+def test_shelve_does_not_query_document_titles(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """レビュー指摘 must#2: shelve() の分類プロンプト（shelving._format_card）は
+    titles を使わないため、shelve() 経路のカタログ構築では titles 投影クエリ自体を
+    発行しない（_build_catalog(include_titles=False)）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    store.create_notebook("physics", backend="codex")
+    _upsert_doc_with_title(store, "physics", "doc1", "物理タイトル")
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+    calls: list[str] = []
+    original = store.list_document_titles
+
+    def spy(notebook: str, limit: int) -> list[str]:
+        calls.append(notebook)
+        return original(notebook, limit)
+
+    store.list_document_titles = spy
+
+    service.shelve(str(root), dry_run=True)
+
+    assert calls == []
 
 
 def test_consult_degrades_gracefully_when_expert_backend_call_fails(
@@ -4165,6 +4364,94 @@ def test_shelve_converts_each_file_once_uses_summary_as_description_and_recommen
     assert result["notes"] == [
         "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
     ]
+
+
+def test_shelve_dry_run_surfaces_silent_notebook_name_remap_note(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """LLM が名前提案の指示を無視し、全角のみの notebook 名を提案した場合
+    （タスク B7-3）。既定名へサイレントにリマップされたことを dry-run の
+    計画結果にも可視化する。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned='{"action": "new", "notebook": "量子力学", "description": "d", "reason": "r"}'
+    )
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+
+    result = service.shelve(str(root), dry_run=True)
+
+    assert len(result["notes"]) == 1
+    assert "notebook" in result["notes"][0]
+
+
+def test_shelve_apply_surfaces_silent_notebook_name_remap_note_before_digest_recommendation(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned='{"action": "new", "notebook": "量子力学", "description": "d", "reason": "r"}'
+    )
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+
+    result = service.shelve(str(root), dry_run=False)
+
+    assert len(result["notes"]) == 2
+    assert "notebook" in result["notes"][0]
+    assert result["notes"][1] == (
+        "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
+    )
+
+
+def test_shelve_apply_masks_title_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """shelve() 経路（_prepare_shelve_candidates→_persist_converted）でも title は
+    mask を通す（レビュー指摘 must#1・add_source と同じ不変条件）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(
+        markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n",
+        title=f"秘密資料 {secret}",
+    )
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    result = service.shelve(str(root), dry_run=False)
+
+    document = store.get_document(result["added"][0]["doc_id"])
+    assert document is not None
+    assert secret not in document["title"]
+    assert "<REDACTED>" in document["title"]
 
 
 def test_consult_reports_router_error_when_librarian_backend_fails(store, embedder, tmp_path):

@@ -260,6 +260,76 @@ class TestDocumentCRUD:
 
         assert [d["id"] for d in docs] == ["doc1"]
 
+    def test_list_document_titles_orders_by_added_at_not_id(self, store):
+        """id (=doc_id_for のスラグ+ハッシュ) はアルファベット順であり投入順とは
+        無関係。added_at（投入時刻）順で返すことを、id の辞書順と added_at の投入順が
+        逆転するデータで検証する（レビュー指摘 must#2: レビュアーが実データで
+        id 昇順=投入順という誤前提の逆転を再現した）。"""
+        _make_notebook(store, name="physics")
+        _make_document(
+            store, id_="zebra-doc", notebook="physics", origin="a.pdf",
+            normalized_path="corpus/physics/zebra-doc.md",
+            added_at="2026-01-01T00:00:00Z", title="最初に投入",
+        )
+        _make_document(
+            store, id_="apple-doc", notebook="physics", origin="b.pdf",
+            normalized_path="corpus/physics/apple-doc.md",
+            added_at="2026-01-02T00:00:00Z", title="次に投入",
+        )
+
+        titles = store.list_document_titles("physics", limit=5)
+
+        assert titles == ["最初に投入", "次に投入"]
+
+    def test_list_document_titles_excludes_null_titles(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf",
+            normalized_path="corpus/physics/doc1.md", title=None,
+        )
+        _make_document(
+            store, id_="doc2", notebook="physics", origin="b.pdf",
+            normalized_path="corpus/physics/doc2.md", title="タイトルあり",
+        )
+
+        titles = store.list_document_titles("physics", limit=5)
+
+        assert titles == ["タイトルあり"]
+
+    def test_list_document_titles_respects_limit(self, store):
+        _make_notebook(store, name="physics")
+        for i in range(3):
+            _make_document(
+                store, id_=f"doc{i}", notebook="physics", origin=f"{i}.pdf",
+                normalized_path=f"corpus/physics/doc{i}.md",
+                added_at=f"2026-01-0{i + 1}T00:00:00Z", title=f"タイトル{i}",
+            )
+
+        titles = store.list_document_titles("physics", limit=2)
+
+        assert titles == ["タイトル0", "タイトル1"]
+
+    def test_list_document_titles_filters_by_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf",
+            normalized_path="corpus/physics/doc1.md", title="物理タイトル",
+        )
+        _make_document(
+            store, id_="doc2", notebook="math", origin="b.pdf",
+            normalized_path="corpus/math/doc2.md", title="数学タイトル",
+        )
+
+        titles = store.list_document_titles("physics", limit=5)
+
+        assert titles == ["物理タイトル"]
+
+    def test_list_document_titles_returns_empty_list_when_no_documents(self, store):
+        _make_notebook(store, name="physics")
+
+        assert store.list_document_titles("physics", limit=5) == []
+
     def test_delete_document_removes_its_chunks(self, store):
         _make_notebook(store, name="physics")
         _make_document(store, id_="doc1", notebook="physics")

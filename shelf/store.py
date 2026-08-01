@@ -778,6 +778,28 @@ class Store:
             ).fetchall()
             return [dict(row) for row in rows]
 
+    def list_document_titles(self, notebook: str, limit: int) -> list[str]:
+        """notebook の文書タイトルのうち、投入順（added_at 昇順・同時刻は id で決定的に
+        タイブレーク）で先頭 limit 件を返す（レビュー指摘 must#2）。
+
+        list_documents の `ORDER BY id` を「投入順」の代替として流用すると、
+        id は doc_id_for が生成するスラグ+ハッシュでありアルファベット順であって
+        投入順とは無関係（実データで逆転が再現された）。本メソッドは
+        NotebookCard.titles 投影専用に、SELECT title のみ・LIMIT を SQL 側で
+        適用し、list_documents の全カラム全件フェッチという N+1 の無駄を避ける。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT title FROM documents
+                WHERE notebook = ? AND title IS NOT NULL
+                ORDER BY added_at, id
+                LIMIT ?
+                """,
+                (notebook, limit),
+            ).fetchall()
+            return [row["title"] for row in rows]
+
     def find_documents_by_origin(self, origin: str) -> list[dict]:
         """origin（resolve 済み絶対パス文字列）で全 notebook を横断検索する。
 

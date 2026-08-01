@@ -110,6 +110,30 @@ class TestPlanHappyPathNewNotebook:
         assert result.created[0].backend == "codex"
 
 
+class TestPlanCollectsSilentRemapNotes:
+    """タスク B7-3: classify_step が検出した silent fallback の note を
+    ShelvePlan.notes へ集約し、利用者に可視化する。"""
+
+    def test_step_note_is_collected_into_plan_notes(self):
+        backend = FakeAnswerBackend(
+            canned='{"action": "new", "notebook": "物理学", "description": "d", "reason": "r"}'
+        )
+        shelver = Shelver(backend, workdir=Path("/corpus"), notebook_backend="ollama")
+
+        result = shelver.plan([_summary()], [])
+
+        assert len(result.notes) == 1
+        assert "notebook" in result.notes[0]
+
+    def test_no_note_when_no_fallback_occurs(self):
+        backend = FakeAnswerBackend(canned=_ASSIGN_PHYSICS)
+        shelver = Shelver(backend, workdir=Path("/corpus"), notebook_backend="ollama")
+
+        result = shelver.plan([_summary()], [_card()])
+
+        assert result.notes == []
+
+
 class TestPlanIncrementalCatalogThreading:
     """増分カタログスレッディングの証明（設計書 §13.9 done-criteria）。"""
 
