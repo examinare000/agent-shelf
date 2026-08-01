@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,36 @@ from shelf.prompts import ANSWER_SCHEMA, SUMMARY_SCHEMA
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
 from tests.fakes import FakeAnswerBackend, FakeEmbedder, FakeLibrarian
+
+
+def _symlink_creation_supported() -> bool:
+    """実行環境で symlink 作成が許可されているかをプローブする。
+
+    Windows は symlink 作成に管理者権限または開発者モードを要求するため、
+    OS 名ではなく実際の作成可否で判定する。これにより権限が付与された
+    Windows CI では通常どおりテストが実行され続け、権限がない環境だけが
+    skip される（「既定は cross-platform 化で skip を避ける」の例外として、
+    symlink 作成そのものを検証するテストには代替手段がないため）。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "target"
+        target.write_text("x")
+        link = Path(d) / "link"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            return False
+        return True
+
+
+requires_symlinks = pytest.mark.skipif(
+    not _symlink_creation_supported(),
+    reason=(
+        "symlink 作成に OS 権限が必要（Windows で管理者権限/開発者モードなしの場合は不可）。"
+        "既知のトレードオフ: GitHub-hosted windows-latest ランナーは既定で開発者モードが"
+        "無効なため、この4テストは通常そこで恒常的に skip される。"
+    ),
+)
 
 
 class _FakeConverter:
@@ -1088,6 +1119,7 @@ def test_add_source_dispatches_empty_directory_and_returns_error_dict(
     assert converter.file_calls == []
 
 
+@requires_symlinks
 def test_add_source_rejects_symlink_to_directory_without_dispatching(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -1111,6 +1143,7 @@ def test_add_source_rejects_symlink_to_directory_without_dispatching(
     assert converter.file_calls == []
 
 
+@requires_symlinks
 def test_add_source_rejects_symlink_origin(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -1213,6 +1246,7 @@ def test_add_directory_skips_unsupported_extension_without_calling_converter(
     assert converter.file_calls == [Path(str((root / "note.md").resolve()))]
 
 
+@requires_symlinks
 def test_add_directory_skips_symlinked_file_and_does_not_follow_symlinked_directory(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -3362,6 +3396,7 @@ def test_shelve_skips_origin_already_ingested_in_other_notebook(
     assert len(store.list_documents("physics")) == 1
 
 
+@requires_symlinks
 def test_shelve_scan_rules_skip_hidden_symlink_and_unsupported_files(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:

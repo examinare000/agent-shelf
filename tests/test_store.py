@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import numpy as np
@@ -2065,15 +2066,24 @@ class TestPathNormalization:
         finally:
             store3.close()
 
-    def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(self, tmp_path):
-        """POSIX 環境ではバックスラッシュが正当なファイル名として保留される"""
+    def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(
+        self, tmp_path, monkeypatch
+    ):
+        """POSIX 環境ではバックスラッシュが正当なファイル名として保留される
+
+        Store.__init__ は os.name の実値で分岐を決めるため、実行ホストが
+        Windows（実 os.name=="nt"）だと固定しない限りこの分岐（skip）を
+        検証できない。os.name を明示的に "posix" へ固定し、ホスト OS に
+        依らずこの分岐を確認する。
+        """
         db_path = tmp_path / "posix.db"
         store1 = Store(db_path)
         # POSIX では `\` はファイル名として合法的
         self._insert_legacy_chunk(store1, source_path="physics\\a.md")
         store1.close()
 
-        # POSIX 環境（os.name != "nt"）では正規化されないことを確認
+        # os.name を "posix" に固定し、Store.__init__ 内の正規化 skip 分岐を確認する
+        monkeypatch.setattr(os, "name", "posix")
         store2 = Store(db_path)
         try:
             chunk = store2.get_chunk("doc1#0")
