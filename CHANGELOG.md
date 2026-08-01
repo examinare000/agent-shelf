@@ -5,16 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.0] - 2026-08-02
 
-### Fixed
-- **ask/consult の insights[].note_id が chunks.id を誤って返していた**: `_build_insights` が本来 `study_notes.id`（`{notebook}/{doc_id}#d{n}` 形式・設計書 §217 の契約）を返すべき `note_id` に、索引用の `chunks.id`（`{notebook}/{doc_id}#{digest_seq}` 形式）をそのまま入れていた。`note_id` の値を `study_notes.id` 形式へ正規化し、従来の値（`chunks.id`）は応答互換のため新設の `chunk_id` キーへ additive に残した。**外部クライアントへの影響**: `insights[].note_id` の値の意味が変わる（従来の生値が必要な場合は新設の `chunk_id` を参照すること）
+Windows 実運用（ヘッドレス HTTP サーブ）へ向けたブラッシュアップリリース。
+並行性（async 化・consult 並行化・Store スレッド安全化・WAL）、Windows 対応（CI matrix・.cmd 起動・予約名）、
+運用性（doctor・/health・HTTP env 設定）、取込形式（EPUB/FB2/XPS）、ルーティング品質を横断的に強化した。
+
+### Security
+- **取込資料 title の未 mask 露出を修正**: `documents.title` が永続化時点から mask 未適用で、司書ルーティングプロンプトへ未 mask のまま露出し得た（従来は ingest 時の一回限りのプロンプトにしか出ず露出面が狭かったが、本リリースの代表資料カタログ投影で毎 consult へ恒常露出する経路になるところをレビューで検出）。永続化時と投影時の双方で mask を適用する二重防御とした。「backend へ送る全テキストは mask 済み」という不変条件は [ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md) 参照
+- **/health の公開情報を限定**: 死活監視用 `/health` エンドポイントは認証・Host 検査の外にあるため、応答は `status`/`version` のみに限定
+- **意図しない全インターフェース bind への警告**: `serve --host`（または env `SHELF_HTTP_HOST`）が `0.0.0.0`/`::` の場合に stderr へ警告を出力
+- **SECURITY.md に脅威モデル節を追加**: tailnet 信頼境界・認証なし・読み取り専用 MCP surface・取込時マスキングを明文化し、リモート公開可否を判断可能に
 
 ### Added
+- **EPUB/FB2/XPS 対応**: リフロー形式専用の変換経路を `pick_converter` に追加。リフロー形式のページ番号は再レイアウトの副産物で読者の手元の版と一致しないため、ページマーカーを挿入せず引用は見出しパンくず基準とする（[ADR-0001](docs/adr/0001-reflow-citation-heading-breadcrumbs.md)）。スキャン PDF 検出時のエラーには ocrmypdf 等での事前 OCR を促す案内を追記
+- **`shelf doctor` プリフライト診断**: ヘッドレス運用での環境不備を起動前に発見する読み取り専用診断サブコマンド（DB 未作成時は生成せず情報提供に留める）。診断結果を終了コードへ反映
+- **`/health` 死活監視エンドポイント**: HTTP サーブ時の外形監視用
+- **HTTP リスナー設定の環境変数対応**: `SHELF_HTTP_ENABLED`/`SHELF_HTTP_HOST`/`SHELF_HTTP_PORT`/`SHELF_ALLOWED_HOSTS` で `serve` の設定を env からも解決可能に（優先順位: フラグ > env > 既定）。`--stdio` 明示フラグを追加し、`SHELF_HTTP_ENABLED=true` 環境でも stdio を強制できる脱出口を確保。Windows サービス定義（Task Scheduler + ps1）との連携を薄くする
+- **ローカルファイル投入のサイズ上限**: `SHELF_MAX_FILE_MB`（既定 300MB）を追加。誤投入・暴走防止のため上限超過を拒否・スキップ（走査中のファイル削除レース等での stat() 失敗も安全に処理）
+- **Windows CI matrix**: 本番サーバが Windows のため CI に windows-latest を追加し実挙動を検証可能に。既存テストの POSIX 依存（os.name/chmod/symlink/バイナリパス）を排除
+- **司書ルーティングへの代表資料投影**: 未 digest notebook のルーティング精度低下を緩和するため、投入順の文書タイトルをカタログへ代表資料として投影（SQL 側 LIMIT で N+1 を回避、shelve 経路では発行しない）
+- **shelve 命名リマップの可視化**: LLM が命名指示を無視し既定名へサイレントにリマップされる経路を shelve 計画結果へ表示
+- **マスク規則の仕様固定テスト**: distill/extract.py のマスク規則 5 正規表現の現行挙動を positive/negative/冪等性/override 経路のテストで保護
+- **設計書 2 本を移入**: コード・テスト約 15 箇所の宙吊り §参照を解消するため、`docs/design-shelf-mcp.md`・`docs/design-shelf-reference-service.md` を personal リポジトリからスクラブして移入
+- **distill/SKILL.md**: extract.py が参照する未作成の SKILL.md を追加（使い方・出力先・state ファイル）
+- **e2e / dispatch テスト**: new→add→index→ask の一気通貫テストと ls/new/index/ask の main() dispatch テストを追加
 - **SQLite WAL 化**: shelf は長命 MCP サーバ(`shelf serve`)と別プロセスの CLI(`shelf index`/`shelf digest`)が同一 DB ファイルへ同時アクセスする構成のため、既定の rollback-journal では CLI の書き込みトランザクションがサーバの読み取りをブロックしていた（`busy_timeout` 頼みの待ち合わせのみ）。`Store.__init__` で `PRAGMA busy_timeout` の設定直後・スキーマ作成前に `PRAGMA journal_mode=WAL`・`PRAGMA synchronous=NORMAL` を発行し、reader/writer が互いをブロックしない WAL モードへ移行。journal_mode は DB ファイルに永続する属性のため、既存 DB も新コードで開くだけで自動的に WAL 化される（migration スクリプト不要）。読み取り専用ファイルシステムやネットワーク共有等で WAL が有効化できない場合や、これらの PRAGMA 発行自体が読み取り専用パーミッション・別接続との書き込みロック競合で `sqlite3.OperationalError` を送出する場合も、例外にせず warning ログへフェイルソフトし rollback-journal のまま起動を継続する（既存の FTS 劣化と同じ流儀）。次回 open 時に競合が解消していれば自動的に WAL 化される
   - **注意**: WAL モードでは DB ファイル本体に加えて `-wal`・`-shm` のサイドカーファイルが増える。DB を OneDrive 等のクラウド同期フォルダやネットワーク共有（SMB/NFS）に置いている場合、WAL が要求する共有メモリ・ロック機構が動作せず機能しないことがある（その場合は自動的に rollback-journal のままフェイルソフトする）。バックアップを取る際は `-wal`・`-shm` を含めたサイドカー込みでコピーするか、整合性の取れた単一ファイルを得られる `VACUUM INTO` を推奨する
 - **FTS ラッチの自己修復リトライ**: 別プロセスによる `chunks_fts` の DROP や MATCH 読み取り自体の一過性エラー等でキーワード索引が壊れ `fts_enabled=False` に落ちた場合、従来は長命サーバのプロセス再起動までハイブリッド検索を喪失していた。直前まで有効だった FTS が今回初めて壊れた場合に限り、劣化後最初の `keyword_topk` 呼び出しで `chunks_fts` を強制的に作り直して(DROP+全件バックフィル)1回だけ再試行するようにした。already_existed の判定に関わらず常に全件バックフィルするため、劣化中に upsert された行も復旧時に取りこぼさない。この再試行の実行中に発生した失敗（backfill 自体の失敗・成功直後に続けて実行される実クエリの失敗）は「直前まで健全だった」と誤認されず再アームされない（障害が持続的でも毎クエリ再試行にはならない）。毎クエリ再試行はコストのため予算は使い切りで、初回から fts5/trigram 非対応の環境など直前まで一度も有効化できていない場合は無駄なリトライを行わない
 - **content_hash 記録 + notebook 横断の内容重複検出**: `documents.content_hash` はスキーマ・`upsert_document` 双方で対応済みだったが `_ingest_file` が渡していなかったため常に NULL だった。変換後 markdown の sha256（`_content_hash_of`、digest の source_hash 計算と共有）を計算して記録し、`add_source`/`add_directory` の応答へ同一内容の既存資料を `duplicates: [{doc_id, notebook}]` として additive に警告表示する（空なら省略・既存の notes と同じ流儀）。UX は warn + 記録のみで skip はしない（同一書籍を複数の棚に意図的に置く運用は正当なため）。`Store.find_documents_by_content_hash` を新設（notebook を跨いだ全表検索。既存行の backfill は再 add で自然に埋まる。一括 backfill コマンドはスコープ外）
+
+### Changed
+- **MCP 3 ツール（ask/list_notebooks/consult）の async 化**: 単一の長時間リクエストがイベントループごと全クライアントをブロックしていた問題を解消。backend 呼び出しをワーカースレッド（上限 40）へ逃がし、他クライアントの応答性を維持。`anyio` を推移的依存から直接依存へ明示化（`abandon_on_cancel` 導入版 4.1 以上）。輻輳時挙動（ワーカースレッド上限とキャンセル時のスロット解放遅延）はタイムアウト契約に記載
+- **consult の expert 呼び出しを並行化**: `SHELF_ROUTE_TOP_N` 段の逐次レイテンシを縮めるため ThreadPoolExecutor で並行化し、共有 embedder は Lock で直列化。応答順序・per-target 劣化・例外伝播の意味論は維持
+- **Store のスレッド安全化**: MCP ツール非同期化に備え Store を RLock で公開メソッド単位に保護し、ShelfService の遅延構築（_get_librarian/_shelver 等）の check-then-set レースを解消。load_vectors の行列構築はロック外に置き、index 中の ask 直列化を回避
+- **consult warning の原因別分離**: 回答不能（資料からは分からない）と解析失敗（backend エラー・パース失敗）を利用者が区別できるよう warning 文言を分離
+- **README を実装と一致**: 検証規則で拒否されるクイックスタート例と実在しないエンジン記載を修正し、対応形式・全コマンド・リモート提供・環境変数の欠落を補完。多段ルーティングの推奨設定と並行化後の理論上の最悪壁時計も追記
+
+### Fixed
+- **persona 表示専用パスの embedder 構築ハング**: persona コマンドの表示専用パスが不要に実 embedder を構築し、モデル未キャッシュ環境で pytest 全体を恒久ハングさせていた。`_build_service` の呼び出しを set/clear 分岐内へ遅延
+- **Windows で npm 由来 .cmd シムの起動失敗**: CreateProcess が .cmd を解決できず consult backend の起動に失敗していたため、bare コマンド名に限り `shutil.which` で事前解決してから実行（相対パス+workdir の既存契約は維持）
+- **Windows timeout 時の孫プロセス孤児化**: .cmd 経由起動では timeout 時に cmd.exe のみ kill され node.exe 等の孫が孤児化していたため、Windows では `taskkill /T /F` でプロセスツリーごと kill
+- **Windows 予約デバイス名の notebook 名**: con/prn/aux/nul/com1-9/lpt1-9 はディレクトリ作成不能になるため、validate では拒否し shelve 自動命名では安全な名前へリマップ
+- **emit-mcp の Gemini 出力キー**: Gemini CLI が streamable-http 接続で `url` キーを SSE と誤認するため、gemini 出力を `httpUrl` キーに変更
+- **setup 対話フローのカスタム粒度入力が無視されるバグ**: 非数値・0 以下を拒否する検証付きで digest_max_notes/top_k を個別入力できるよう修正
+- **ask/consult の insights[].note_id が chunks.id を誤って返していた**: `_build_insights` が本来 `study_notes.id`（`{notebook}/{doc_id}#d{n}` 形式・設計書 §217 の契約）を返すべき `note_id` に、索引用の `chunks.id`（`{notebook}/{doc_id}#{digest_seq}` 形式）をそのまま入れていた。`note_id` の値を `study_notes.id` 形式へ正規化し、従来の値（`chunks.id`）は応答互換のため新設の `chunk_id` キーへ additive に残した。**外部クライアントへの影響**: `insights[].note_id` の値の意味が変わる（従来の生値が必要な場合は新設の `chunk_id` を参照すること）
 
 ### Migration Notes
 - **既存の予約名 notebook のロックアウト**: 本リリースで Windows 予約デバイス名
@@ -22,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   本修正の適用前にこれらの名前で notebook を作成済みの場合、ask/add/digest/persona などの
   操作は notebook 名検証で以後すべて弾かれ、データを直接救済する手段はない。対応が必要な場合は
   `shelf rm <予約名の notebook>` で削除したうえで、別名で資料を再投入すること。
+- **既存 DB の WAL 化は自動適用**: 新コードで DB を開くだけで journal_mode が WAL へ移行する（上記 Added 参照）。適用前に `VACUUM INTO` 等でバックアップを取ることを推奨。
+
+### Versioning Note
+- 本リポジトリ（OSS）と personal リポジトリ（v0.5.0）は独立採番。本リリースを personal へ還流する際は personal 側を 0.6.0 として適用することを推奨（還流ガイド: [docs/backport-0.5.0.md](docs/backport-0.5.0.md)）。
 
 ## [0.4.3] - 2026-07-25
 
