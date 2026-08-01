@@ -503,6 +503,26 @@ class TestPersonaDispatch:
         captured = capsys.readouterr().out
         assert "エラー" in captured
 
+    def test_display_only_path_does_not_build_service(self, monkeypatch, capsys):
+        """表示のみの分岐(--set/--clear なし)は store だけで完結すべきで、
+        実 FastEmbedEmbedder を構築する _build_service を呼んではいけない
+        (呼ぶとモデル未キャッシュ環境で実ネットワークダウンロードが走り、
+        テストが恒久ハングするバグの再発防止)。
+        """
+        store = Store(":memory:")
+        store.create_notebook("physics", description="物理")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+
+        def _fail_if_called():
+            raise AssertionError("_build_service は表示のみの分岐で呼ばれてはならない")
+
+        monkeypatch.setattr(cli, "_build_service", _fail_if_called)
+
+        cli.main(["persona", "physics"])
+
+        captured = capsys.readouterr().out
+        assert "未設定" in captured
+
 
 class TestRmDocNotebookMismatch:
     """rm --doc は doc_id をグローバル検索するため、positional の notebook と対象
