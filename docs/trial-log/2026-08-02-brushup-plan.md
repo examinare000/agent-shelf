@@ -61,3 +61,14 @@
 
 - **セキュリティ**（→ [ADR-0002](../adr/0002-masked-invariant-for-backend-text.md) へ昇格）: documents.title は永続化時点から mask 未適用だった（従来は ingest 時の一回限りのプロンプトにしか出ず露出面が狭かったため見過ごされていた）。titles のカタログ投影で毎 consult へ恒常露出する経路になるところをレビューが検出。教訓: 「新しい露出経路を作るとき、載せるデータの sanitize 履歴を遡って確認する」— 既存データが直感的に安全とは限らない
 - **順序前提の検証**: 「id 昇順=投入順」という直感的な前提が doc_id の実生成方式（スラグ+ハッシュ）で崩れていた。テストが単純 id を使ったため偶然 green。教訓: 順序に依存する機能のテストは、順序が逆転するデータで書く
+
+## 完了宣言の反証検証（adversarial-verifier、REJECT → 追修正）
+
+検出された実質的不足（追修正ラウンドで対応）:
+- test_doctor の chmod テストに Windows ガードなし → push 直後に windows-latest が赤くなることが実行前から判明（同リリース内の test_cli には同型ガードの先例あり — 掃引後に新規 POSIX 依存が入り CI 未実行のため検出されず）
+- serve 初回起動はモデル DL がリスナー bind より前に走り /health 無応答の窓がある。doctor の fastembed チェックは ok=True 固定 + docstring の DL タイミング記述が誤りで、この失敗を予告できない → docstring 修正 + README 文書化（根本対処の遅延ロードは還流後の課題として繰延）
+- SECURITY.md に既知の過少マスク欠陥が未記載（ADR/backport ガイドのみだった）→ 開示追記
+- v0.5.0 タグ未作成（過去リリースは全てタグ付き）→ 追修正マージ後に付与
+- push は外部公開操作のためユーザー判断に委ねる（未 push の間 Windows CI は実行されない — 引き継ぎ事項として明示）
+
+崩されなかった主張: 1260 green・ruff clean・全 Must/Should 実装の実在・CHANGELOG サンプル突合 5 件・WAL 自動移行の実測・README クイックスタートの動作。
