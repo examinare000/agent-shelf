@@ -2461,6 +2461,149 @@ def test_consult_catalog_includes_notebook_tags_saved_by_digest(
     assert set(catalog[0].tags) == {"量子力学", "スピン"}
 
 
+def _upsert_doc_with_title(
+    store: Store,
+    notebook: str,
+    doc_id: str,
+    title: str | None,
+    added_at: str = "2024-01-01T00:00:00+00:00",
+) -> None:
+    store.upsert_document(
+        id=doc_id, notebook=notebook, origin=f"{doc_id}.md", origin_type="md",
+        normalized_path=f"{notebook}/{doc_id}.md", converter="raw",
+        added_at=added_at, title=title,
+    )
+
+
+def test_consult_catalog_projects_up_to_5_document_titles_in_insertion_order(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """未 digest（tags 空）の notebook でも既存 DB 情報（文書タイトル）だけで
+    カタログを補い、ルーティング精度低下を緩和する（タスク B7-1）。上限 5 件は
+    プロンプト肥大防止のための境界防御で、6 件目以降は投影しない。
+
+    id（=doc_id_for が生成するスラグ+ハッシュ）は投入順とは無関係のアルファベット順
+    になるため（レビュー指摘 must#2）、id の辞書順とは逆順になる added_at を割り当てて
+    「投入順（added_at）で並ぶこと」を実質的に検証する（id 昇順で読むと誤って
+    タイトル6〜タイトル2 が返る＝本テストで検出できる）。
+    """
+    store.create_notebook("nb", backend="codex")
+    for i in range(1, 7):
+        _upsert_doc_with_title(
+            store, "nb", f"doc{7 - i}", f"タイトル{i}",
+            added_at=f"2024-01-0{i}T00:00:00+00:00",
+        )
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("タイトル1", "タイトル2", "タイトル3", "タイトル4", "タイトル5")
+
+
+def test_consult_catalog_truncates_titles_to_60_chars(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """長大なタイトルがプロンプトを肥大させないよう、投影時に60字へ切り詰める
+    （タスク B7-1）。"""
+    store.create_notebook("nb", backend="codex")
+    long_title = "あ" * 100
+    _upsert_doc_with_title(store, "nb", "doc1", long_title)
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("あ" * 60,)
+
+
+def test_consult_catalog_omits_documents_without_title(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    _upsert_doc_with_title(store, "nb", "doc1", None)
+    _upsert_doc_with_title(store, "nb", "doc2", "タイトル2")
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("タイトル2",)
+
+
+def test_consult_catalog_masks_titles_from_pre_existing_unmasked_rows(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """レビュー指摘 must#1(a): _project_notebook_titles 自体でも self._mask を適用し、
+    本修正以前に永続化された未 mask の既存 DB 行もカバーする（(b) の永続化時 mask は
+    新規行のみの恒久対処であり、既存行には遡及しないため）。"""
+    store.create_notebook("nb", backend="codex")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    _upsert_doc_with_title(store, "nb", "doc1", f"秘密資料 {secret}")
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        librarian=fake_librarian, mask=fake_mask,
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert secret not in catalog[0].titles[0]
+    assert "<REDACTED>" in catalog[0].titles[0]
+
+
+def test_shelve_does_not_query_document_titles(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """レビュー指摘 must#2: shelve() の分類プロンプト（shelving._format_card）は
+    titles を使わないため、shelve() 経路のカタログ構築では titles 投影クエリ自体を
+    発行しない（_build_catalog(include_titles=False)）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    store.create_notebook("physics", backend="codex")
+    _upsert_doc_with_title(store, "physics", "doc1", "物理タイトル")
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+    calls: list[str] = []
+    original = store.list_document_titles
+
+    def spy(notebook: str, limit: int) -> list[str]:
+        calls.append(notebook)
+        return original(notebook, limit)
+
+    store.list_document_titles = spy
+
+    service.shelve(str(root), dry_run=True)
+
+    assert calls == []
+
+
 def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:

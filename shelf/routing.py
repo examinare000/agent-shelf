@@ -75,6 +75,8 @@ def _format_card(card: NotebookCard) -> str:
         meta.append(f"専門家像: {card.persona}")
     if card.tags:
         meta.append(f"タグ: {', '.join(card.tags)}")
+    if card.titles:
+        meta.append(f"代表資料: {', '.join(card.titles)}")
     return "\n".join(meta)
 
 

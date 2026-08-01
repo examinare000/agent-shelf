@@ -67,6 +67,10 @@ class NotebookCard:
     # 既定値を付けることで、tags を知らない既存呼び出し箇所（_build_catalog 等）を
     # 壊さずに追加する（他 DTO の additive 拡張と同じ後方互換方針）。
     tags: tuple[str, ...] = ()
+    # 未 digest の notebook はタグが空でカタログが痩せてルーティング精度が落ちるため、
+    # digest 抜きでも既存 DB 情報（文書タイトル）だけでカードを補う投影（タスク B7-1）。
+    # tags と同じ後方互換方針で既定値を空タプルにする。
+    titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

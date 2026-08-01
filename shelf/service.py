@@ -80,6 +80,16 @@ _SHELVE_DIGEST_RECOMMENDATION = (
     "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
 )
 
+# _build_catalog が NotebookCard.titles へ投影する文書タイトルの件数上限（タスク B7-1）。
+# tags と違い digest 実行なしでも常に存在する既存 DB 情報（documents.title）を使い、
+# 未 digest notebook のカタログ痩せを緩和する。件数を絞るのはプロンプト肥大防止
+# （司書ルーティングプロンプトは notebook 数 × カード情報量に比例して膨らむ）。
+_CATALOG_TITLE_LIMIT = 5
+
+# 投影する各タイトルの切り詰め長（タスク B7-1）。長大なタイトル1件がプロンプトを
+# 支配しないよう、代表資料の目安が伝わる程度の短さに抑える境界防御。
+_CATALOG_TITLE_MAX_LEN = 60
+
 
 @dataclass(frozen=True)
 class IngestResult:
@@ -1228,7 +1238,9 @@ class ShelfService:
             root, summarize_backend
         )
 
-        catalog = self._build_catalog()
+        # shelving._format_card は titles を使わないため、titles 投影クエリを
+        # 発行させない（レビュー指摘 must#2）。
+        catalog = self._build_catalog(include_titles=False)
         plan = self._get_shelver().plan(summaries, catalog)
         errors = [*errors, *plan.errors]
 
@@ -1321,13 +1333,20 @@ class ShelfService:
 
     # -- consult（司書ルーティング入口・設計書 §5-A/§6） -------------------------
 
-    def _build_catalog(self) -> list[NotebookCard]:
+    def _build_catalog(self, *, include_titles: bool = True) -> list[NotebookCard]:
         """Librarian.route() に渡す投影 DTO を store.list_notebooks() から組み立てる。
 
         Librarian は store を一切知らない（設計書 §3「カタログは service が組み立てて
         Librarian に渡す」）ため、この変換は service の責務。tags は
         store.list_tags_by_notebook() を1回だけ引いて notebook 名で引き当てる
-        （notebook 数ぶん個別クエリを発行しない・N+1 回避）。
+        （notebook 数ぶん個別クエリを発行しない・N+1 回避）。titles は tags と異なり
+        digest 未実行でも常に取得できる既存情報だが、store.list_document_titles は
+        notebook 単位の API のため notebook ごとに個別クエリになる（タスク B7-1:
+        LLM 追加呼び出しゼロの範囲でのコスト規律のため、DB read 側の N+1 は許容する）。
+
+        include_titles=False（shelve() 経由）では titles クエリ自体を発行しない
+        （レビュー指摘 must#2）: shelving._format_card は titles を使わないため、
+        shelve() の分類プロンプト経路で毎ファイルぶん無駄な DB read が発生していた。
         """
         tags_by_notebook = self._store.list_tags_by_notebook()
         return [
@@ -1337,9 +1356,33 @@ class ShelfService:
                 persona=row["persona"],
                 doc_count=row["documents"],
                 tags=tuple(tags_by_notebook.get(row["name"], ())),
+                titles=(
+                    self._project_notebook_titles(row["name"]) if include_titles else ()
+                ),
             )
             for row in self._store.list_notebooks()
         ]
+
+    def _project_notebook_titles(self, notebook: str) -> tuple[str, ...]:
+        """notebook の代表資料タイトルを、投入順（added_at 昇順）で先頭
+        _CATALOG_TITLE_LIMIT 件、_CATALOG_TITLE_MAX_LEN 字へ切り詰めて返す
+        （タスク B7-1）。
+
+        store.list_document_titles が「投入順・タイトルありのみ・SQL 側 LIMIT」を
+        保証する（レビュー指摘 must#2: id はスラグ+ハッシュでアルファベット順であり
+        投入順ではないため、投入順の並びは store 層の ORDER BY added_at に委ねる）。
+
+        mask は description/persona と同じく service 側の不変条件（設計書 §7-A）だが、
+        ここでも重ねて適用する（レビュー指摘 must#1(a)）: _persist_converted 側の
+        永続化時 mask（(b)）は新規行のみの恒久対処であり、それ以前に保存された
+        既存 DB 行はカバーできない。mask は冪等（正規表現置換は一度マッチした文字列に
+        再度マッチしない）ため、二重適用しても安全。
+        """
+        titles = self._store.list_document_titles(notebook, _CATALOG_TITLE_LIMIT)
+        return tuple(
+            (self._mask(title) if self._mask is not None else title)[:_CATALOG_TITLE_MAX_LEN]
+            for title in titles
+        )
 
     def _get_librarian(self) -> Librarian:
         """注入された Librarian があればそれを使い、無ければ backend_factory から
