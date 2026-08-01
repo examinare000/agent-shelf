@@ -7,6 +7,8 @@ runner.py のテスト: subprocess 実行の一本化。
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -154,6 +156,98 @@ class TestRunCommandReturnType:
         result = run_command(["/bin/echo", "test"])
         with pytest.raises(AttributeError):
             result.stdout = "modified"
+
+
+class TestRunCommandWhichResolution:
+    """Windows の CreateProcess は codex.cmd 等の PATHEXT 拡張子を解決できないため、
+    shutil.which（PATHEXT を見る）で事前解決してから Popen に渡す必要がある
+    （setup.py の is_command_available との検出結果の矛盾を解消する）。
+    """
+
+    def test_resolves_command_via_which_before_popen(self, monkeypatch):
+        """cmd[0] が shutil.which で解決されたパスで Popen が呼ばれる。"""
+        resolved_path = "/usr/bin/resolved-echo"
+        monkeypatch.setattr(shutil, "which", lambda name: resolved_path)
+
+        captured_cmd: list[str] = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return "", ""
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return _FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        run_command(["echo", "hello"])
+
+        assert captured_cmd[0] == resolved_path
+        assert captured_cmd[1:] == ["hello"]
+
+    def test_missing_command_short_circuits_without_calling_popen(self, monkeypatch):
+        """which が None を返したら Popen を呼ばず rc=127 を即返す。"""
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+
+        def fail_popen(*args, **kwargs):
+            raise AssertionError("Popen should not be called when which() returns None")
+
+        monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+        result = run_command(["definitely-not-a-real-command"])
+
+        assert result.returncode == 127
+        assert "command not found: definitely-not-a-real-command" in result.stderr
+        assert result.timed_out is False
+
+    def test_which_is_not_called_when_cmd_contains_path_separator(self, monkeypatch):
+        """cmd[0] にパス区切りを含む場合は shutil.which を呼ばない（回帰防止）。
+
+        shutil.which は親プロセスの cwd 基準で解決するため、run_command 側で
+        which に通してしまうと workdir 配下の相対パスコマンドが誤って
+        rc=127 になる（レビュー実機再現: run_command(["./script.sh"], workdir=...)）。
+        さらに親 cwd にある同名ファイルへ静かにすり替わるリスクもある。
+        """
+        which_calls: list[str] = []
+        monkeypatch.setattr(
+            shutil, "which", lambda name: which_calls.append(name) or "/should/not/be/used"
+        )
+
+        run_command(["/bin/echo", "hi"])
+
+        assert which_calls == []
+
+    def test_relative_path_command_skips_which_and_uses_workdir(self, tmp_path):
+        """workdir 配下の相対パススクリプトが which 追加後も引き続き実行できる（回帰テスト）。"""
+        script = tmp_path / "script.sh"
+        script.write_text("#!/bin/sh\necho relative-ok\n")
+        script.chmod(0o755)
+
+        result = run_command(["./script.sh"], workdir=tmp_path)
+
+        assert result.stdout.strip() == "relative-ok"
+        assert result.returncode == 0
+
+    def test_file_not_found_error_reports_original_name_not_resolved_path(self, monkeypatch):
+        """TOCTOU（which 解決後に Popen が FileNotFoundError を投げる）でも、
+        stderr には元のコマンド名を残し、解決済み絶対パスを漏らさない。
+        """
+        resolved_path = "/usr/bin/toctou-victim"
+        monkeypatch.setattr(shutil, "which", lambda name: resolved_path)
+
+        def fake_popen(cmd, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        result = run_command(["toctou-victim"])
+
+        assert result.returncode == 127
+        assert "toctou-victim" in result.stderr
+        assert resolved_path not in result.stderr
 
 
 class TestWindowsTimeoutFallback:

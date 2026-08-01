@@ -7,6 +7,7 @@ timeout + killpg + TemporaryDirectory で安全・確実なコマンド実行を
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 from dataclasses import dataclass
@@ -64,7 +65,30 @@ def run_command(
         - start_new_session=True で新しいプロセスグループを作成し、
           TimeoutExpired 時に os.killpg で子プロセスを確実に殺す。
         - すべての例外を catch して安全な RunResult に変換する。
+        - cmd[0] がパス区切りを含まない bare なコマンド名の場合のみ、事前に
+          shutil.which で解決してから Popen に渡す。Windows の CreateProcess は
+          npm がインストールする codex.cmd 等の PATHEXT 拡張子を解決できず
+          FileNotFoundError になる一方、setup.py の is_command_available は
+          shutil.which（PATHEXT を見る）で「検出済み」と判定するため、判定と
+          実行の矛盾が起きていた（実証: 設計指示のバグ報告）。cmd[0] が相対・絶対
+          パスの場合は which をスキップする: shutil.which は「親プロセスの cwd」
+          基準で解決するため、which を通すと run_command(["./script.sh"],
+          workdir=...) のような workdir 配下の相対パス実行が rc=127 に回帰する
+          （レビューで実機再現）。加えて親 cwd の同名ファイルへ静かにすり替わる
+          リスクもあるため、パスが明示された呼び出しは常に無変更で Popen に渡す。
     """
+    original_name = cmd[0] if cmd else "command"
+    if cmd and os.path.dirname(cmd[0]) == "":
+        resolved = shutil.which(cmd[0])
+        if resolved is None:
+            return RunResult(
+                stdout="",
+                stderr=f"command not found: {original_name}",
+                returncode=127,
+                timed_out=False,
+            )
+        cmd = [resolved, *cmd[1:]]
+
     try:
         # start_new_session=True: codex など子プロセスを張る CLI を対象。
         proc = subprocess.Popen(
@@ -123,11 +147,13 @@ def run_command(
                 timed_out=True,
             )
     except FileNotFoundError:
-        # コマンドが見つからない（シェルなし直接実行）
-        cmd_name = cmd[0] if cmd else "command"
+        # コマンドが見つからない（シェルなし直接実行）。cmd[0] は which 解決後の
+        # 絶対パスに書き換わっている可能性があるため、TOCTOU（解決直後にファイルが
+        # 消える等）で到達した場合でも解決前の original_name を報告する
+        # （レビュー指摘: 解決済みパスをエラーメッセージに漏らさない）。
         return RunResult(
             stdout="",
-            stderr=f"command not found: {cmd_name}",
+            stderr=f"command not found: {original_name}",
             returncode=127,
             timed_out=False,
         )
