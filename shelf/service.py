@@ -16,6 +16,7 @@ import hashlib
 import logging
 import threading
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -301,6 +302,14 @@ class ShelfService:
         # is None）と set（self._librarian = ...）の間に別スレッドが割り込んで
         # backend_factory を二重に呼ぶ・Librarian を二重構築するレースを防ぐ。
         self._librarian_lock = threading.Lock()
+        # self._embedder は単一の共有インスタンス（実装は FastEmbedEmbedder=
+        # onnxruntime InferenceSession + HF tokenizer）で、consult() のタスク A4
+        # 並行化により複数ワーカースレッドから同時に embed_query() が呼ばれうる。
+        # onnxruntime/tokenizer 側の並行呼び出し安全性を一次情報で確認できていない
+        # ため、「安全なはず」に賭けず service 側でクエリ埋め込みを直列化する
+        # （embed_query 1回はミリ秒オーダーで直列化コストは無視できる一方、
+        # 未検証の並行実行は ONNX セッション破損等の再現困難なバグに繋がりうる）。
+        self._embed_lock = threading.Lock()
         # shelve() 専用の推論バックエンド名（config.SHELVE_BACKEND 由来・既定 "ollama"）。
         # service.py は config を import しない既存流儀（default_backend と同じ）に
         # 揃え、呼び出し側（cli.py。V8 の担当）が明示的に値を渡す前提のコンストラクタ
@@ -392,7 +401,11 @@ class ShelfService:
                 warning="notebook has no indexed sources",
             )
 
-        query_vec = self._embedder.embed_query(question)
+        # 共有 embedder（実装は onnxruntime + tokenizer）を並行呼び出しから守るため
+        # 直列化する（__init__ の self._embed_lock docstring 参照。クエリ埋め込み
+        # 1回はミリ秒オーダーで直列化コストは無視できる）。
+        with self._embed_lock:
+            query_vec = self._embedder.embed_query(question)
         merged_ids, hybrid_active = self._retrieve_ids(notebook, question, ids, matrix, query_vec)
         chunks = self._load_chunks(merged_ids)
         if hybrid_active:
@@ -1357,9 +1370,34 @@ class ShelfService:
         return {
             "question": question,
             "answered": True,
-            "routed": [self._consult_target(target) for target in outcome.targets],
+            "routed": self._consult_targets(outcome.targets),
             "warning": None,
         }
+
+    def _consult_targets(self, targets: list[RouteTarget]) -> list[dict]:
+        """target ごとの専門家推論を実行し、ルーティング順のリストで返す（タスク A4）。
+
+        各 target は独立（別 notebook・別 backend 呼び出し=サブプロセス/HTTP）であり、
+        Store はスレッド安全化済み（RLock は短時間の DB 操作のみを保護し、LLM 呼び出しは
+        ロック外）なので、2 件以上なら ThreadPoolExecutor で並行実行して SHELF_ROUTE_TOP_N
+        段の直列レイテンシ（最悪 300s×2）を max() へ縮める。1 件以下は executor 生成の
+        オーバーヘッドを避けるため従来どおり直接呼び出す（挙動・意味論を完全に保存）。
+
+        executor.map はイテラブルの順序を完了順ではなく投入順で返す（内部で
+        futures をリスト順に result() する）ため、結果はルーティング順のまま保たれる。
+        例外はそのイテレーション時に result() 経由で再送出され、list() 内で consult()
+        の呼び出し元まで素通しに伝播する（既存の「try/except を挟まない」意味論を維持）。
+
+        トレードオフ: 先頭 target が生例外を投げた場合でも、まだ実行中の後続 target は
+        cancel 不能（既に走り始めた ThreadPoolExecutor のワーカーは中断できない）で、
+        with ブロック終了時の shutdown(wait=True) がその完了を待ってから例外が
+        呼び出し元へ伝播する。逐次実装なら後続 target はそもそも開始されないため、
+        並行化によりこの経路の最悪待ち時間が増える（最悪 300s）。
+        """
+        if len(targets) <= 1:
+            return [self._consult_target(target) for target in targets]
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            return list(executor.map(self._consult_target, targets))
 
     def _consult_target(self, target: RouteTarget) -> dict:
         """ルーティング対象 1 件に対して専門家推論を実行し、透明性情報と集約する。
