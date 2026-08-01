@@ -16,6 +16,7 @@ Windows 実運用（ヘッドレス HTTP サーブ）へ向けたブラッシュ
 - **/health の公開情報を限定**: 死活監視用 `/health` エンドポイントは認証・Host 検査の外にあるため、応答は `status`/`version` のみに限定
 - **意図しない全インターフェース bind への警告**: `serve --host`（または env `SHELF_HTTP_HOST`）が `0.0.0.0`/`::` の場合に stderr へ警告を出力
 - **SECURITY.md に脅威モデル節を追加**: tailnet 信頼境界・認証なし・読み取り専用 MCP surface・取込時マスキングを明文化し、リモート公開可否を判断可能に
+- **既知の制限（未修正）**: マスク規則のうち password/secret/token 系の値キャプチャが空白を含まないため、クォート付き複数語の値は先頭 1 トークンのみマスクされる過少マスクの余地がある。正本 `distill/extract.py` は agent-recall と共有のため修正は同期方針決定待ち（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）
 
 ### Added
 - **EPUB/FB2/XPS 対応**: リフロー形式専用の変換経路を `pick_converter` に追加。リフロー形式のページ番号は再レイアウトの副産物で読者の手元の版と一致しないため、ページマーカーを挿入せず引用は見出しパンくず基準とする（[ADR-0001](docs/adr/0001-reflow-citation-heading-breadcrumbs.md)）。スキャン PDF 検出時のエラーには ocrmypdf 等での事前 OCR を促す案内を追記

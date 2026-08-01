@@ -11,7 +11,10 @@ close する（未作成パスに対して Store を構築し新規スキーマ�
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
+
+import pytest
 
 from shelf.doctor import (
     CheckResult,
@@ -101,6 +104,10 @@ class TestCheckDbParentDir:
 
         assert result.ok is True
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="chmod 0o500 は Windows のディレクトリ書込み可否に影響しないため無効",
+    )
     def test_ok_false_when_nearest_existing_ancestor_is_not_writable(self, tmp_path):
         readonly_dir = tmp_path / "readonly"
         readonly_dir.mkdir()
@@ -278,6 +285,19 @@ class TestCheckFastembedCache:
 
         assert result.ok is True
         assert "未作成" in result.detail or "見つかりません" in result.detail
+
+    def test_missing_dir_detail_warns_serve_blocks_until_model_download(self, tmp_path):
+        """DL は「初回 embed 実行時」ではなく FastEmbedEmbedder のコンストラクタ
+        （= serve がリスナーを bind する前）で走る（実装確認済み）ため、未キャッシュ
+        時に serve が応答しなくなる旨を detail で警告する（要件2）。
+        """
+        cache_dir = tmp_path / "not-yet"
+
+        result = check_fastembed_cache(cache_dir)
+
+        assert "serve" in result.detail
+        assert "DL" in result.detail
+        assert "応答し" in result.detail
 
 
 class TestRunChecks:

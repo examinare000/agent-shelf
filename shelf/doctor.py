@@ -166,15 +166,23 @@ def resolve_fastembed_cache_dir() -> Path:
 def check_fastembed_cache(cache_dir: str | Path) -> CheckResult:
     """fastembed キャッシュディレクトリの存在有無を報告する（情報提供のみ）。
 
-    未作成でも初回起動時は正常な状態（初回 embed 実行時に自動作成・DL される）
-    であり、モデルロード自体はここでは行わないためドクター診断としては ok=True
-    に固定する（config_env と同じ「存在有無を知らせるが失敗にはしない」方針）。
+    未作成でも初回起動時は正常な状態であり、モデルロード自体はここでは行わない
+    ためドクター診断としては ok=True に固定する（config_env と同じ「存在有無を
+    知らせるが失敗にはしない」方針）。ただし DL のタイミングは「初回 embed
+    実行時」ではなく FastEmbedEmbedder のコンストラクタ（= `shelf serve` が
+    リスナーを bind する前）であるため、未キャッシュ状態は serve の初回起動が
+    モデル DL 完了までブロックされることを意味する。detail でその旨を注意喚起
+    する（0.5.0 完了検証で判明した事実誤認の修正）。
     """
     exists = Path(cache_dir).is_dir()
     detail = (
         f"fastembed キャッシュが見つかりました: {cache_dir}"
         if exists
-        else f"fastembed キャッシュはまだ未作成です(初回embed時に自動作成): {cache_dir}"
+        else (
+            f"fastembed キャッシュはまだ未作成です(初回起動時に自動作成): {cache_dir}"
+            "。注意: モデル未キャッシュの場合、serve は初回起動時にモデル DL が"
+            "完了するまでリスナーが応答しません。"
+        )
     )
     return CheckResult(name="fastembed_cache", ok=True, detail=detail)
 
