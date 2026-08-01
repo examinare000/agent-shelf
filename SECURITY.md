@@ -7,6 +7,16 @@
 - **MCP surface は読み取り 3 ツールのみ**: `ask` / `list_notebooks` / `consult`。notebook 作成・資料投入・削除などコーパスを変更する操作は CLI（人間操作）に限定し、MCP には公開していません。
 - **シークレットマスキングは取込時に適用**: 資料は corpus への永続化前に `mask()` を通します。マスク規則の正本は `distill/extract.py`（`SHELF_EXTRACT_PY` で差し替え可能。`shelf/masking.py` が importlib で読み込む単一ソース方式）。
 
+### 既知の制限
+
+- **マスク規則の過少マスク（password/secret/token 系）**: 汎用の password/secret/token
+  検出 regex は値キャプチャが空白を含まない設計のため、クォートで囲まれた複数語の
+  値（例 `password: "correct horse battery staple"`）は先頭 1 トークンのみがマスクされ、
+  残りの単語が corpus に平文で残ります。マスク規則の正本 `distill/extract.py` は
+  agent-recall と共有しているため、修正はそちらとの同期方針決定待ちです。詳細は
+  [docs/adr/0002-masked-invariant-for-backend-text.md](docs/adr/0002-masked-invariant-for-backend-text.md)
+  を参照してください。
+
 ## 脆弱性、および悪意のあるコード・プロンプト指示の混入の報告
 
 agent-shelf で脆弱性、および悪意のあるコード・プロンプト指示の混入を発見した場合は、
