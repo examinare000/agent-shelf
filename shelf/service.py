@@ -1420,10 +1420,13 @@ class ShelfService:
         catalog が空の場合は Librarian.route() 自体を呼ばずに短絡する（apply_fallback
         も同じ分岐で対象ゼロを返すが、catalog が空だと事前に分かっている以上、
         無駄な backend 呼び出しを避けるほうがレイテンシ・コスト面で望ましい）。
-        route() が空リストを返す理由（カタログ空／answerable=false／パース失敗／
-        backend失敗のいずれか）は routing.apply_fallback 内部で吸収され Librarian の
-        外からは区別できないため、ここでは一律「資料からは分からない」型の返却
-        （grounded=false・専門家を呼ばない）に倒す（部品からの申し送り事項）。
+        route() が空リストを返す理由は grounded=false（専門家を呼ばない）へ一律で
+        倒すが、warning 文言は RouteOutcome の診断情報（router_error/parse_ok）を
+        使って3通りに出し分ける（タスク B7-2・_consult_no_targets_warning 参照）:
+        (1) backend 呼び出し自体の失敗（router_error）、(2) 司書応答が JSON として
+        解釈できなかった解析失敗（parse_ok=False）、(3) 解析は成功したが
+        answerable=false、または targets 空で fallback=conservative という
+        「回答不能」寄りの経路。
         """
         catalog = self._build_catalog()
         if not catalog:

@@ -209,7 +209,7 @@ class ShelvePlan:
     """`Shelver.plan()` の集約結果（分類段・設計書 §13.6）。
 
     dry-run 出力・適用時の両方の元になる第一級データ構造（§13.1 決定 2）。
-    4 フィールドとも mutable な list のため、他の集約 DTO（RoutingDecision.targets）と
+    5 フィールドとも mutable な list のため、他の集約 DTO（RoutingDecision.targets）と
     同じく field(default_factory=list) でインスタンス間の共有を断つ。
     """
 
