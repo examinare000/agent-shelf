@@ -1154,3 +1154,25 @@ class TestBuildServiceWiring:
         assert captured_kwargs["digest_map_notes"] == 7
         assert captured_kwargs["digest_map_window_chars"] == 1234
         assert captured_kwargs["digest_backend"] == "gemini"
+
+    def test_wires_max_file_mb_from_config(self, monkeypatch):
+        import shelf.embedder as embedder_module
+
+        captured_kwargs: dict = {}
+
+        class _FakeEmbedder:
+            def __init__(self, model_name: str) -> None:
+                self.model_name = model_name
+
+        class _FakeShelfService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(embedder_module, "FastEmbedEmbedder", _FakeEmbedder)
+        monkeypatch.setattr(cli, "_build_store", lambda: Store(":memory:"))
+        monkeypatch.setattr(cli, "ShelfService", _FakeShelfService)
+        monkeypatch.setattr(cli.config, "MAX_FILE_MB", 42)
+
+        cli._build_service()
+
+        assert captured_kwargs["max_file_mb"] == 42
