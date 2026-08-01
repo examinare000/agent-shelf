@@ -11,6 +11,7 @@ main() 経由でここに含める。
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -1111,7 +1112,37 @@ class TestSetupDispatchErrors:
         assert "エラー" in captured
         assert not config_path.exists()
 
+    def test_config_dir_path_collision_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        """設定ディレクトリの親パスが既にファイルとして存在する場合、書込み失敗を報告する。
+
+        chmod によるディレクトリ書込み禁止は Windows では効果がない（chmod は
+        読み取り専用属性のトグルのみで、ディレクトリへのファイル作成は妨げない）
+        ため、親コンポーネントを「ディレクトリではなくファイル」にする方式で OS
+        非依存に書込み失敗を再現する。setup.write_config_env は書込み前に
+        path.parent.mkdir(parents=True, exist_ok=True) を呼ぶため、親が既存の
+        非ディレクトリだと mkdir 自体が FileExistsError（OSError のサブクラス）を
+        送出する（実測: NotADirectoryError ではない）。POSIX 限定の権限拒否
+        （chmod 0o000）シナリオは test_unwritable_config_dir_reports_japanese_error
+        を参照（Windows では本テストがその代替）。
+        """
+        not_a_dir = tmp_path / "not-a-directory"
+        not_a_dir.write_text("this is a file, not a directory", encoding="utf-8")
+        config_path = not_a_dir / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="chmod 0o000 は Windows のディレクトリ書込み可否に影響しないため無効"
+        "（Windows での同種シナリオは test_config_dir_path_collision_reports_japanese_error"
+        "のパス衝突版が代替する）",
+    )
     def test_unwritable_config_dir_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        """書込み権限のないディレクトリ（chmod 0o000）への書込みはエラーを報告する（POSIX 限定）。"""
         readonly_dir = tmp_path / "readonly"
         readonly_dir.mkdir()
         readonly_dir.chmod(0o000)
