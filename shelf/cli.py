@@ -18,7 +18,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from shelf import config, emit_mcp, setup
+from shelf import config, doctor, emit_mcp, setup
 from shelf.server import build_transport_security, create_server
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
@@ -225,6 +225,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     persona_group.add_argument(
         "--clear", action="store_true", help="ペルソナをクリアする(None に設定)"
+    )
+
+    sub.add_parser(
+        "doctor", help="環境のプリフライト診断を行う(エンジンCLI/ollama/DB/corpus等)"
     )
 
     return parser
@@ -467,6 +471,25 @@ def _cmd_setup(args: argparse.Namespace) -> None:
     print(text)
 
 
+def _cmd_doctor(args: argparse.Namespace) -> None:
+    """診断結果を ✓/✗ 付きで日本語表示し、1件でも失敗があれば exit code 1 で終える。
+
+    Task Scheduler 等の無人運用でも「起動前に環境が壊れている」ことを終了コードで
+    機械的に検知できるようにするのが目的。診断ロジック自体は一切ここに持たず
+    doctor.run_checks() へ委譲する(cli.py は配線だけの薄さを保つ既存方針、
+    cli.py 冒頭 docstring 参照)。
+    """
+    results = doctor.run_checks()
+    all_ok = True
+    for result in results:
+        mark = "✓" if result.ok else "✗"
+        print(f"{mark} {result.name}: {result.detail}")
+        if not result.ok:
+            all_ok = False
+    if not all_ok:
+        sys.exit(1)
+
+
 def _cmd_rm(args: argparse.Namespace) -> None:
     store = _build_store()
 
@@ -611,6 +634,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_setup(args)
     elif args.command == "rm":
         _cmd_rm(args)
+    elif args.command == "doctor":
+        _cmd_doctor(args)
     elif args.command == "index":
         stats = _build_service().index(args.notebook, full=args.all)
         _print_index_stats(stats)
