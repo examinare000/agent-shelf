@@ -1278,6 +1278,100 @@ def test_add_source_returns_safe_error_when_stat_raises_during_size_check(
     assert converter.file_calls == []
 
 
+# -- add_source: content_hash 記録 + notebook 横断の内容重複検出（B3） -------------
+# documents.content_hash はスキーマ・upsert_document 双方で対応済みだったが、
+# _ingest_file が渡していなかったため常に NULL だった。同一内容の資料が別パス・
+# 別 notebook から投入されても重複を検出できていなかったギャップを埋める。
+
+
+def test_add_source_persists_content_hash(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("original file content, unused by fake converter", encoding="utf-8")
+    markdown = "# Doc\n\nfresh content about penguins.\n"
+    converter = _FakeConverter(markdown=markdown)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_source("nb", str(source_file), auto_summary=False)
+
+    document = store.get_document(result["doc_id"])
+    assert document is not None
+    assert document["content_hash"] == hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
+def test_add_same_content_to_two_notebooks_reports_duplicate(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """同一内容の資料を別 notebook へ add すると、2件目の応答に先行資料が
+    duplicates として載る。skip はしない（同一書籍を複数の棚に意図的に置く運用は
+    正当であるため・warn + 記録の方針）。
+    """
+    store.create_notebook("nb_a", backend="codex")
+    store.create_notebook("nb_b", backend="codex")
+    markdown = "# Doc\n\nidentical markdown content shared across sources.\n"
+    converter = _FakeConverter(markdown=markdown)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+    source_a = tmp_path / "a.txt"
+    source_a.write_text("a-side original file, unused by fake converter", encoding="utf-8")
+    source_b = tmp_path / "b.txt"
+    source_b.write_text("b-side original file, unused by fake converter", encoding="utf-8")
+
+    result_a = service.add_source("nb_a", str(source_a), auto_summary=False)
+    result_b = service.add_source("nb_b", str(source_b), auto_summary=False)
+
+    assert "duplicates" not in result_a
+    assert result_b["duplicates"] == [{"doc_id": result_a["doc_id"], "notebook": "nb_a"}]
+
+
+def test_add_different_content_no_duplicates_key(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("original file content, unused by fake converter", encoding="utf-8")
+    converter = _FakeConverter(markdown="# Doc\n\nunique content, no duplicates.\n")
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_source("nb", str(source_file), auto_summary=False)
+
+    assert "duplicates" not in result
+
+
+def test_add_directory_attaches_duplicates_to_matching_added_entry(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """add_directory の added エントリ単位でも、add_source と同様に content_hash
+    重複が個別に伝わる（notes の既存パターンと同じ idiom）。
+    """
+    store.create_notebook("nb", backend="codex")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "a.txt").write_text("a-side original content", encoding="utf-8")
+    (root / "b.txt").write_text("b-side original content", encoding="utf-8")
+    converter = _FakeConverter(markdown="# Doc\n\n" + "identical content " * 10)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_directory("nb", str(root), auto_summary=False)
+
+    assert len(result["added"]) == 2
+    # sorted(rglob) により a.txt が先に処理されるため、先行資料を持たない a.txt の
+    # エントリには duplicates キー自体が付かない。
+    assert "duplicates" not in result["added"][0]
+    assert result["added"][1]["duplicates"] == [
+        {"doc_id": result["added"][0]["doc_id"], "notebook": "nb"}
+    ]
+
+
 # -- add_directory: ディレクトリ再帰投入（shelf add にディレクトリを渡した場合） -------
 
 
