@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,27 @@ def _call(server, name: str, args: dict):
     return asyncio.run(server.call_tool(name, args))
 
 
+class _BlockingAnswerBackend:
+    """backend.answer() を threading.Event で任意に停止させる決定論的ダブル。
+
+    FakeAnswerBackend は即座に応答を返すため並行性の検証に使えない。ask/consult が
+    バックエンド呼び出し中にイベントループを専有していないかを確かめるには、応答を
+    明示的に保留できるダブルが要る。
+    """
+
+    name = "fake"
+
+    def __init__(self, release_event: threading.Event, response: RawAnswer) -> None:
+        self._release_event = release_event
+        self._response = response
+        self.calls: list[dict] = []
+
+    def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+        self.calls.append({"prompt": prompt, "workdir": workdir, "schema": schema})
+        self._release_event.wait(timeout=5)
+        return self._response
+
+
 def _ask_result(server, args: dict) -> dict:
     """ask の戻り値注釈は design doc 通り素の `dict`。素の dict には FastMCP が
     structured output スキーマを生成しないため、call_tool は TextContent 1件のみを
@@ -82,6 +104,71 @@ class TestAsk:
         result = _ask_result(server, {"notebook": "unknown", "question": "何か"})
 
         assert "error" in result
+
+    def test_slow_ask_does_not_block_concurrent_list_notebooks(self, tmp_path):
+        """ask がバックエンド応答待ちでもイベントループを専有せず、他ツール呼び出しを
+        並行して処理できることを検証する。sync def のままだと FastMCP はイベントループ
+        上で素呼びするため、backend.answer() の threading.Event.wait() がループ全体を
+        止め、list_notebooks は ask の完了(Event解放)後まで一切進行できない
+        (Red確認: pytest.fail に到達する)。async def + anyio.to_thread.run_sync 化後は
+        ask がワーカースレッドへ逃げ、list_notebooks は ask 完了を待たず先に完了できる
+        (Green)。
+        """
+        store = Store(":memory:")
+        embedder = FakeEmbedder(dim=8, known={_CHUNK_TEXT: _KNOWN_VEC, _QUERY_TEXT: _KNOWN_VEC})
+        store.create_notebook("physics", description="物理の論文", backend="codex")
+        nb_dir = tmp_path / "physics"
+        nb_dir.mkdir()
+        (nb_dir / "doc.md").write_text(f"# Doc\n\n{_CHUNK_TEXT}\n", encoding="utf-8")
+        index_notebook(tmp_path, "physics", store, embedder)
+
+        release_event = threading.Event()
+        backend = _BlockingAnswerBackend(release_event, _grounded_raw_answer())
+        service = ShelfService(store, embedder, lambda name: backend, tmp_path)
+        server = create_server(service)
+
+        async def scenario() -> None:
+            ask_task = asyncio.create_task(
+                server.call_tool("ask", {"notebook": "physics", "question": _QUERY_TEXT})
+            )
+            # ask_task が backend.answer() の Event.wait() まで進む猶予を与える。
+            await asyncio.sleep(0.05)
+
+            list_result = await asyncio.wait_for(server.call_tool("list_notebooks", {}), timeout=2.0)
+            assert list_result is not None
+            # list_notebooks が完了した時点で ask はまだ backend 応答待ちのはず。
+            assert not ask_task.done()
+
+            release_event.set()
+            await asyncio.wait_for(ask_task, timeout=2.0)
+
+        # sync 実装ではイベントループ自体が backend.answer() の Event.wait() でブロック
+        # されるため、上記 scenario 内の asyncio.wait_for はタイムアウトすら発火できない
+        # (タイマー自体もそのイベントループに依存するため)。テストプロセスを永久に
+        # 止めないよう、scenario の実行を別スレッドに切り出し、外側から join タイムアウト
+        # で観測する。
+        outcome: dict[str, BaseException] = {}
+
+        def run() -> None:
+            try:
+                asyncio.run(scenario())
+            except BaseException as exc:  # noqa: BLE001 - スレッド越しに再送出するため捕捉
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=3.0)
+
+        # スレッドが生きたまま残っていても Event を解放し、バックエンド呼び出しに
+        # 使ったワーカースレッドが後始末されるようにする(テスト間のリーク防止)。
+        release_event.set()
+
+        if thread.is_alive():
+            pytest.fail(
+                "list_notebooks が ask の完了を待たされた(イベントループがブロックされた)"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
 
 
 class TestListNotebooks:
@@ -154,6 +241,70 @@ class TestConsult:
         assert result["question"] == _QUERY_TEXT
         assert result["answered"] is True
         assert len(result["routed"]) > 0
+
+    def test_slow_consult_does_not_block_concurrent_list_notebooks(self, tmp_path):
+        """consult がバックエンド応答待ちでもイベントループを専有せず、他ツール呼び出しを
+        並行して処理できることを検証する。TestAsk の同名テストと同型（sync def のままだと
+        FastMCP がイベントループ上で素呼びするため、司書ルーティング呼び出しの
+        threading.Event.wait() でループ全体が止まり list_notebooks は consult の完了まで
+        進行できない）。consult は本 PR（MCP ツールの async 化）の主目的のツールであり、
+        ask だけでなく consult 自身についても非専有性を直接証明する必要がある。
+        """
+        store = Store(":memory:")
+        embedder = FakeEmbedder(dim=8, known={_CHUNK_TEXT: _KNOWN_VEC, _QUERY_TEXT: _KNOWN_VEC})
+        store.create_notebook("physics", description="物理の論文", backend="codex")
+        nb_dir = tmp_path / "physics"
+        nb_dir.mkdir()
+        (nb_dir / "doc.md").write_text(f"# Doc\n\n{_CHUNK_TEXT}\n", encoding="utf-8")
+        index_notebook(tmp_path, "physics", store, embedder)
+
+        # 司書ルーティング呼び出し(backend.answer の1回目)をここでブロックすれば、
+        # consult は専門家呼び出しにすら到達できない。それで十分: 目的は「consult 実行中は
+        # イベントループが専有されない」ことの証明であり、どの内部呼び出しで止めるかは
+        # 本質ではない。
+        release_event = threading.Event()
+        backend = _BlockingAnswerBackend(release_event, _grounded_raw_answer())
+        service = ShelfService(
+            store, embedder, lambda name: backend, tmp_path,
+            router_backend="codex", route_top_n=1, route_fallback="",
+        )
+        server = create_server(service)
+
+        async def scenario() -> None:
+            consult_task = asyncio.create_task(server.call_tool("consult", {"question": _QUERY_TEXT}))
+            # consult_task が backend.answer() の Event.wait() まで進む猶予を与える。
+            await asyncio.sleep(0.05)
+
+            list_result = await asyncio.wait_for(server.call_tool("list_notebooks", {}), timeout=2.0)
+            assert list_result is not None
+            # list_notebooks が完了した時点で consult はまだ backend 応答待ちのはず。
+            assert not consult_task.done()
+
+            release_event.set()
+            await asyncio.wait_for(consult_task, timeout=2.0)
+
+        # sync 実装ではイベントループ自体がブロックされタイムアウトすら発火できないため、
+        # TestAsk の同名テストと同じくデーモンスレッド + join タイムアウトで外側から観測する。
+        outcome: dict[str, BaseException] = {}
+
+        def run() -> None:
+            try:
+                asyncio.run(scenario())
+            except BaseException as exc:  # noqa: BLE001 - スレッド越しに再送出するため捕捉
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(timeout=3.0)
+
+        release_event.set()
+
+        if thread.is_alive():
+            pytest.fail(
+                "list_notebooks が consult の完了を待たされた(イベントループがブロックされた)"
+            )
+        if "error" in outcome:
+            raise outcome["error"]
 
 
 @pytest.mark.parametrize("tool_name", ["ask", "list_notebooks", "consult"])
