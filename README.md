@@ -165,6 +165,9 @@ Host になります。Tailscale MagicDNS 名（例 `myhost.tailXXXX.ts.net`）�
 `--allowed-host` での追加指定が必須です（指定しないと「Invalid Host header」で
 initialize が弾かれます）。
 
+`SHELF_HTTP_ENABLED` を使う環境で stdio 登録する場合は、裸の `shelf serve` が env に
+すり替えられないよう `--stdio` を明示してください。
+
 クライアント側（Claude Code の例）:
 
 ```bash
@@ -220,6 +223,10 @@ shelf は大規模資料（数百頁の書籍など）から学びノートを�
 | `SHELF_SHELVE_BACKEND` | `ollama` | 自動分類・新規 notebook 生成時のバックエンド |
 | `SHELF_MAX_FILE_MB` | `300` | ローカルファイル投入（add・shelve）のサイズ上限（MB）。誤投入・暴走防止用で、URL 投入の20MB上限とは別 |
 | `SHELF_EXTRACT_PY` | `<repo>/distill/extract.py` | 機微情報マスク規則の読み込み元（下記参照） |
+| `SHELF_HTTP_ENABLED` | `false` | `shelf serve --http` を CLI フラグなしで有効化する（true/1） |
+| `SHELF_HTTP_HOST` | `127.0.0.1` | `--http` 時の bind ホスト（`--host` 未指定時のみ使用） |
+| `SHELF_HTTP_PORT` | `8765` | `--http` 時の bind ポート（`--port` 未指定時のみ使用） |
+| `SHELF_ALLOWED_HOSTS` | `` | DNS リバインディング保護の追加許可 Host（カンマ区切り、`--allowed-host` 未指定時のみ使用） |
 
 ## アップグレード・マイグレーション（0.3.x → 0.4.0）
 

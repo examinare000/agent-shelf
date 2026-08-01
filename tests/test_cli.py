@@ -28,17 +28,20 @@ class TestServeCommand:
         args = build_parser().parse_args(["serve"])
         assert args.command == "serve"
 
-    def test_http_defaults_to_false(self):
+    def test_http_defaults_to_none_sentinel(self):
+        # None は「CLI 指定なし」を表すサンチネル。実際の既定値解決(フラグ > env > 既定)は
+        # resolve_serve_settings が担うため、argparse 自体は env より優先すべきかを
+        # 判定できるよう None のままにする。
         args = build_parser().parse_args(["serve"])
-        assert args.http is False
+        assert args.http is None
 
-    def test_host_defaults_to_localhost(self):
+    def test_host_defaults_to_none_sentinel(self):
         args = build_parser().parse_args(["serve"])
-        assert args.host == "127.0.0.1"
+        assert args.host is None
 
-    def test_port_defaults_to_8765(self):
+    def test_port_defaults_to_none_sentinel(self):
         args = build_parser().parse_args(["serve"])
-        assert args.port == 8765
+        assert args.port is None
 
     def test_http_flag_can_be_set(self):
         args = build_parser().parse_args(["serve", "--http"])
@@ -74,6 +77,14 @@ class TestServeCommand:
         )
         assert args.allowed_host == ["avalon.tailxxxx.ts.net:8765", "otherhost:8765"]
 
+    def test_stdio_flag_defaults_to_false(self):
+        args = build_parser().parse_args(["serve"])
+        assert args.stdio is False
+
+    def test_stdio_flag_can_be_set(self):
+        args = build_parser().parse_args(["serve", "--stdio"])
+        assert args.stdio is True
+
 
 class TestBindWarning:
     """--host が全インターフェース bind を意味する値のとき、意図しない公開を
@@ -108,6 +119,117 @@ class TestBindWarning:
 
     def test_none_for_ipv6_arbitrary_address(self):
         assert cli._bind_warning("2001:db8::1") is None
+
+
+class TestResolveServeSettings:
+    """resolve_serve_settings の優先順位(CLI フラグ > env)を検証する純関数テスト。
+
+    build_transport_security と同じ流儀で、config モジュールを直接読まず呼び出し元が
+    解決済みの値を明示的に渡す(reload 不要でテストできる・呼び出し元の責務を分離する)。
+    """
+
+    def test_flags_present_win_over_differing_env(self):
+        args = build_parser().parse_args(
+            [
+                "serve",
+                "--http",
+                "--host",
+                "100.64.0.1",
+                "--port",
+                "9000",
+                "--allowed-host",
+                "flaghost:9000",
+            ]
+        )
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=False,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=["envhost:8765"],
+        )
+        assert settings.http is True
+        assert settings.host == "100.64.0.1"
+        assert settings.port == 9000
+        assert settings.allowed_hosts == ["flaghost:9000"]
+
+    def test_env_only_is_used_when_no_flags_given(self):
+        args = build_parser().parse_args(["serve"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=True,
+            env_host="192.168.1.5",
+            env_port=9100,
+            env_allowed_hosts=["envhost:9100"],
+        )
+        assert settings.http is True
+        assert settings.host == "192.168.1.5"
+        assert settings.port == 9100
+        assert settings.allowed_hosts == ["envhost:9100"]
+
+    def test_conflicting_http_host_port_flags_win_while_unset_allowed_host_falls_back_to_env(
+        self,
+    ):
+        # http/host/port は CLI で明示指定(env と競合)しているため常にフラグが勝つ。
+        # 一方 --allowed-host は未指定のため、この項目だけ独立に env 側へフォール
+        # バックする(4項目が一括で「フラグ優先」になるわけではないことの固定)。
+        args = build_parser().parse_args(
+            ["serve", "--http", "--host", "flag.example", "--port", "1111"]
+        )
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=False,
+            env_host="env.example",
+            env_port=2222,
+            env_allowed_hosts=["envhost:2222"],
+        )
+        assert settings.http is True
+        assert settings.host == "flag.example"
+        assert settings.port == 1111
+        assert settings.allowed_hosts == ["envhost:2222"]
+
+    def test_neither_flags_nor_meaningful_env_falls_back_to_env_defaults(self):
+        # env_* 自体には config.py 側で既に「未設定時のハードコード既定値」が
+        # 解決済みの前提(責務分離)。ここでは resolve_serve_settings がその値を
+        # そのまま透過することだけを検証する。
+        args = build_parser().parse_args(["serve"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=False,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=[],
+        )
+        assert settings.http is False
+        assert settings.host == "127.0.0.1"
+        assert settings.port == 8765
+        assert settings.allowed_hosts == []
+
+    def test_stdio_flag_wins_over_http_flag_and_env(self):
+        # --stdio は MCP クライアント登録(裸の `shelf serve` に依存)が env による
+        # 無言のすり替えに巻き込まれないための脱出口。優先順位は --stdio > --http >
+        # env > 既定であり、--http フラグと SHELF_HTTP_ENABLED が両方 true でも
+        # --stdio が最終的に勝つ。
+        args = build_parser().parse_args(["serve", "--http", "--stdio"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=True,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=[],
+        )
+        assert settings.http is False
+
+    def test_stdio_flag_wins_over_env_alone(self):
+        args = build_parser().parse_args(["serve", "--stdio"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=True,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=[],
+        )
+        assert settings.http is False
 
 
 class TestLsCommand:
@@ -348,6 +470,66 @@ class TestServeDispatch:
         cli.main(["serve"])
 
         assert fake_server.settings.transport_security is None
+
+    def test_shelf_http_enabled_env_triggers_streamable_http_without_http_flag(
+        self, monkeypatch
+    ):
+        """SHELF_HTTP_ENABLED=true(--http フラグ未指定)でも streamable-http が
+        選ばれることを、config 属性を直接差し替えて検証する(env→config 解決自体は
+        test_config.py が担当するため、ここでは cli 側の分岐のみを見る)。
+        """
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+        monkeypatch.setattr(cli.config, "HTTP_ENABLED", True)
+
+        cli.main(["serve"])
+
+        assert fake_server.run_calls == ["streamable-http"]
+
+    def test_stdio_flag_forces_stdio_even_when_shelf_http_enabled_env_is_true(
+        self, monkeypatch
+    ):
+        """MCP クライアント登録は裸の `shelf serve`(暗黙 stdio 前提)に依存するため、
+        SHELF_HTTP_ENABLED=true が環境に立っていても `--stdio` で明示的に脱出できる
+        ことを検証する(レビュー指摘: env による無言のすり替えへの脱出口)。
+        """
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+        monkeypatch.setattr(cli.config, "HTTP_ENABLED", True)
+
+        cli.main(["serve", "--stdio"])
+
+        assert fake_server.run_calls == [None]
+
+    def test_shelf_http_enabled_env_dispatch_uses_env_host_port_and_allowed_hosts(
+        self, monkeypatch
+    ):
+        """SHELF_HTTP_ENABLED=true と併せて SHELF_HTTP_HOST/SHELF_HTTP_PORT/
+        SHELF_ALLOWED_HOSTS も env のみで指定された場合(CLI フラグなし)に、
+        resolve_serve_settings の kwarg 取り違えなく main() まで正しく配線される
+        ことを E2E で検証する(レビュー指摘(b): env→config→dispatch の一気通貫)。
+        """
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+        monkeypatch.setattr(cli.config, "HTTP_ENABLED", True)
+        monkeypatch.setattr(cli.config, "HTTP_HOST", "192.168.1.9")
+        monkeypatch.setattr(cli.config, "HTTP_PORT", 9200)
+        monkeypatch.setattr(cli.config, "ALLOWED_HOSTS", ["envhost:9200"])
+
+        cli.main(["serve"])
+
+        assert fake_server.run_calls == ["streamable-http"]
+        assert fake_server.settings.host == "192.168.1.9"
+        assert fake_server.settings.port == 9200
+        security = fake_server.settings.transport_security
+        assert security.allowed_hosts == [
+            "192.168.1.9:9200",
+            "192.168.1.9",
+            "envhost:9200",
+        ]
 
     def test_http_dispatch_sets_transport_security_to_bind_target_by_default(
         self, monkeypatch

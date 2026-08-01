@@ -156,6 +156,28 @@ DIGEST_BACKEND = os.environ.get("SHELF_DIGEST_BACKEND", "")
 # クラウド課金を避け、かつ実効コンテキストが小さいモデル前提の設計（設計書 §13.1 決定6）。
 SHELVE_BACKEND = os.environ.get("SHELF_SHELVE_BACKEND", "ollama")
 
+
+def _parse_allowed_hosts(raw: str) -> list[str]:
+    """カンマ区切りの許可ホスト一覧を list[str] へパースする。
+
+    前後空白を除去し、空要素（連続カンマ・末尾カンマ由来）は捨てる。
+    未設定時は空文字列が渡り、空リストになる（= 追加の許可ホストなし）。
+    """
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+# `shelf serve --http` の起動設定を env からも解決できるようにする3変数。
+# Windows サービス定義（serve-shelf.ps1）が env→CLIフラグの翻訳を自前で行って
+# いたため、ここで env を解決することでサービス定義側を薄くできる。CLI フラグは
+# 常にこれらの env より優先する（優先順位の解決は cli.resolve_serve_settings の責務、
+# ここでは「env→既定値」の解決のみを担う）。
+HTTP_ENABLED = _bool_env("SHELF_HTTP_ENABLED", False)
+HTTP_HOST = os.environ.get("SHELF_HTTP_HOST", "127.0.0.1")
+HTTP_PORT = _int_env("SHELF_HTTP_PORT", 8765)
+# 変数名は SHELF_HTTP_ALLOWED_HOSTS ではなく SHELF_ALLOWED_HOSTS（serve-shelf.ps1 の
+# 既存 env 名と一致させる必要があるため、HTTP_ プレフィックスを付けない）。
+ALLOWED_HOSTS = _parse_allowed_hosts(os.environ.get("SHELF_ALLOWED_HOSTS", ""))
+
 # ask/consult のチャンク検索を、cosine ベクトル検索単体ではなく FTS5 キーワード
 # 検索（BM25）との RRF（Reciprocal Rank Fusion）併用にするかどうか。既定 true:
 # ベクトル検索は意味的に近いが語彙が一致しない文を拾える一方、固有名詞・型番・
