@@ -169,6 +169,8 @@ def convert_file(path: Path) -> ConvertResult:
     # 形式ごとに変換
     if converter_name == "pymupdf4llm":
         return _convert_pdf(path)
+    elif converter_name == "pymupdf4llm-reflow":
+        return _convert_reflow(path)
     elif converter_name == "markitdown":
         return _convert_markitdown(path)
     else:  # "raw"
@@ -255,6 +257,39 @@ def _convert_pdf(path: Path) -> ConvertResult:
 
     notes = (_OCR_SKIP_NOTE,) if skip_ocr else ()
     return ConvertResult(markdown=markdown, converter="pymupdf4llm", title=None, notes=notes)
+
+
+def _convert_reflow(path: Path) -> ConvertResult:
+    """pymupdf4llm を使用した EPUB/FB2/XPS 等リフロー形式の変換。
+
+    WHY page_chunks=False（ページマーカーを挿入しない）: リフロー形式の
+    「ページ番号」は pymupdf-layout が page_width=612 で再レイアウトした際の
+    副産物であり、章立てやレイアウト条件次第でページ数自体が変動するため、
+    読者が実際に手にする版のページ番号とは一致しない虚構である。ページベース
+    の引用は蔵書の「正確な出典」目標に反するため、<!-- page: N --> マーカーは
+    挿入せず、引用の位置情報は既存の見出しパンくず（chunker.py の
+    _split_into_segments）に委ねる。
+    """
+    import pymupdf4llm
+
+    try:
+        markdown = pymupdf4llm.to_markdown(str(path), page_chunks=False)
+    except Exception as e:
+        # pymupdf.FileDataError 等の例外メッセージは絶対パスを含む
+        # （実測: "Failed to open file '<絶対パス>' as type epub."）。
+        # そのまま利用者へ見せず、DRM/破損の可能性のみを伝える安全な文言に丸める。
+        raise ConversionError(
+            "ファイルを読み込めませんでした（DRM 保護や破損の可能性があります）"
+        ) from e
+
+    # 100 字未満チェック。「スキャン PDF」という文言は _convert_pdf 専用の
+    # 原因説明であり、リフロー形式には無関係（DRM/破損の可能性を案内する）。
+    if len(markdown) < 100:
+        raise ConversionError(
+            "テキストを抽出できませんでした（DRM 保護や破損の可能性があります）"
+        )
+
+    return ConvertResult(markdown=markdown, converter="pymupdf4llm-reflow", title=None)
 
 
 def _convert_markitdown(path: Path) -> ConvertResult:
