@@ -5,6 +5,7 @@ description = "書籍・資料コーパスへの委譲QA（ローカル検索+�
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0",
+    "anyio>=4.1",
     "fastembed>=0.4.0",
     "numpy>=1.26",
     "pymupdf4llm",
