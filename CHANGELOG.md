@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Migration Notes
+- **既存の予約名 notebook のロックアウト**: 本リリースで Windows 予約デバイス名
+  （con/prn/aux/nul/com1-9/lpt1-9、大文字小文字不問）が notebook 名として拒否されるようになった。
+  本修正の適用前にこれらの名前で notebook を作成済みの場合、ask/add/digest/persona などの
+  操作は notebook 名検証で以後すべて弾かれ、データを直接救済する手段はない。対応が必要な場合は
+  `shelf rm <予約名の notebook>` で削除したうえで、別名で資料を再投入すること。
+
 ## [0.4.3] - 2026-07-25
 
 personal 環境への grounded digest 還流時のレビューで発見された 3 件の堅牢化を逆移植。
