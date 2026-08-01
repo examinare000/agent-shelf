@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -123,6 +124,19 @@ class _SelectivelyFailingConverter:
 
     def convert_url(self, url: str) -> ConvertResult:
         raise NotImplementedError
+
+
+def _write_sparse_file(path: Path, size_bytes: int) -> None:
+    """size_bytes ちょうどの疎（sparse）ファイルを作る。
+
+    サイズ上限テストのために実際に数百MB/数MBのデータを書き込むと低速・ディスク
+    浪費になるため、seek + 末尾1バイト書き込みで論理サイズだけを確保する
+    （実データ内容はテスト対象外）。
+    """
+    with path.open("wb") as f:
+        if size_bytes > 0:
+            f.seek(size_bytes - 1)
+            f.write(b"\0")
 
 
 class _PermissionErrorConverter:
@@ -1163,6 +1177,105 @@ def test_add_source_rejects_symlink_origin(
     assert converter.file_calls == []
 
 
+def test_add_source_rejects_file_exceeding_max_file_mb(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """SHELF_MAX_FILE_MB を超えるローカルファイルは誤投入・暴走防止のため拒否する
+    （テスト高速化のため max_file_mb=1 を注入。既定300MBの意味は test_config.py 側で
+    別途検証済み）。エラーメッセージはサイズ上限を含み、フルパスは含めない
+    （convert.py の URL サイズ超過エラーと同じ「安全なメッセージ」流儀）。
+    """
+    store.create_notebook("nb", backend="codex")
+    max_bytes = 1 * 1024 * 1024
+    oversized = tmp_path / "huge.txt"
+    _write_sparse_file(oversized, max_bytes + 1)
+    converter = _FakeConverter(markdown="unused")
+    service = ShelfService(
+        store,
+        embedder,
+        lambda name: FakeAnswerBackend(),
+        tmp_path,
+        converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.add_source("nb", str(oversized), auto_summary=False)
+
+    assert "error" in result
+    assert "1MB" in result["error"]
+    assert str(oversized) not in result["error"]
+    assert converter.file_calls == []
+
+
+def test_add_source_accepts_file_exactly_at_max_file_mb_boundary(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """ちょうど上限サイズのファイルは拒否しない（超過のみ拒否、境界値は許可）。"""
+    store.create_notebook("nb", backend="codex")
+    max_bytes = 1 * 1024 * 1024
+    boundary = tmp_path / "boundary.txt"
+    _write_sparse_file(boundary, max_bytes)
+    converter = _FakeConverter(markdown="# Doc\n\n" + "content " * 20)
+    service = ShelfService(
+        store,
+        embedder,
+        lambda name: FakeAnswerBackend(),
+        tmp_path,
+        converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.add_source("nb", str(boundary), auto_summary=False)
+
+    assert "error" not in result
+    assert converter.file_calls == [boundary.resolve()]
+
+
+def test_add_source_returns_safe_error_when_stat_raises_during_size_check(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """走査中のファイル削除・権限変更等のレースで size チェック用の stat() が
+    OSError を送出しても、生の例外を漏らさず安全なエラー辞書を返す（indexer.py の
+    「1ファイルの失敗で全体を止めない」既存原則と同じ防御・コードレビュー指摘対応）。
+
+    is_file() は self.stat() 経由で内部的に stat を呼ぶため、Path.stat 自体を
+    無条件に差し替えると is_file() 側まで巻き込んでしまう。is_file()/is_dir() を
+    os.path 系のプリミティブ（Path.stat を経由しない）へ差し替えることで、
+    「is_file() 判定は成功済みだが、直後の size チェック用 stat() だけがレースで
+    失敗する」という狙った状況だけを再現する。
+    """
+    store.create_notebook("nb", backend="codex")
+    target = tmp_path / "flaky.txt"
+    target.write_text("content", encoding="utf-8")
+    target_str = str(target.resolve())
+
+    real_stat = Path.stat
+
+    def flaky_stat(self: Path, *args, **kwargs):
+        # is_symlink() は lstat()(follow_symlinks=False)経由で内部的に stat() を
+        # 呼ぶため、それは巻き込まず通す。size チェック用の通常 stat()
+        # (follow_symlinks=True、既定)だけを対象にレースを再現する。
+        if str(self) == target_str and kwargs.get("follow_symlinks", True):
+            raise OSError("stat failed (race)")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    # is_file()/is_dir() も内部で self.stat() を呼ぶため、Path.stat を経由しない
+    # os.path 系プリミティブへ差し替えて意図しない巻き込みを避ける。
+    monkeypatch.setattr(Path, "is_file", lambda self: os.path.isfile(str(self)))
+    monkeypatch.setattr(Path, "is_dir", lambda self: os.path.isdir(str(self)))
+
+    converter = _FakeConverter(markdown="unused")
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_source("nb", str(target), auto_summary=False)
+
+    assert result == {"error": "ファイルにアクセスできませんでした"}
+    assert converter.file_calls == []
+
+
 # -- add_directory: ディレクトリ再帰投入（shelf add にディレクトリを渡した場合） -------
 
 
@@ -1243,6 +1356,82 @@ def test_add_directory_skips_unsupported_extension_without_calling_converter(
     assert result["skipped"] == [
         {"origin": str((root / "image.png").resolve()), "reason": "未対応の形式です"}
     ]
+    assert converter.file_calls == [Path(str((root / "note.md").resolve()))]
+
+
+def test_add_directory_skips_file_exceeding_max_file_mb_and_continues(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """サイズ上限超過ファイルは skipped に理由付きで記録され、他ファイルの処理は
+    継続する（1ファイルの拒否で全体を止めない add_directory の既存流儀）。
+    """
+    store.create_notebook("nb", backend="codex")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    max_bytes = 1 * 1024 * 1024
+    _write_sparse_file(root / "huge.txt", max_bytes + 1)
+    converter = _FakeConverter(markdown="# Doc\n\n" + "converted content " * 10)
+    service = ShelfService(
+        store,
+        embedder,
+        lambda name: FakeAnswerBackend(),
+        tmp_path,
+        converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.add_directory("nb", str(root), auto_summary=False)
+
+    assert len(result["added"]) == 1
+    assert result["added"][0]["origin"] == str((root / "note.md").resolve())
+    assert result["skipped"] == [
+        {"origin": str((root / "huge.txt").resolve()), "reason": "ファイルサイズが上限（1MB）を超えています"}
+    ]
+    assert converter.file_calls == [Path(str((root / "note.md").resolve()))]
+
+
+def test_add_directory_skips_file_when_stat_raises_during_size_check_and_continues(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """走査中のファイル削除・権限変更等のレースで size チェック用の stat() が
+    OSError を送出しても、一括投入全体を止めず skipped に記録して継続する
+    （indexer.py の「1ファイルの失敗で全体を止めない」既存原則と同じ防御・
+    コードレビュー指摘対応）。
+    """
+    store.create_notebook("nb", backend="codex")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    flaky = root / "flaky.txt"
+    flaky.write_text("content", encoding="utf-8")
+    flaky_str = str(flaky.resolve())
+
+    real_stat = Path.stat
+
+    def flaky_stat(self: Path, *args, **kwargs):
+        # is_symlink() は lstat()(follow_symlinks=False)経由で内部的に stat() を
+        # 呼ぶため、それは巻き込まず通す。size チェック用の通常 stat()
+        # (follow_symlinks=True、既定)だけを対象にレースを再現する。
+        if str(self) == flaky_str and kwargs.get("follow_symlinks", True):
+            raise OSError("stat failed (race)")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    # is_dir() も内部で self.stat() を呼ぶため、Path.stat を経由しない os.path 系
+    # プリミティブへ差し替えて意図しない巻き込みを避ける。
+    monkeypatch.setattr(Path, "is_dir", lambda self: os.path.isdir(str(self)))
+
+    converter = _FakeConverter(markdown="# Doc\n\n" + "converted content " * 10)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_directory("nb", str(root), auto_summary=False)
+
+    assert len(result["added"]) == 1
+    assert result["added"][0]["origin"] == str((root / "note.md").resolve())
+    assert result["skipped"] == [{"origin": flaky_str, "reason": "ファイルを読み取れませんでした"}]
     assert converter.file_calls == [Path(str((root / "note.md").resolve()))]
 
 
@@ -3437,6 +3626,46 @@ def test_shelve_scan_rules_skip_hidden_symlink_and_unsupported_files(
     assert str((root / "image.png").resolve()) in skipped_origins
     assert not any(".git" in o for o in skipped_origins)
     assert len(result["skipped"]) == 2
+
+
+def test_shelve_skips_file_exceeding_max_file_mb_and_continues(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """shelve は add_directory と同じ _iter_directory_candidates を共有するため、
+    max_file_mb によるサイズ上限超過も skipped に記録され、他ファイルの分類は継続する
+    （コードレビュー指摘: _prepare_shelve_candidates の呼び出しから max_file_mb が
+    将来落ちても検知できるようにする回帰テスト）。dry_run=True で永続副作用なく検証。
+    """
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    max_bytes = 1 * 1024 * 1024
+    _write_sparse_file(root / "huge.txt", max_bytes + 1)
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.shelve(str(root), dry_run=True)
+
+    assert result["plan"] == [
+        {
+            "origin": str((root / "note.md").resolve()),
+            "notebook": "quantum-notes",
+            "new_notebook": True,
+            "summary": "量子力学の基礎資料",
+            "reason": "既存に合致なし",
+        }
+    ]
+    assert result["skipped"] == [
+        {"origin": str((root / "huge.txt").resolve()), "reason": "ファイルサイズが上限（1MB）を超えています"}
+    ]
 
 
 def test_shelve_converts_each_file_once_uses_summary_as_description_and_recommends_digest(

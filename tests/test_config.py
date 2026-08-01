@@ -351,6 +351,40 @@ def test_hybrid_search_env_falsy_values(monkeypatch, value):
     importlib.reload(config)
 
 
+def test_max_file_mb_default_is_300():
+    # 誤投入・暴走を防ぐための上限であり、正当な蔵書（スキャン書籍PDFは数百MBに
+    # なり得る）を弾かない大きめの既定値とする。
+    assert config.MAX_FILE_MB == 300
+
+
+def test_max_file_mb_env_override(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MAX_FILE_MB", "10")
+        importlib.reload(config)
+        assert config.MAX_FILE_MB == 10
+    importlib.reload(config)
+
+
+def test_max_file_mb_invalid_value_falls_back_to_default(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MAX_FILE_MB", "abc")
+        importlib.reload(config)
+        assert config.MAX_FILE_MB == 300
+    importlib.reload(config)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "-300"])
+def test_max_file_mb_non_positive_value_falls_back_to_default(monkeypatch, value):
+    # 0以下は「常に拒否」("ファイルサイズが上限（0MB）を超えています"等の違和感ある
+    # エラーメッセージ)になってしまうため、不正値と同様に既定へフォールバックする
+    # （コードレビュー指摘）。
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MAX_FILE_MB", value)
+        importlib.reload(config)
+        assert config.MAX_FILE_MB == 300
+    importlib.reload(config)
+
+
 class TestSessionWideConfigIsolation:
     """tests/conftest.py の autouse フィクスチャによる SHELF_CONFIG 固定を検証する。
 

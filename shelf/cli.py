@@ -249,6 +249,7 @@ def _build_service() -> ShelfService:
         digest_map_window_chars=config.DIGEST_MAP_WINDOW_CHARS,
         digest_backend=config.DIGEST_BACKEND,
         shelve_backend=config.SHELVE_BACKEND,
+        max_file_mb=config.MAX_FILE_MB,
     )
 
 

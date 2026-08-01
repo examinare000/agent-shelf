@@ -218,6 +218,7 @@ shelf は大規模資料（数百頁の書籍など）から学びノートを�
 | `SHELF_DIGEST_BACKEND` | `` | Digest 専用 LLM バックエンド（未指定時は notebook の backend → SHELF_DEFAULT_BACKEND） |
 | `SHELF_HYBRID_SEARCH` | `true` | ハイブリッド検索有効化（cosine + FTS5 BM25 RRF）。SQLite が FTS5 非対応の場合は自動劣化 |
 | `SHELF_SHELVE_BACKEND` | `ollama` | 自動分類・新規 notebook 生成時のバックエンド |
+| `SHELF_MAX_FILE_MB` | `300` | ローカルファイル投入（add・shelve）のサイズ上限（MB）。誤投入・暴走防止用で、URL 投入の20MB上限とは別 |
 | `SHELF_EXTRACT_PY` | `<repo>/distill/extract.py` | 機微情報マスク規則の読み込み元（下記参照） |
 
 ## アップグレード・マイグレーション（0.3.x → 0.4.0）

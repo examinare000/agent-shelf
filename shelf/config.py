@@ -164,3 +164,16 @@ SHELVE_BACKEND = os.environ.get("SHELF_SHELVE_BACKEND", "ollama")
 # fts5/trigram tokenizer が使えない環境では store.fts_enabled=False により
 # 自動的にベクトル単体へ劣化する（このフラグは「使うかどうかの意図」のみを表す）。
 HYBRID_SEARCH = _bool_env("SHELF_HYBRID_SEARCH", True)
+
+# ローカルファイル投入（add_source/add_directory、および内部で同じ走査規則を
+# 共有する shelve）のファイルサイズ上限（MB）。守る対象は誤投入・暴走であって
+# 正当な蔵書ではない（スキャン書籍PDFは数百MBになり得る）ため、既定は大きめの
+# 300MBとし、運用でより厳しく絞りたい場合は env で調整できるようにする。
+# URL 経由の投入（convert.py の 20MB 上限）とは独立した値（ローカルファイルと
+# 外部URL取得ではリスクの性質が異なるため）。
+# 0以下は「常に拒否」という意図しない全否定になり、かつエラーメッセージに
+# 負数/0MBが埋め込まれる違和感を生むため、不正値（int変換失敗）と同様に既定へ
+# フォールバックする（他の *_MB/*_NOTES 系と異なり、0以下が意味を持たない値のため
+# 共有ヘルパ _int_env 自体は変更せずここだけで個別にクランプする）。
+_max_file_mb_raw = _int_env("SHELF_MAX_FILE_MB", 300)
+MAX_FILE_MB = _max_file_mb_raw if _max_file_mb_raw > 0 else 300
