@@ -1,12 +1,14 @@
 """
 runner.py のテスト: subprocess 実行の一本化。
 
-実プロセスは /bin/echo・/bin/cat・sleep スクリプト等の決定論コマンドのみ使用。
+実プロセスは sys.executable -c "..." ベースの決定論コマンドのみ使用する
+（Windows CI に /bin/echo 等の POSIX バイナリが存在しないため）。
 検証: stdout capture / stdin 渡し / 非0 returncode / timeout で timed_out=True
 かつ所要時間が timeout+2秒以内 / 存在しないコマンド→127 / workdir が効く。
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -23,7 +25,7 @@ class TestRunCommandBasic:
 
     def test_echo_command(self):
         """echo コマンドで stdout をキャプチャできる。"""
-        result = run_command(["/bin/echo", "hello"])
+        result = run_command([sys.executable, "-c", "print('hello')"])
         assert result.stdout.strip() == "hello"
         assert result.returncode == 0
         assert result.timed_out is False
@@ -31,7 +33,7 @@ class TestRunCommandBasic:
     def test_stdin_passthrough(self):
         """stdin でテキストを渡せる。"""
         result = run_command(
-            ["/bin/cat"],
+            [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
             stdin_text="test input\n",
         )
         assert result.stdout == "test input\n"
@@ -102,9 +104,9 @@ class TestRunCommandWorkdir:
     """workdir パラメータテスト。"""
 
     def test_workdir_is_used(self, tmp_path):
-        """workdir パラメータが実際に使用されることを確認（pwd 出力）。"""
+        """workdir パラメータが実際に使用されることを確認（カレントディレクトリ出力）。"""
         result = run_command(
-            ["/bin/pwd"],
+            [sys.executable, "-c", "import pathlib; print(pathlib.Path.cwd())"],
             workdir=tmp_path,
         )
         output_path = Path(result.stdout.strip())
@@ -144,7 +146,7 @@ class TestRunCommandReturnType:
 
     def test_returns_run_result(self):
         """戻り値が RunResult 型であることを確認。"""
-        result = run_command(["/bin/echo", "test"])
+        result = run_command([sys.executable, "-c", "print('test')"])
         assert isinstance(result, RunResult)
         assert isinstance(result.stdout, str)
         assert isinstance(result.stderr, str)
@@ -153,7 +155,7 @@ class TestRunCommandReturnType:
 
     def test_result_is_frozen(self):
         """RunResult は frozen dataclass（不変）。"""
-        result = run_command(["/bin/echo", "test"])
+        result = run_command([sys.executable, "-c", "print('test')"])
         with pytest.raises(AttributeError):
             result.stdout = "modified"
 
@@ -216,17 +218,22 @@ class TestRunCommandWhichResolution:
             shutil, "which", lambda name: which_calls.append(name) or "/should/not/be/used"
         )
 
-        run_command(["/bin/echo", "hi"])
+        run_command([sys.executable, "-c", "print('hi')"])
 
         assert which_calls == []
 
     def test_relative_path_command_skips_which_and_uses_workdir(self, tmp_path):
-        """workdir 配下の相対パススクリプトが which 追加後も引き続き実行できる（回帰テスト）。"""
-        script = tmp_path / "script.sh"
-        script.write_text("#!/bin/sh\necho relative-ok\n")
-        script.chmod(0o755)
+        """workdir 配下の相対パスコマンドが which 追加後も引き続き実行できる（回帰テスト）。
 
-        result = run_command(["./script.sh"], workdir=tmp_path)
+        POSIX 専用の `#!/bin/sh` シェバンスクリプトの代わりに、sys.executable を
+        tmp_path からの相対パスとして表現して実行する。cmd[0] はパス区切りを
+        含む相対パス（which スキップ条件）のまま、Windows でも直接起動可能な
+        実バイナリ（python 本体）を指すため、OS 分岐なしに「workdir 基準で
+        相対パスコマンドが解決される」という回帰観点を保てる。
+        """
+        rel_python = os.path.relpath(sys.executable, start=tmp_path)
+
+        result = run_command([rel_python, "-c", "print('relative-ok')"], workdir=tmp_path)
 
         assert result.stdout.strip() == "relative-ok"
         assert result.returncode == 0
@@ -263,8 +270,6 @@ class TestWindowsProcessTreeKill:
 
     def test_windows_timeout_uses_taskkill_with_tree_and_force_flags(self, monkeypatch):
         """os.name=='nt' で timeout したら taskkill /T /F /PID <pid> を呼ぶ。"""
-        import os
-
         monkeypatch.setattr(os, "name", "nt")
 
         class _FakeProc:
@@ -309,8 +314,6 @@ class TestWindowsProcessTreeKill:
 
     def test_windows_timeout_falls_back_to_proc_kill_when_taskkill_fails(self, monkeypatch):
         """taskkill 自体が例外を投げたら proc.kill() にフォールバックする。"""
-        import os
-
         monkeypatch.setattr(os, "name", "nt")
 
         class _FakeProc:
@@ -351,8 +354,6 @@ class TestWindowsProcessTreeKill:
         subprocess.run は check=True を指定しない限り非0 returncode で例外を投げないため、
         戻り値を無視すると権限不足等の taskkill 失敗を見逃してしまう（レビュー指摘）。
         """
-        import os
-
         monkeypatch.setattr(os, "name", "nt")
 
         class _FakeProc:
@@ -398,7 +399,7 @@ class TestTimeoutKillFallbackBranches:
     def test_timeout_with_available_killpg_kills_process_group(self):
         """timeout 時にプロセスが確実に kill される（killpg 使用可能な POSIX 環境）。"""
         result = run_command(
-            ["/bin/sleep", "10"],  # 10秒の sleep（timeout が 1秒のため kill される）
+            [sys.executable, "-c", "import time; time.sleep(10)"],
             timeout=1,
         )
 
@@ -412,19 +413,18 @@ class TestTimeoutKillFallbackBranches:
         """killpg 非対応かつ os.name!='nt' の未知環境では、taskkill 分岐ではなく
         第三分岐（else: proc.kill()）を通ってプロセスを kill する。
 
-        このテストは os.name を変更せず os.killpg/os.getpgid だけを削除するため、
-        実行環境（テストホストの実 os.name）を経由して taskkill 分岐ではなく
-        「killpg 非対応の未知環境向け」フォールバックを検証している。
+        os.killpg/os.getpgid の削除に加え os.name も明示的に "posix" へ固定する。
+        実行ホストが Windows（実 os.name=="nt"）の場合、固定しないと taskkill
+        分岐に入ってしまい、このテストが検証すべき「第三分岐」を通らなくなる。
         """
-        import os
-
         # os.killpg と os.getpgid を削除して killpg 非対応環境をシミュレート
         monkeypatch.delattr(os, "killpg", raising=False)
         monkeypatch.delattr(os, "getpgid", raising=False)
+        monkeypatch.setattr(os, "name", "posix")
 
         # timeout で子プロセスが kill される（例外が出ない）
         result = run_command(
-            ["/bin/sleep", "10"],  # 10秒の sleep（timeout が 1秒のため kill される）
+            [sys.executable, "-c", "import time; time.sleep(10)"],
             timeout=1,
         )
 
