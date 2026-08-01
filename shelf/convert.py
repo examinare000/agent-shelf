@@ -249,10 +249,13 @@ def _convert_pdf(path: Path) -> ConvertResult:
     chunks = pymupdf4llm.to_markdown(str(path), page_chunks=True, **kwargs)
     markdown = _insert_page_markers(chunks)
 
-    # 100 字未満チェック
+    # 100 字未満チェック。OCR は同梱していないため、スキャン PDF の場合の
+    # 代替手段（事前 OCR）を案内する。
     if len(markdown) < 100:
         raise ConversionError(
-            "テキストを抽出できませんでした（スキャン PDF の可能性があります）"
+            "テキストを抽出できませんでした（スキャン PDF の可能性があります）。"
+            "OCR は同梱していません。事前に OCR 済み PDF を用意してください"
+            "（例: ocrmypdf）"
         )
 
     notes = (_OCR_SKIP_NOTE,) if skip_ocr else ()

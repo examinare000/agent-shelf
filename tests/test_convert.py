@@ -493,6 +493,24 @@ class TestConvertPdf:
                 assert "抽出できませんでした" in str(exc_info.value)
 
 
+class TestConvertPdfErrorMessageIncludesOcrGuidance:
+    """テキスト抽出失敗時の PDF 専用文言に、OCR は同梱していない旨と代替手段
+    (ocrmypdf 等での事前 OCR)の案内を追記したことの確認。"""
+
+    def test_scan_pdf_error_mentions_ocrmypdf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scanned.pdf"
+            path.write_bytes(b"%PDF-1.4 dummy")
+
+            with patch("pymupdf4llm.to_markdown") as mock_to_markdown:
+                mock_to_markdown.return_value = [_pdf_chunk(None), _pdf_chunk("")]
+
+                with pytest.raises(ConversionError) as exc_info:
+                    convert_file(path)
+
+            assert "ocrmypdf" in str(exc_info.value)
+
+
 class TestConvertReflowFormats:
     """EPUB/FB2/XPS の実変換(pymupdf4llm 経由)。
 
