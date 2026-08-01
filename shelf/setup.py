@@ -168,6 +168,36 @@ def _prompt(
     return raw if raw else default
 
 
+def _prompt_int(
+    input_func: Callable[[str], str],
+    print_func: Callable[..., None],
+    prompt: str,
+    default: int,
+    *,
+    min_value: int = 1,
+) -> int:
+    """数値専用のプロンプト。非数値入力や min_value 未満の入力は生の ValueError を
+    利用者に露出させず（cli.py:440-442 の _cmd_setup と同じ「例外を握りつぶさず
+    メッセージ化する」流儀）、日本語メッセージを表示して再プロンプトする。
+
+    top_k=0 のような値は ask/consult 側で検索結果ゼロを無診断で招く
+    （cosine_topk の [:0] スライス）ため、min_value=1 を既定の下限として拒否する。
+    空入力（Enter のみ）は _prompt と同じく default をそのまま採用する
+    （default は呼び出し元のプリセット値なので常に min_value 以上）。
+    """
+    while True:
+        raw = _prompt(input_func, print_func, prompt, str(default))
+        try:
+            value = int(raw)
+        except ValueError:
+            print_func(f"数値を入力してください（入力値: {raw!r}）")
+            continue
+        if value < min_value:
+            print_func(f"{min_value} 以上の数値を入力してください（入力値: {value}）")
+            continue
+        return value
+
+
 def collect_answers_interactively(
     *,
     input_func: Callable[[str], str] = input,
@@ -216,6 +246,18 @@ def collect_answers_interactively(
     )
     digest_max_notes = defaults["digest_max_notes"]
     top_k = defaults["top_k"]
+    if granularity not in GRANULARITY_PRESETS:
+        # 表示案内どおり、プリセット名以外の入力は「数値で個別指定」として扱う。
+        # resolve_granularity は digest_max_notes/top_k が None でなければプリセット
+        # より優先して採用するため、ここで確定した数値がそのまま最終値になる。
+        standard_preset = GRANULARITY_PRESETS[_DEFAULT_GRANULARITY]
+        digest_max_notes = _prompt_int(
+            input_func,
+            print_func,
+            "学びノート数 (digest_max_notes)",
+            standard_preset["digest_max_notes"],
+        )
+        top_k = _prompt_int(input_func, print_func, "top_k", standard_preset["top_k"])
 
     print_func("== 4. 配置 ==")
     if Path(defaults["corpus_dir"]).exists():
