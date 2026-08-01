@@ -16,6 +16,8 @@ import inspect
 import json
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -2263,6 +2265,80 @@ def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     assert routed["answer"] == ""
     assert routed["citations"] == []
     assert routed["insights"] == []
+
+
+# -- スレッド安全性: _get_librarian/_get_shelver の遅延 check-then-set 対策（タスク A2）---
+
+
+def test_get_librarian_builds_backend_factory_only_once_under_concurrent_access(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """複数ワーカースレッドから同時に consult() する構成（後続タスクで async def +
+    anyio.to_thread 化）で、_get_librarian の遅延 check-then-set が二重構築を
+    起こさないことを検証する。backend_factory 内に意図的な遅延を挟み、
+    「None チェックを通過してから代入するまでの間」に複数スレッドが割り込める
+    レースウィンドウを広げる。"""
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def backend_factory(name: str) -> FakeAnswerBackend:
+        nonlocal call_count
+        time.sleep(0.05)
+        with count_lock:
+            call_count += 1
+        return FakeAnswerBackend()
+
+    service = ShelfService(store, embedder, backend_factory, tmp_path)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            service._get_librarian()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert errors == []
+    assert call_count == 1
+
+
+def test_get_shelver_builds_backend_factory_only_once_under_concurrent_access(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """_get_librarian と同型の遅延構築キャッシュを持つ _get_shelver（shelve()経由）
+    についても、並行呼び出しで backend_factory が1回しか呼ばれないことを検証する。"""
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def backend_factory(name: str) -> FakeAnswerBackend:
+        nonlocal call_count
+        time.sleep(0.05)
+        with count_lock:
+            call_count += 1
+        return FakeAnswerBackend()
+
+    service = ShelfService(store, embedder, backend_factory, tmp_path)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            service._get_shelver()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert errors == []
+    assert call_count == 1
 
 
 def test_shelf_service_digest_constructor_defaults_share_digests_constants():
