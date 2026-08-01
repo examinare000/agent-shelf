@@ -164,7 +164,7 @@ def _stem_for(origin: str) -> str:
     return Path(origin).stem
 
 
-def _validate_file_origin(origin: str) -> dict | None:
+def _validate_file_origin(origin: str, *, max_file_mb: int) -> dict | None:
     """ファイル系 origin をパス/サイズ観点で検証する（design doc §7、中位指摘#5）。
 
     is_symlink() は元のパス（resolve 前）に対して判定する必要がある。resolve() は
@@ -173,6 +173,11 @@ def _validate_file_origin(origin: str) -> dict | None:
     resolve 後の is_file() はディレクトリ・デバイスファイル等の特殊ファイルを
     自然に弾く（通常ファイルにのみ True を返す）ため、シンボリックリンク拒否と
     合わせて「シンボリックリンク・ディレクトリ・特殊ファイル拒否」を満たす。
+
+    max_file_mb（config.MAX_FILE_MB 由来。既定300MB）は誤投入・暴走を防ぐための
+    上限であり、正当な蔵書（スキャン書籍PDFは数百MBになり得る）を弾かない大きめの
+    既定値。エラーメッセージは convert.py の URL サイズ超過エラーと同じ流儀で
+    上限値のみを含め、フルパスは含めない（内部ファイルシステム詳細を漏らさない）。
     """
     raw_path = Path(origin)
     if raw_path.is_symlink():
@@ -181,6 +186,18 @@ def _validate_file_origin(origin: str) -> dict | None:
     resolved = raw_path.resolve()
     if not resolved.is_file():
         return {"error": f"ファイルが存在しないか、通常ファイルではありません: {origin}"}
+
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        # is_file() 通過後、走査中のファイル削除・権限変更等のレースで stat() が
+        # 失敗し得る（indexer.py の「1ファイルの失敗で全体を止めない」既存原則と
+        # 同じ防御）。生の例外を漏らさず安全なエラー辞書を返す。
+        return {"error": "ファイルにアクセスできませんでした"}
+
+    max_bytes = max_file_mb * 1024 * 1024
+    if size > max_bytes:
+        return {"error": f"ファイルサイズが上限（{max_file_mb}MB）を超えています"}
 
     return None
 
@@ -209,6 +226,7 @@ class ShelfService:
         librarian: Librarian | None = None,
         shelve_backend: str = "ollama",
         shelver: Shelver | None = None,
+        max_file_mb: int = 300,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -267,6 +285,12 @@ class ShelfService:
         # 注入されなければ shelve() 初回呼び出し時に backend_factory から遅延構築し、
         # 以後キャッシュする（_get_shelver・_get_librarian と同型のパターン）。
         self._shelver = shelver
+        # config.MAX_FILE_MB(env SHELF_MAX_FILE_MB)。ローカルファイル投入
+        # （add_source/add_directory、および _iter_directory_candidates の走査規則を
+        # 共有する shelve）のサイズ上限（MB）。service.py は config を import しない
+        # 既存流儀（default_backend 等と同じ）に揃え、呼び出し側（cli.py）が明示的に
+        # 値を渡す前提のコンストラクタ引数に留める。
+        self._max_file_mb = max_file_mb
 
     # -- notebook 名検証（共通ヘルパ） -----------------------------------------
 
@@ -813,7 +837,7 @@ class ShelfService:
                 return self.add_directory(notebook, origin, auto_summary=auto_summary)
             # URL 系 origin は convert_url 側の Content-Length/打ち切り読みでサイズを
             # 制御するため対象外（design doc §7 はファイル系 origin の規定）。
-            file_error = _validate_file_origin(origin)
+            file_error = _validate_file_origin(origin, max_file_mb=self._max_file_mb)
             if file_error is not None:
                 return file_error
             # add_directory（resolve 済み絶対パスで origin 記録）と表記を揃える。
@@ -852,17 +876,20 @@ class ShelfService:
     # -- add_directory ---------------------------------------------------------
 
     @staticmethod
-    def _iter_directory_candidates(root: Path, skipped: list[dict]) -> Iterator[Path]:
+    def _iter_directory_candidates(
+        root: Path, skipped: list[dict], *, max_file_mb: int
+    ) -> Iterator[Path]:
         """root 配下を再帰走査し、対応形式の通常ファイルの Path だけを yield する。
 
         add_directory と shelve（設計書 §13.2 手順1「add_directory と同一規則」）が
         共有するスキャン規則: 隠しファイル/ディレクトリ（root からの相対パス構成要素の
-        いずれかが "." 始まり）は記録すらせず黙って除外し、symlink・未対応形式は
-        呼び出し元が渡す skipped リストへ記録したうえで除外する。rglob はディレクトリ
-        シンボリックリンクを辿らない（Python 3.11+）ため、tree 外へ迷い出る走査
-        ループの心配なくそのまま使える。root は呼び出し元が resolve 済みである前提
-        （yield する Path も resolve 済み絶対パスの子孫になる）。
+        いずれかが "." 始まり）は記録すらせず黙って除外し、symlink・未対応形式・
+        サイズ上限超過は呼び出し元が渡す skipped リストへ記録したうえで除外する。
+        rglob はディレクトリシンボリックリンクを辿らない（Python 3.11+）ため、tree 外へ
+        迷い出る走査ループの心配なくそのまま使える。root は呼び出し元が resolve 済み
+        である前提（yield する Path も resolve 済み絶対パスの子孫になる）。
         """
+        max_bytes = max_file_mb * 1024 * 1024
         for path in sorted(root.rglob("*")):
             rel_parts = path.relative_to(root).parts
             if any(part.startswith(".") for part in rel_parts):
@@ -883,6 +910,27 @@ class ShelfService:
                 pick_converter(str(path))
             except ConversionError:
                 skipped.append({"origin": str(path), "reason": "未対応の形式です"})
+                continue
+
+            try:
+                size = path.stat().st_size
+            except OSError:
+                # 走査中のファイル削除・権限変更等のレースで stat() が失敗し得る
+                # （indexer.py の「1ファイルの失敗で全体を止めない」既存原則と同じ
+                # 防御・コードレビュー指摘対応）。生の例外を漏らさず継続する。
+                skipped.append({"origin": str(path), "reason": "ファイルを読み取れませんでした"})
+                continue
+
+            if size > max_bytes:
+                # 1件の拒否で一括投入全体を止めない既存流儀（symlink・未対応形式と
+                # 同じ「skipped へ記録して継続」）。単体投入(add_source)は即時エラー
+                # 辞書を返すのに対し、一括投入では他ファイルの価値を優先する。
+                skipped.append(
+                    {
+                        "origin": str(path),
+                        "reason": f"ファイルサイズが上限（{max_file_mb}MB）を超えています",
+                    }
+                )
                 continue
 
             yield path
@@ -913,7 +961,7 @@ class ShelfService:
         skipped: list[dict] = []
         errors: list[dict] = []
 
-        for path in self._iter_directory_candidates(root, skipped):
+        for path in self._iter_directory_candidates(root, skipped, max_file_mb=self._max_file_mb):
             origin = str(path)
             try:
                 ingest_result = self._ingest_file(
@@ -1021,7 +1069,7 @@ class ShelfService:
         skipped: list[dict] = []
         errors: list[dict] = []
 
-        for path in self._iter_directory_candidates(root, skipped):
+        for path in self._iter_directory_candidates(root, skipped, max_file_mb=self._max_file_mb):
             origin = str(path)
             # 既に(いずれかのnotebookに)投入済みの origin は変換・要約・分類の
             # コストを払わずスキップする（設計書 §13.1 決定4/§13.7）。
