@@ -8,6 +8,7 @@ from __future__ import annotations
 import pytest
 
 from shelf.names import (
+    _is_reserved_device_name,
     assign_unique_name,
     doc_id_for,
     normalize_notebook_name,
@@ -69,6 +70,37 @@ class TestValidateNotebookName:
             validate_notebook_name(too_long)
         assert too_long[:64] in str(excinfo.value)
         assert too_long not in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "con",
+            "prn",
+            "aux",
+            "nul",
+            "com1",
+            "com9",
+            "lpt1",
+            "lpt9",
+        ],
+    )
+    def test_rejects_windows_reserved_device_names(self, name):
+        # notebook 名は corpus/ 配下のディレクトリ名になるため、Windows の
+        # 予約デバイス名（大文字小文字不問）を許すとディレクトリ作成不能・
+        # 誤動作につながる。
+        with pytest.raises(ValueError):
+            validate_notebook_name(name)
+
+    @pytest.mark.parametrize("name", ["CON", "Con", "PRN", "Com1"])
+    def test_is_reserved_device_name_matches_case_insensitively(self, name):
+        # validate_notebook_name 経路では regex が大文字を先に弾くため、
+        # 大文字小文字不問の判定自体は判定関数を直接呼んで検証する。
+        assert _is_reserved_device_name(name) is True
+
+    def test_accepts_name_containing_reserved_word_as_substring(self):
+        # 予約デバイス名は完全一致でのみ拒否する。"console" のような
+        # 予約語を含むだけの名前まで拒否するのは過剰。
+        assert validate_notebook_name("console") == "console"
 
 
 class TestDocIdFor:
@@ -169,6 +201,18 @@ class TestNormalizeNotebookName:
         raw = "Cooking Recipes!!"
         assert normalize_notebook_name(raw) == normalize_notebook_name(raw)
 
+    @pytest.mark.parametrize("reserved", ["con", "PRN", "Aux", "nul", "com1", "lpt9"])
+    def test_remaps_windows_reserved_device_names_to_safe_name(self, reserved):
+        # shelve の自動命名は normalize_notebook_name の出力をそのまま
+        # notebook 名として使うため、例外を投げず安全な名前へリマップする。
+        result = normalize_notebook_name(reserved)
+        assert result != reserved.lower()
+        assert validate_notebook_name(result) == result
+
+    def test_remapped_reserved_name_keeps_original_as_prefix(self):
+        result = normalize_notebook_name("con")
+        assert result.startswith("con")
+
     @pytest.mark.parametrize(
         "raw",
         [
@@ -182,6 +226,9 @@ class TestNormalizeNotebookName:
             "a" * 100,
             "a" * 63 + "!" * 5,
             "",
+            "con",
+            "PRN",
+            "com1",
         ],
     )
     def test_output_always_passes_validate_notebook_name(self, raw):
