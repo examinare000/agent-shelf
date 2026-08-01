@@ -286,6 +286,19 @@ class TestCheckFastembedCache:
         assert result.ok is True
         assert "未作成" in result.detail or "見つかりません" in result.detail
 
+    def test_missing_dir_detail_warns_serve_blocks_until_model_download(self, tmp_path):
+        """DL は「初回 embed 実行時」ではなく FastEmbedEmbedder のコンストラクタ
+        （= serve がリスナーを bind する前）で走る（実装確認済み）ため、未キャッシュ
+        時に serve が応答しなくなる旨を detail で警告する（要件2）。
+        """
+        cache_dir = tmp_path / "not-yet"
+
+        result = check_fastembed_cache(cache_dir)
+
+        assert "serve" in result.detail
+        assert "DL" in result.detail
+        assert "応答し" in result.detail
+
 
 class TestRunChecks:
     """run_checks は cli.py が呼ぶ唯一の窓口。実PATH/実ネットワーク/実DBに触れず
