@@ -37,7 +37,7 @@ from shelf.digests import (
     parse_reduce,
     select_reduce_input,
 )
-from shelf.indexer import IndexStats, index_notebook
+from shelf.indexer import DIGEST_SEQ_BASE, IndexStats, index_notebook
 from shelf.librarian import Librarian
 from shelf.names import doc_id_for, validate_notebook_name
 from shelf.ports import (
@@ -576,28 +576,55 @@ class ShelfService:
         return citations
 
     @staticmethod
+    def _digest_chunk_id_to_note_id(chunk_id: str) -> str:
+        """digest チャンクの id ("{notebook}/{doc_id}#{digest_seq}") を、対応する
+        study_notes.id ("{notebook}/{doc_id}#d{n}") へ変換する。
+
+        indexer.index_notebook は digest_seq = DIGEST_SEQ_BASE - note["seq"] で
+        チャンク id を生成する(indexer.py 参照)ため、逆算 n = DIGEST_SEQ_BASE -
+        digest_seq で study_notes.seq を復元できる。この関係は文字列操作だけで
+        閉じるため、store への追加問い合わせは不要（最小の対応方法として採用）。
+        """
+        prefix, _, digest_seq_text = chunk_id.rpartition("#")
+        seq = DIGEST_SEQ_BASE - int(digest_seq_text)
+        return f"{prefix}#d{seq}"
+
+    @classmethod
     def _build_insights(
-        insight_ids: list[int], insight_chunks: list[RetrievedChunk]
+        cls, insight_ids: list[int], insight_chunks: list[RetrievedChunk]
     ) -> list[dict]:
         """L番号(insight_ids)を retrieved された digest チャンクの学びに変換する。
 
         _build_citations と対称の構造だが、(source, page) 重複除去はしない: 学びノートは
         同一資料から複数件が独立した価値を持つため（citations の「同一箇所の重複引用を
-        1件にまとめる」判断とは意図が異なる）。note_id は chunks テーブルの id
-        （例 "nb/doc#-2"）をそのまま使う。study_notes.id の "#d{n}" 形式ではないが、
-        indexer.py/ports.py を編集できない本タスク(R8)の範囲では retrieved チャンクの
-        id が学びノートを一意に指す唯一の値であり、これで足りる（R9/R10 への申し送り
-        事項として完了報告に明記）。
+        1件にまとめる」判断とは意図が異なる）。note_id は study_notes.id
+        （"{notebook}/{doc_id}#d{n}" 形式）へ正規化する: 応答の note_id が指す先は
+        本来 study_notes テーブルであるべきで、chunks.id（例 "nb/doc#-2"）をそのまま
+        返すと呼び出し元が study_notes を引けない不整合になるため。chunk.id 自体は
+        応答互換のため chunk_id として additive に残す。
         """
         insights: list[dict] = []
         for l in insight_ids:  # noqa: E741 - 設計書 §5-C の "l" 番号をそのまま踏襲
             if not (1 <= l <= len(insight_chunks)):
                 continue
             chunk = insight_chunks[l - 1]
+            try:
+                note_id = cls._digest_chunk_id_to_note_id(chunk.id)
+            except (ValueError, IndexError) as exc:
+                # 現行の indexer.py 生成規則では到達不能だが、フェイルソフト方針
+                # （design doc既定）に合わせ、想定外形式の chunk.id で ask/consult
+                # 全体を落とさず、この insight だけをスキップして warning に残す。
+                _logger.warning(
+                    "digest チャンクの id が想定外形式のため insight をスキップしました: "
+                    "chunk_id=%r error=%r",
+                    chunk.id, exc,
+                )
+                continue
             insights.append(
                 {
                     "l": l,
-                    "note_id": chunk.id,
+                    "note_id": note_id,
+                    "chunk_id": chunk.id,
                     "source": chunk.source_path,
                     "text": chunk.text[:QUOTE_MAX_LEN],
                     # additive: map-reduce パイプライン(§7-B)が付与した代表節・
