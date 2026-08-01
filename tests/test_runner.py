@@ -7,6 +7,8 @@ runner.py のテスト: subprocess 実行の一本化。
 """
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -156,12 +158,245 @@ class TestRunCommandReturnType:
             result.stdout = "modified"
 
 
-class TestWindowsTimeoutFallback:
-    """【5】Windows 環境の timeout 処理で proc.kill() フォールバックが機能"""
+class TestRunCommandWhichResolution:
+    """Windows の CreateProcess は codex.cmd 等の PATHEXT 拡張子を解決できないため、
+    shutil.which（PATHEXT を見る）で事前解決してから Popen に渡す必要がある
+    （setup.py の is_command_available との検出結果の矛盾を解消する）。
+    """
+
+    def test_resolves_command_via_which_before_popen(self, monkeypatch):
+        """cmd[0] が shutil.which で解決されたパスで Popen が呼ばれる。"""
+        resolved_path = "/usr/bin/resolved-echo"
+        monkeypatch.setattr(shutil, "which", lambda name: resolved_path)
+
+        captured_cmd: list[str] = []
+
+        class _FakeProc:
+            returncode = 0
+
+            def communicate(self, input=None, timeout=None):
+                return "", ""
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd.extend(cmd)
+            return _FakeProc()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        run_command(["echo", "hello"])
+
+        assert captured_cmd[0] == resolved_path
+        assert captured_cmd[1:] == ["hello"]
+
+    def test_missing_command_short_circuits_without_calling_popen(self, monkeypatch):
+        """which が None を返したら Popen を呼ばず rc=127 を即返す。"""
+        monkeypatch.setattr(shutil, "which", lambda name: None)
+
+        def fail_popen(*args, **kwargs):
+            raise AssertionError("Popen should not be called when which() returns None")
+
+        monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+        result = run_command(["definitely-not-a-real-command"])
+
+        assert result.returncode == 127
+        assert "command not found: definitely-not-a-real-command" in result.stderr
+        assert result.timed_out is False
+
+    def test_which_is_not_called_when_cmd_contains_path_separator(self, monkeypatch):
+        """cmd[0] にパス区切りを含む場合は shutil.which を呼ばない（回帰防止）。
+
+        shutil.which は親プロセスの cwd 基準で解決するため、run_command 側で
+        which に通してしまうと workdir 配下の相対パスコマンドが誤って
+        rc=127 になる（レビュー実機再現: run_command(["./script.sh"], workdir=...)）。
+        さらに親 cwd にある同名ファイルへ静かにすり替わるリスクもある。
+        """
+        which_calls: list[str] = []
+        monkeypatch.setattr(
+            shutil, "which", lambda name: which_calls.append(name) or "/should/not/be/used"
+        )
+
+        run_command(["/bin/echo", "hi"])
+
+        assert which_calls == []
+
+    def test_relative_path_command_skips_which_and_uses_workdir(self, tmp_path):
+        """workdir 配下の相対パススクリプトが which 追加後も引き続き実行できる（回帰テスト）。"""
+        script = tmp_path / "script.sh"
+        script.write_text("#!/bin/sh\necho relative-ok\n")
+        script.chmod(0o755)
+
+        result = run_command(["./script.sh"], workdir=tmp_path)
+
+        assert result.stdout.strip() == "relative-ok"
+        assert result.returncode == 0
+
+    def test_file_not_found_error_reports_original_name_not_resolved_path(self, monkeypatch):
+        """TOCTOU（which 解決後に Popen が FileNotFoundError を投げる）でも、
+        stderr には元のコマンド名を残し、解決済み絶対パスを漏らさない。
+        """
+        resolved_path = "/usr/bin/toctou-victim"
+        monkeypatch.setattr(shutil, "which", lambda name: resolved_path)
+
+        def fake_popen(cmd, **kwargs):
+            raise FileNotFoundError()
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+        result = run_command(["toctou-victim"])
+
+        assert result.returncode == 127
+        assert "toctou-victim" in result.stderr
+        assert resolved_path not in result.stderr
+
+
+class TestWindowsProcessTreeKill:
+    """.cmd 経由起動では直接の子が cmd.exe になるため、timeout 時の proc.kill() は
+    cmd.exe のみを殺し孫の node.exe が孤児化する。os.name=='nt' では
+    taskkill /T /F（PID の親子ツリーを辿って kill）でプロセスツリーごと殺す必要がある。
+
+    creationflags=CREATE_NEW_PROCESS_GROUP は付与しない: このフラグは
+    GenerateConsoleCtrlEvent（Ctrl+C/Break のシグナル配送先グループ）向けであり、
+    taskkill /T が辿るのは PID の親子関係であってプロセスグループではないため、
+    taskkill 方式には不要（レビュー指摘: 誤った技術的因果をコメントに残さない）。
+    """
+
+    def test_windows_timeout_uses_taskkill_with_tree_and_force_flags(self, monkeypatch):
+        """os.name=='nt' で timeout したら taskkill /T /F /PID <pid> を呼ぶ。"""
+        import os
+
+        monkeypatch.setattr(os, "name", "nt")
+
+        class _FakeProc:
+            pid = 4321
+            returncode = None
+
+            def __init__(self):
+                self._communicate_calls = 0
+                self.kill_called = False
+
+            def communicate(self, input=None, timeout=None):
+                self._communicate_calls += 1
+                if self._communicate_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                self.kill_called = True
+
+        fake_proc = _FakeProc()
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: fake_proc)
+
+        taskkill_calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            taskkill_calls.append(cmd)
+
+            class _Result:
+                returncode = 0
+
+            return _Result()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = run_command(["/bin/sleep", "10"], timeout=1)
+
+        assert result.timed_out is True
+        assert len(taskkill_calls) == 1
+        assert taskkill_calls[0] == ["taskkill", "/T", "/F", "/PID", "4321"]
+        # taskkill が呼ばれた場合、proc.kill() フォールバックは使わない。
+        assert fake_proc.kill_called is False
+
+    def test_windows_timeout_falls_back_to_proc_kill_when_taskkill_fails(self, monkeypatch):
+        """taskkill 自体が例外を投げたら proc.kill() にフォールバックする。"""
+        import os
+
+        monkeypatch.setattr(os, "name", "nt")
+
+        class _FakeProc:
+            pid = 5555
+            returncode = None
+
+            def __init__(self):
+                self._communicate_calls = 0
+                self.kill_called = False
+
+            def communicate(self, input=None, timeout=None):
+                self._communicate_calls += 1
+                if self._communicate_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                self.kill_called = True
+
+        fake_proc = _FakeProc()
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: fake_proc)
+
+        def fake_run(cmd, **kwargs):
+            raise OSError("taskkill.exe not found")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = run_command(["/bin/sleep", "10"], timeout=1)
+
+        assert result.timed_out is True
+        assert fake_proc.kill_called is True
+
+    def test_windows_timeout_falls_back_to_proc_kill_when_taskkill_returns_nonzero(
+        self, monkeypatch
+    ):
+        """taskkill が例外を投げず非0 returncode を返す場合も proc.kill() にフォールバックする。
+
+        subprocess.run は check=True を指定しない限り非0 returncode で例外を投げないため、
+        戻り値を無視すると権限不足等の taskkill 失敗を見逃してしまう（レビュー指摘）。
+        """
+        import os
+
+        monkeypatch.setattr(os, "name", "nt")
+
+        class _FakeProc:
+            pid = 6666
+            returncode = None
+
+            def __init__(self):
+                self._communicate_calls = 0
+                self.kill_called = False
+
+            def communicate(self, input=None, timeout=None):
+                self._communicate_calls += 1
+                if self._communicate_calls == 1:
+                    raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                return "", ""
+
+            def kill(self):
+                self.kill_called = True
+
+        fake_proc = _FakeProc()
+        monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: fake_proc)
+
+        def fake_run(cmd, **kwargs):
+            class _Result:
+                returncode = 1
+
+            return _Result()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        result = run_command(["/bin/sleep", "10"], timeout=1)
+
+        assert result.timed_out is True
+        assert fake_proc.kill_called is True
+
+
+class TestTimeoutKillFallbackBranches:
+    """timeout 時の kill 分岐（os.name=='nt' / killpg 利用可能 / どちらでもない未知環境）
+    のうち、POSIX の killpg 経路と、killpg 非対応かつ os.name!='nt' の第三分岐
+    （不明環境向けフォールバック）を検証する。
+    """
 
     def test_timeout_with_available_killpg_kills_process_group(self):
-        """【5】timeout 時にプロセスが確実に kill される（killpg 使用可能環境）"""
-        # POSIX 環境（killpg 使用可能）での timeout テスト
+        """timeout 時にプロセスが確実に kill される（killpg 使用可能な POSIX 環境）。"""
         result = run_command(
             ["/bin/sleep", "10"],  # 10秒の sleep（timeout が 1秒のため kill される）
             timeout=1,
@@ -171,11 +406,19 @@ class TestWindowsTimeoutFallback:
         # プロセスが kill されるため、returncode は 0 ではない（SIGKILL で -9 相当）
         assert result.returncode != 0 or result.timed_out
 
-    def test_timeout_with_windows_fallback_uses_proc_kill(self, monkeypatch):
-        """【5】Windows フォールバック（killpg 非使用可）で proc.kill() が呼ばれる"""
+    def test_timeout_falls_back_to_proc_kill_when_killpg_unavailable_and_not_windows(
+        self, monkeypatch
+    ):
+        """killpg 非対応かつ os.name!='nt' の未知環境では、taskkill 分岐ではなく
+        第三分岐（else: proc.kill()）を通ってプロセスを kill する。
+
+        このテストは os.name を変更せず os.killpg/os.getpgid だけを削除するため、
+        実行環境（テストホストの実 os.name）を経由して taskkill 分岐ではなく
+        「killpg 非対応の未知環境向け」フォールバックを検証している。
+        """
         import os
 
-        # os.killpg と os.getpgid を削除して Windows 環境をシミュレート
+        # os.killpg と os.getpgid を削除して killpg 非対応環境をシミュレート
         monkeypatch.delattr(os, "killpg", raising=False)
         monkeypatch.delattr(os, "getpgid", raising=False)
 
