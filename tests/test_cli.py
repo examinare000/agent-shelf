@@ -17,6 +17,7 @@ import pytest
 
 from shelf import cli
 from shelf.cli import build_parser
+from shelf.doctor import CheckResult
 from shelf.indexer import IndexStats
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
@@ -516,6 +517,54 @@ class TestPersonaCommand:
     def test_set_and_clear_are_mutually_exclusive(self):
         with pytest.raises(SystemExit):
             build_parser().parse_args(["persona", "physics", "--set", "text", "--clear"])
+
+
+class TestDoctorCommand:
+    def test_parses_with_no_extra_args(self):
+        args = build_parser().parse_args(["doctor"])
+        assert args.command == "doctor"
+
+
+class TestDoctorDispatch:
+    """main() の doctor ディスパッチが doctor.run_checks() の結果を印字し、
+    1件でも ok=False なら SystemExit(1) することを、run_checks を差し替えて検証する
+    (実PATH/実DB/実ネットワークには一切触れない)。
+    """
+
+    def test_prints_ok_and_ng_marks_with_detail(self, monkeypatch, capsys):
+        results = [
+            CheckResult(name="engine:codex", ok=True, detail="codex コマンドが見つかりました"),
+            CheckResult(name="ollama", ok=False, detail="http://x へ疎通できません"),
+        ]
+        monkeypatch.setattr(cli.doctor, "run_checks", lambda: results)
+
+        with pytest.raises(SystemExit):
+            cli.main(["doctor"])
+
+        out = capsys.readouterr().out
+        assert "✓ engine:codex: codex コマンドが見つかりました" in out
+        assert "✗ ollama: http://x へ疎通できません" in out
+
+    def test_exits_zero_when_all_ok(self, monkeypatch):
+        results = [CheckResult(name="engine:codex", ok=True, detail="ok")]
+        monkeypatch.setattr(cli.doctor, "run_checks", lambda: results)
+
+        try:
+            cli.main(["doctor"])
+        except SystemExit as e:
+            assert e.code in (0, None)
+
+    def test_exits_one_when_any_check_fails(self, monkeypatch):
+        results = [
+            CheckResult(name="engine:codex", ok=True, detail="ok"),
+            CheckResult(name="ollama", ok=False, detail="ng"),
+        ]
+        monkeypatch.setattr(cli.doctor, "run_checks", lambda: results)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["doctor"])
+
+        assert exc_info.value.code == 1
 
 
 class _FakeMcpSettings:

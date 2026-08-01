@@ -12,11 +12,14 @@
 from __future__ import annotations
 
 import functools
+import importlib.metadata
 from collections.abc import Sequence
 
 import anyio.to_thread
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
 
 from shelf.service import ShelfService
 
@@ -44,6 +47,22 @@ def build_transport_security(allowed_hosts: Sequence[str]) -> TransportSecurityS
 
 def create_server(service: ShelfService) -> FastMCP:
     mcp = FastMCP("shelf")
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request: Request) -> Response:
+        """Task Scheduler 等の無人運用向け死活監視エンドポイント。
+
+        custom_route（mcp SDK）は認証を要求せず Host/Origin 検査の対象外
+        （build_transport_security の DNS リバインディング保護は MCP プロトコル
+        パスにのみ適用され、custom_route には及ばない）。したがって、ここで返す
+        情報は「サーバプロセスが生きているか」の判定に必要な最小限の2フィールド
+        （status・version）に意図的に絞る（custom_route が認証・Host 検査の外に
+        あるため、公開情報を最小化する設計判断。notebook 一覧・設定値等の
+        情報は決して含めない）。
+        """
+        return JSONResponse(
+            {"status": "ok", "version": importlib.metadata.version("shelf")}
+        )
 
     @mcp.tool()
     async def ask(notebook: str, question: str) -> dict:

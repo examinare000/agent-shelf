@@ -10,11 +10,13 @@ Store(":memory:") + FakeEmbedder + FakeAnswerBackend を注入し、実DB・実�
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 import threading
 from pathlib import Path
 
 import pytest
+from starlette.testclient import TestClient
 
 from shelf.indexer import index_notebook
 from shelf.ports import RawAnswer
@@ -317,6 +319,38 @@ def test_only_the_three_expected_tools_are_registered(tool_name, tmp_path):
 
     assert names == {"ask", "list_notebooks", "consult"}
     assert tool_name in names
+
+
+class TestHealthRoute:
+    """GET /health は Task Scheduler 等の死活監視用の無認証エンドポイント
+    (design判断: 認証・Host 検査の外にあるため公開情報は status/version の2つのみ)。
+    FastMCP.streamable_http_app() が実際に組み立てる Starlette app に対して
+    starlette.testclient.TestClient で疎通を検証する(register済みcustom_routeの
+    実体を確認するため。実ネットワークは使わない、単一プロセス内ASGI呼び出し)。
+    """
+
+    def test_returns_200_with_status_ok_and_version(self, tmp_path):
+        service = _service_with_one_chunk(tmp_path)
+        server = create_server(service)
+        app = server.streamable_http_app()
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ok"
+        assert body["version"] == importlib.metadata.version("shelf")
+
+    def test_response_contains_only_status_and_version_fields(self, tmp_path):
+        service = _service_with_one_chunk(tmp_path)
+        server = create_server(service)
+        app = server.streamable_http_app()
+
+        with TestClient(app) as client:
+            response = client.get("/health")
+
+        assert set(response.json().keys()) == {"status", "version"}
 
 
 class TestBuildTransportSecurity:

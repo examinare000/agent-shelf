@@ -135,6 +135,7 @@ shelf index tech-books
 | `emit-mcp` | claude / codex / gemini 向け MCP 設定ファイルを生成（`--host` / `--transport` / `--url` / `-o`。登録は行わない） |
 | `setup` | 対話式で backend 初期設定（config.env）を生成（`--yes` / `--answers-file`） |
 | `persona <notebook>` | notebook の専門家ペルソナを表示・設定（`--set` / `--clear`） |
+| `doctor` | 環境のプリフライト診断（エンジンCLI / ollama / DB / corpus / config.env / fastembed キャッシュ）。1つでも失敗があれば exit code 1 |
 
 使用例:
 
