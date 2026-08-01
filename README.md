@@ -181,6 +181,15 @@ claude mcp add --transport http --scope user shelf http://<host>:8765/mcp
 長い consult が途中で切れるため、クライアント設定を引き上げるか、サーバ側で
 `SHELF_ANSWER_TIMEOUT` を短縮して整合させてください。
 
+**推奨設定例（多段ルーティング）**: 複数 notebook にまたがる質問への回答精度を
+上げたい場合、`SHELF_ROUTE_TOP_N=2`（コード側の上限と同値）+
+`SHELF_ROUTE_FALLBACK=all`（ルーティング失敗時も対象ゼロにせず全 notebook を
+横断）の組み合わせを推奨します。この設定でも、`consult` の専門家呼び出しは
+並行化済み（`ThreadPoolExecutor`）のため上記の一般式ほど壁時計は伸びません。
+司書ルーティング1回（直列）+ 選択された最大2 notebook への回答生成（並行実行の
+max）という2段構成に留まるため、構成値から算出される理論上の最悪壁時計はおおよそ
+`SHELF_ANSWER_TIMEOUT × 2`（既定構成で600秒）です。
+
 **輻輳時の挙動**: `ask`/`list_notebooks`/`consult` はいずれもバックエンド呼び出しを
 anyio のワーカースレッドプール（既定上限 40 スレッド）へ逃がして実行するため、
 1 クライアントの長時間 consult が他クライアントの呼び出しをブロックすることは
