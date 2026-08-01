@@ -2361,6 +2361,212 @@ def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     assert routed["insights"] == []
 
 
+def test_consult_degrades_only_the_failing_target_when_multiple_experts_fan_out(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """複数 target への fan-out で 1 件の backend 失敗が他の target を巻き込まない
+    （add_directory の「1件の失敗で全体を止めない」流儀・タスク A4 で維持すべき既存挙動）。
+    呼び出し順ではなく notebook 名で成否を切り替えるフェイクにし、並行実行時の
+    レース（backend.calls の消費順序が不定になる）に依存しない判定にする。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_ok", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_fail", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_ok", score=0.9, subquery=_QUERY_TEXT, reason="OK"),
+        RouteTarget(notebook="nb_fail", score=0.8, subquery=_QUERY_TEXT, reason="FAIL"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+
+    class PerNotebookBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            if workdir.name == "nb_fail":
+                return RawAnswer(text="", ok=False, error="timeout")
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = PerNotebookBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    routed_by_notebook = {r["notebook"]: r for r in result["routed"]}
+    assert routed_by_notebook["nb_ok"]["grounded"] is True
+    assert routed_by_notebook["nb_ok"]["answer"] != ""
+    assert routed_by_notebook["nb_fail"]["grounded"] is False
+    assert routed_by_notebook["nb_fail"]["answer"] == ""
+    assert routed_by_notebook["nb_fail"]["citations"] == []
+
+
+def test_consult_preserves_routing_order_even_when_second_target_finishes_first(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """並行実行しても routed[] はルーティング順（実行完了順ではない）を保つ。
+    nb_a の呼び出しを nb_b の呼び出しが終わるまで足止めし、完了順が逆転しても
+    routed[0] が nb_a（ルーティング1番目）のままであることを固定する。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    nb_b_done = threading.Event()
+    answer_json = _grounded_raw_answer([1]).text
+
+    class ReversedCompletionBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            if workdir.name == "nb_a":
+                # nb_b の完了（下の else 節での set）を待ってから返る。並行実行でなければ
+                # nb_b はまだ呼ばれていないため、この wait はタイムアウトするだけで
+                # 順序は元々崩れない（決定論的・sleep 非依存）。
+                nb_b_done.wait(timeout=0.3)
+            else:
+                nb_b_done.set()
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = ReversedCompletionBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    assert [r["notebook"] for r in result["routed"]] == ["nb_a", "nb_b"]
+
+
+def test_consult_calls_experts_concurrently_for_multiple_targets(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """2 target の専門家呼び出しが並行実行されることを、両方の backend.answer() が
+    「同時に実行中」であることを待ち合わせる threading.Barrier(2) で証明する。
+    逐次実装ではもう一方の呼び出しがまだ backend.answer() に到達していない状態で
+    最初の呼び出しが Barrier に足止めされ、相方が来ないままタイムアウトして
+    BrokenBarrierError が consult() から伝播し Red になる（sleep 非依存・決定論的）。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    barrier = threading.Barrier(2, timeout=1.0)
+    answer_json = _grounded_raw_answer([1]).text
+
+    class BarrierSyncedBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            barrier.wait()  # 両方が同時に到達しない限りタイムアウトして例外化する
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = BarrierSyncedBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    assert [r["notebook"] for r in result["routed"]] == ["nb_a", "nb_b"]
+    assert all(r["grounded"] for r in result["routed"])
+
+
+def test_consult_serializes_embed_query_calls_across_concurrent_targets(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """並行実行される複数 target が共有 embedder.embed_query() を同時に叩かない
+    ことを検証する。embedder は単一の共有インスタンス（実装は onnxruntime
+    InferenceSession + HF tokenizer）で、並行呼び出し安全性を一次情報で確認できて
+    いないため service 側で直列化する（レビュー指摘: 共有 embedder の並行安全性）。
+    検出用ラッパーは embed_query 内の同時実行数を計測し、直列化されていれば
+    max_concurrent は常に 1 のまま。実行中にごく短い sleep を挟むのは Green 側の
+    判定確定性(Lock がある限り2つ目は関数に入ることすらできない)には影響せず、
+    直列化されていない場合に確実に重なりを検出できるよう競合の窓を広げるためだけ
+    に入れている。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+    backend = FakeAnswerBackend(canned=answer_json)
+
+    class ConcurrencyDetectingEmbedder:
+        """FakeEmbedder をラップし、embed_query の同時実行数を計測する検出用ダブル。"""
+
+        def __init__(self, inner: FakeEmbedder) -> None:
+            self._inner = inner
+            self.model_name = inner.model_name
+            self._active_lock = threading.Lock()
+            self._active = 0
+            self.max_concurrent = 0
+
+        def embed_documents(self, texts: list[str]):
+            return self._inner.embed_documents(texts)
+
+        def embed_query(self, text: str):
+            with self._active_lock:
+                self._active += 1
+                self.max_concurrent = max(self.max_concurrent, self._active)
+            time.sleep(0.02)  # 競合の窓を広げるためだけの遅延（同期プリミティブではない）
+            with self._active_lock:
+                self._active -= 1
+            return self._inner.embed_query(text)
+
+    detecting_embedder = ConcurrencyDetectingEmbedder(embedder)
+    service = ShelfService(
+        store, detecting_embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    assert detecting_embedder.max_concurrent == 1
+
+
+def test_consult_propagates_raw_exception_from_expert_backend_call(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """1 件の target が backend.answer() で生例外を投げた場合、その例外型が
+    consult() の呼び出し元まで正しく伝播する（レビュー指摘: 生例外パスの挙動）。
+    もう一方の target は正常応答を返す canned にし、実行中の相方が cancel 不能な
+    まま shutdown(wait=True) の完了を待ってから例外が伝播する（_consult_targets の
+    docstring 参照）ことを、例外型・メッセージが失われずに届くことで確認する。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+
+    class RaisingBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            if workdir.name == "nb_a":
+                raise ValueError("boom: unexpected backend crash")
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = RaisingBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    with pytest.raises(ValueError, match="boom: unexpected backend crash"):
+        service.consult(_QUERY_TEXT)
+
+
 # -- スレッド安全性: _get_librarian/_get_shelver の遅延 check-then-set 対策（タスク A2）---
 
 
