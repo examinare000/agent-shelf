@@ -122,7 +122,24 @@ def run_command(
             # os.killpg/getpgid は Windows には存在せず AttributeError になり、
             # 外側の except Exception に飲まれて timed_out=False の runner error に
             # 化けて子プロセスが放置されていた（実証: TestRunCommandTimeout の red）。
-            if hasattr(os, "killpg"):
+            if os.name == "nt":
+                # Windows: .cmd 経由起動では直接の子が cmd.exe のため、proc.kill() だけ
+                # では孫の node.exe が孤児化する。taskkill /T（PID の親子ツリーを辿って
+                # kill）/F（強制）でプロセスツリーごと殺す。subprocess.run は check=True
+                # を指定しない限り非0 returncode で例外を投げないため、例外発生時だけで
+                # なく returncode != 0（未インストール・権限不足等）でも proc.kill() に
+                # フォールバックし、直接の子だけは確実に殺す。
+                try:
+                    result = subprocess.run(
+                        ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                        capture_output=True,
+                        timeout=5,
+                    )
+                    if result.returncode != 0:
+                        proc.kill()
+                except Exception:
+                    proc.kill()
+            elif hasattr(os, "killpg"):
                 # POSIX: プロセスグループごと殺す（孫プロセスまで確実に殺すため）。
                 try:
                     pgid = os.getpgid(proc.pid)
@@ -131,7 +148,7 @@ def run_command(
                     # プロセスがすでに終了している場合など
                     pass
             else:
-                # Windows: プロセスグループ kill 手段がないため直接の子のみ kill。
+                # 上記いずれにも該当しない未知環境向けのフォールバック。
                 proc.kill()
 
             # タイムアウト後の残り出力を回収
