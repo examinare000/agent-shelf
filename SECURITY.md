@@ -13,9 +13,9 @@
 
 - **JSON キー形式**: `"password": "..."` のようにラベルがクォートに包まれた形式は、ラベルと区切り文字（`:`）の間でクォートが終端するため新旧とも未マスク。
 - **末尾非空白**: 閉じクォート直後に `,` `)` `}` `;` 等の非空白が続く形（JSON5/YAML flow/Python kwarg 等）は、短勝ちマッチ再発防止のため旧実装と同じ先頭トークンのみマスクに留まります（露出増なし）。
-- **日本語引用符**: `「」` のような日本語引用符は新旧とも先頭トークン限定（vault の mask_vault のみ日本語ラベルを補完）。
+- **日本語引用符**: `「」` のような日本語引用符は新旧とも先頭トークン限定。
 
-詳細は [ADR-0008](docs/adr/0008-mask-quoted-value-pattern.md) および [docs/trial-log/mask-quoted-values.md](docs/trial-log/mask-quoted-values.md) を参照してください。
+修正の設計判断（クォート全体優先・改行除外・閉じ直後非空白での不採用）と「旧実装より露出を増やさない」不変条件の検証経緯は、`tests/test_masking.py` の `TestQuotedValueMasking` docstring と CHANGELOG の該当エントリを参照してください。
 
 ## 脆弱性、および悪意のあるコード・プロンプト指示の混入の報告
 
