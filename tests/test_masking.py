@@ -135,6 +135,30 @@ class TestIdempotency:
                 id="jwt",
             ),
             pytest.param("nothing secret here at all", id="plain-text"),
+            pytest.param(
+                'password: "hunter 2 with spaces"',
+                id="double-quoted-multiword-value",
+            ),
+            pytest.param(
+                "api_key: 'foo bar baz'",
+                id="single-quoted-multiword-value",
+            ),
+            pytest.param(
+                'password: """hunter 2 with spaces"""',
+                id="triple-quoted-multiword-value-with-unbalanced-quotes",
+            ),
+            pytest.param(
+                'export API_KEY=""$REAL_KEY_VALUE""',
+                id="empty-quote-wrapped-shell-variable",
+            ),
+            pytest.param(
+                'password: "start of secret\nmore stuff here\napi_key: "closed later',
+                id="crossline-unterminated-double-quote",
+            ),
+            pytest.param(
+                "token: 'it starts\nhere and it's\nnever closed",
+                id="crossline-unterminated-single-quote-with-apostrophe",
+            ),
         ],
     )
     def test_repeated_mask_is_stable(self, text: str) -> None:
@@ -144,8 +168,7 @@ class TestIdempotency:
 
 
 class TestKnownQuirks:
-    """現行規則の既知の癖（過剰/過少マスク）。extract.py は改変禁止のため、
-    仕様として固定するのみで修正はしない。
+    """現行規則の既知の癖（過剰/過少マスク）。
 
     発見内容:
     1. regex 適用順によるラベル剥落: sk-/ghp_/AKIA/JWT の各 regex が先に走り
@@ -154,10 +177,12 @@ class TestKnownQuirks:
        マーカーを汎用の "token=<REDACTED>" で上書きしてしまう。実害（漏洩）
        はないが、ログ上でどの種類の秘密だったかの情報が失われる（過剰マスク
        ではなく「情報劣化」）。
-    2. 汎用 password|passwd|secret|api_key|token regex は値を `\\S+`
-       （空白を含まない）でしか捕捉しないため、`password: "hunter 2 style"`
-       のようにクォートで囲まれた複数語の値は先頭の1語しかマスクされず、
-       残りの単語がログに残る（過少マスク・実害あり）。
+    2. （修正済み・2026-08-02）汎用 password|passwd|secret|api_key|token regex は
+       元々値を `\\S+`（空白を含まない）でしか捕捉せず、`password: "hunter 2 style"`
+       のようにクォートで囲まれた複数語の値は先頭の1語しかマスクされずに残りの
+       単語がログに残っていた（過少マスク・実害あり）。値パターンをクォート文字列
+       全体優先（`"..."` / `'...'` を丸ごと捕捉し、どちらでもなければ従来の `\\S+`
+       にフォールバック）へ変更し解消した。挙動は TestQuotedValueMasking を参照。
     3. sk-/ghp_ 系の regex には単語境界 (`\\b`) が無いため、"prefix_sk-XXXX"
        のように語の途中に埋め込まれていてもマッチする。値そのものは正しく
        マスクされるため過少マスクにはならないが、意図せず前後の文字列が
@@ -173,15 +198,105 @@ class TestKnownQuirks:
         assert result == "token=<REDACTED>"
         assert "<REDACTED-KEY>" not in result
 
-    def test_quoted_multiword_value_only_partially_masked(self) -> None:
+    def test_quoted_multiword_value_is_fully_masked(self) -> None:
         text = 'password: "hunter 2 with spaces"'
 
         result = mask(text)
 
-        # 最初の空白区切りトークンまでしかマスクされず、残りの単語が漏洩する。
-        assert result == 'password=<REDACTED> 2 with spaces"'
+        # クォート文字列全体（閉じクォートまで）がマスクされ、漏洩しない。
+        assert result == "password=<REDACTED>"
         assert "hunter" not in result
-        assert "with spaces" in result
+        assert "with spaces" not in result
+
+
+class TestQuotedValueMasking:
+    """クォート付き複数語 secret 値の修正後の挙動を固定する。
+
+    値パターンは `"(?:\\\\.|[^"\\\\\\n])*"(?!\\\\S)` （ダブルクォート、内部エスケープ
+    許容、改行は body から除外）/ `'(?:\\\\.|[^'\\\\\\n])*'(?!\\\\S)` （シングルクォート、
+    同様）を `\\S+` より先に試し、どちらにもマッチしなければ従来どおり `\\S+` に
+    フォールバックする。
+
+    `\\n` を body から除外するのは、閉じクォートが別行にある入力（例:
+    password 行の値がダブルクォートで開いたまま複数行下の別ラベル行で
+    初めて閉じクォートに出会うケース）で無関係な複数行を丸ごと飲み込んで
+    消してしまうのを防ぐため。閉じ直後に `(?!\\S)`（次が非空白なら不採用）を
+    置くのは、値が空クォートや連続する複数個のクォート文字で始まるケースで
+    「早期に閉じたと誤認して後続語を露出させる」短勝ちマッチを弾き、旧実装
+    （`\\S+` のみ）と同等以上の安全側へ倒すため。両条件のいずれかで不採用になった
+    場合は `\\S+` にフォールバックし、旧実装と同じ「先頭トークンのみマスク」に
+    留まる。
+    """
+
+    def test_double_quoted_multiword_value_is_fully_masked(self) -> None:
+        text = 'password: "hunter 2 with spaces"'
+
+        result = mask(text)
+
+        assert result == "password=<REDACTED>"
+
+    def test_quoted_value_with_trailing_punctuation_falls_back_to_first_token(self) -> None:
+        # 閉じクォート直後が非空白（, ) } ; 等。JSON5/YAML flow/Python kwarg で頻出）の
+        # 場合は (?!\S) によりクォート分岐を採らず、旧実装と同じ先頭トークンのみの
+        # マスクに留まる。短勝ちマッチの再発防止と引き換えの既知の制限（CHANGELOG 開示）。
+        result = mask('password: "hunter 2 spaces",')
+
+        assert result == 'password=<REDACTED> 2 spaces",'
+
+    def test_single_quoted_multiword_value_is_fully_masked(self) -> None:
+        text = "api_key: 'foo bar baz'"
+
+        result = mask(text)
+
+        assert result == "api_key=<REDACTED>"
+
+    def test_double_quoted_value_with_escaped_quote_is_fully_masked(self) -> None:
+        # 値の中に \" を含むエスケープ済みクォートがあっても、そこで閉じたと
+        # 誤認せず本当の閉じクォートまでをマスクする。
+        text = r'secret: "say \"hi\" to bob"'
+
+        result = mask(text)
+
+        assert result == "secret=<REDACTED>"
+        assert "bob" not in result
+
+    def test_single_quoted_value_with_escaped_quote_is_fully_masked(self) -> None:
+        text = r"token: 'it\'s a secret'"
+
+        result = mask(text)
+
+        # 完全一致で全体マスクを確認済みのため、この時点で "secret" は result に
+        # 一切含まれない（`result.replace("<REDACTED>", "")` の再チェックは
+        # 直前の完全一致に完全に含意される冗長な主張だったため、意味のある
+        # 主張として「アポストロフィエスケープを含む値でも label だけが残る」
+        # ことを明示する形に置き換える）。
+        assert result == "token=<REDACTED>"
+
+    def test_double_quoted_value_starting_with_empty_quote_falls_back_to_full_token(
+        self,
+    ) -> None:
+        # 値が空クォート ("") で始まり直後に非空白が続く場合、「早期に閉じた」と
+        # 誤認して残りの語を露出させてはならない。(?!\S) が弾くことで \S+ に
+        # フォールバックし、旧実装（\S+ のみ）と同じ「1トークン全体マスク」に
+        # 落ち着く（このケースは内部に空白が無いため \S+ でも取りこぼしなく
+        # 全体がマスクされる）。
+        text = 'password: ""hunter2"'
+
+        result = mask(text)
+
+        assert result == "password=<REDACTED>"
+        assert "hunter2" not in result
+
+    def test_double_quoted_empty_value_surrounding_variable_falls_back_to_full_token(
+        self,
+    ) -> None:
+        # shell 変数展開に典型的な `""$VAR""` 形式。空クォートの早期閉じ誤認で
+        # $REAL_KEY_VALUE が露出してはならない。
+        text = 'export API_KEY=""$REAL_KEY_VALUE""'
+
+        result = mask(text)
+
+        assert result == "export API_KEY=<REDACTED>"
 
 
 class TestExtractPyOverride:

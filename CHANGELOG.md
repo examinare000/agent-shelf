@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **クォート付き複数語の secret 値の過少マスク修正**: 汎用の password/secret/token regex が
+  クォート文字列内の複数語を先頭 1 トークンのみマスクしていた問題を修正。値パターンを
+  クォート全体優先（ダブル/シングルクォート、内部エスケープ許容、改行をまたいで飲み込まない）へ
+  変更し、どちらでもなければ従来の `\S+` へフォールバック。対象は `ラベル: 値` / `ラベル= 値` の
+  直書き形式のみ。既知の制限: JSON キー形式（`"password": "..."`）は本修正の前後を通じて
+  未対応のまま。また閉じクォート直後に `,` `)` `}` `;` 等の非空白が続く形（JSON5/YAML flow/Python kwarg）は
+  早期閉じ誤認防止のため旧実装と同じ先頭トークンのみのマスクに留まる（露出増なし）。
+
 ### Security
 - **要約/分類/digest プロンプトへの title 未 mask 露出を修正**: v0.5.0 のカタログ投影・永続化時 mask（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）は、取込時の要約生成プロンプト（`build_summary_prompt` の add/shelve 双方の呼び出し）・shelve 要約失敗時のフォールバック分類プロンプト（`build_classification_prompt`）・digest map/reduce プロンプトの title 引数には未適用で、converter 抽出直後の生 title・既存 DB 行の未 mask title がそれぞれ backend へ素通しになる経路が残っていた。プロンプト構築の直前で mask を適用する
 

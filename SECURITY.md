@@ -7,15 +7,15 @@
 - **MCP surface は読み取り 3 ツールのみ**: `ask` / `list_notebooks` / `consult`。notebook 作成・資料投入・削除などコーパスを変更する操作は CLI（人間操作）に限定し、MCP には公開していません。
 - **シークレットマスキングは取込時に適用**: 資料は corpus への永続化前に `mask()` を通します。マスク規則の正本は `distill/extract.py`（`SHELF_EXTRACT_PY` で差し替え可能。`shelf/masking.py` が importlib で読み込む単一ソース方式）。文書 title は「backend へ送出される全テキストは mask 済み」という不変条件（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）のもと、永続化時に加えて、ルーティングカタログ投影・要約/分類プロンプト構築・digest map/reduce プロンプト構築の直前でも再度 mask を適用する二重防御としています（修正適用前に永続化された既存行にも遡って有効）。
 
-### 既知の制限
+### 既知の制限（修正済み：2026-08-02）
 
-- **マスク規則の過少マスク（password/secret/token 系）**: 汎用の password/secret/token
-  検出 regex は値キャプチャが空白を含まない設計のため、クォートで囲まれた複数語の
-  値（例 `password: "correct horse battery staple"`）は先頭 1 トークンのみがマスクされ、
-  残りの単語が corpus に平文で残ります。マスク規則の正本 `distill/extract.py` は
-  agent-recall と共有しているため、修正はそちらとの同期方針決定待ちです。詳細は
-  [docs/adr/0002-masked-invariant-for-backend-text.md](docs/adr/0002-masked-invariant-for-backend-text.md)
-  を参照してください。
+マスク規則はクォート付き複数語の secret 値の過少マスク（例：`password: "correct horse battery staple"`）を修正済みです。ただし以下の制限が残ります:
+
+- **JSON キー形式**: `"password": "..."` のようにラベルがクォートに包まれた形式は、ラベルと区切り文字（`:`）の間でクォートが終端するため新旧とも未マスク。
+- **末尾非空白**: 閉じクォート直後に `,` `)` `}` `;` 等の非空白が続く形（JSON5/YAML flow/Python kwarg 等）は、短勝ちマッチ再発防止のため旧実装と同じ先頭トークンのみマスクに留まります（露出増なし）。
+- **日本語引用符**: `「」` のような日本語引用符は新旧とも先頭トークン限定。
+
+修正の設計判断（クォート全体優先・改行除外・閉じ直後非空白での不採用）と「旧実装より露出を増やさない」不変条件の検証経緯は、`tests/test_masking.py` の `TestQuotedValueMasking` docstring と CHANGELOG の該当エントリを参照してください。
 
 ## 脆弱性、および悪意のあるコード・プロンプト指示の混入の報告
 
