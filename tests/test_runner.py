@@ -222,6 +222,22 @@ class TestRunCommandWhichResolution:
 
         assert which_calls == []
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="GitHub Actions の windows-latest ランナーではチェックアウト先"
+        "（sys.executable は .venv 配下）と %TEMP%（tmp_path の親）が別ドライブに"
+        "割り当てられることがあり、os.path.relpath がドライブを跨ぐ相対パスを"
+        "表現できず ValueError になる（実測: \"path is on mount 'D:', start on "
+        "mount 'C:'\"）。runner.py 自体は relpath/relative_to を一切使わない"
+        "（grep 確認済み）ためテスト前提（sys.executable と tmp_path が同一"
+        "ドライブ）側の問題であり、venv インタプリタは @executable_path 相対の"
+        "動的リンクに依存するため tmp_path 配下へコピー/シンボリックリンクして"
+        "同一ドライブを強制する対処もできない（実測: コピーは dyld のライブラリ"
+        "解決に失敗、シンボリックリンクは Windows で管理者権限が必要になりうる）。"
+        "「cmd[0] にパス区切りを含む場合は which を呼ばない」という本来の回帰観点は"
+        "OS 非依存の test_which_is_not_called_when_cmd_contains_path_separator が"
+        "既にカバーしている",
+    )
     def test_relative_path_command_skips_which_and_uses_workdir(self, tmp_path):
         """workdir 配下の相対パスコマンドが which 追加後も引き続き実行できる（回帰テスト）。
 
@@ -229,7 +245,8 @@ class TestRunCommandWhichResolution:
         tmp_path からの相対パスとして表現して実行する。cmd[0] はパス区切りを
         含む相対パス（which スキップ条件）のまま、Windows でも直接起動可能な
         実バイナリ（python 本体）を指すため、OS 分岐なしに「workdir 基準で
-        相対パスコマンドが解決される」という回帰観点を保てる。
+        相対パスコマンドが解決される」という回帰観点を保てる（POSIX ホスト限定。
+        上記 skipif 参照）。
         """
         rel_python = os.path.relpath(sys.executable, start=tmp_path)
 
