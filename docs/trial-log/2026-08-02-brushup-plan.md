@@ -72,3 +72,22 @@
 - push は外部公開操作のためユーザー判断に委ねる（未 push の間 Windows CI は実行されない — 引き継ぎ事項として明示）
 
 崩されなかった主張: 1260 green・ruff clean・全 Must/Should 実装の実在・CHANGELOG サンプル突合 5 件・WAL 自動移行の実測・README クイックスタートの動作。
+
+## PR #13 Windows CI 初実走 8 件失敗の切り分け（2026-08-02）
+
+release/0.5.0-publish への push 後、windows-latest ジョブ（91468134053）が 8 件失敗。macOS ローカルでは Windows 実行不能なため、実装読解 + 「ホストに依らず再現できるテスト」を書くことで切り分けた。
+
+- **実バグ 4 件（コード修正）**:
+  - `emit_mcp.build_codex_toml_text`: `str(repo_root)` を TOML basic string へ無エスケープで埋め込んでいた。Windows パスの `\U`・`\u` が不正 Unicode エスケープと解釈され `tomllib.TOMLDecodeError`。`_toml_basic_string()` を追加しエスケープ。POSIX でも `Path("C:\\Users\\x")` は文字列としてバックスラッシュを保持するため（`\` は POSIX の区切り文字でない）、ホストに依らず再現・検証できた（`tests/test_emit_mcp.py::test_stdio_escapes_windows_backslash_path`）。
+  - `Store._migrate_normalize_path_separators`: `_enable_wal` は既に fail-soft（A1 修正済み）だが、その後に無条件実行される本メソッドの UPDATE は未捕捉のままだった。readonly DB・ロック競合のどちらでも `__init__` がクラッシュ（Windows CI の2件はどちらもこのメソッド内で失敗、traceback で確認）。try/except sqlite3.OperationalError で fail-soft化。`_force_windows=True` + `chmod`/別接続ロックで POSIX ホストから再現。
+  - `convert._convert_reflow`: `raise ConversionError(...) from e` が元の pymupdf 例外（絶対パスを含む）を `__context__`/`__cause__` 経由で連鎖させたまま呼び出し元へ渡していた。message には出ないが、ログ出力・トレースバック経由で「そのまま見せない」という意図に反して漏れうる設計不整合であり、Windows では元例外のトレースバックがフレームローカル経由で pymupdf 内部の未解放ファイルハンドルを延命させ、テストの tempdir cleanup で WinError 32 を誘発する疑い。except ブロックの外側で raise することで `__context__` を自動的に None にし、連鎖を断ち切った（`sys.exc_info()` は except ブロックを抜けるとクリアされる、というテストで確認済みの CPython の挙動を利用）。
+  - **反証検証の余地**: convert.py の修正は「元例外のトレースバックが Windows のファイルハンドル延命に寄与する」という因果を Windows 実機で実測できていない（macOS では該当しない）。ただし「安全なエラーメッセージを謳いながら生の例外を chain する」設計不整合自体は独立した正当な修正理由であり、chain を切ることに副作用はない。
+
+- **ホスト差 3 件（テスト側で skipif、コード側は変更なし）**:
+  - `test_stdio_script_is_valid_bash_syntax`/`test_http_script_is_valid_bash_syntax`: CI ログの stderr は空文字なのに returncode=1 で失敗、stdout に UTF-16 らしき制御バイト列が混じり末尾が「...to install.」で終わる。GitHub Actions windows-latest では無引数の `bash` が `C:\Windows\System32\bash.exe`（WSL 未導入時の案内スタブ）に解決されうる既知のランナー特性と一致（`wsl --install` 系の案内メッセージ）。生成スクリプト自体はローカル実 bash で構文検証済み（既存テストが両方 green）のため、ホスト差と判定し skipif(os.name=="nt")。
+  - `test_init_skips_normalization_on_posix_preserving_backslash_in_filenames`: ブリーフで原因確定済み（`monkeypatch.setattr(os, "name", "posix")` が pathlib のクラス選択に波及し、Windows ホストで `Path()` が `PosixPath` を選んで `NotImplementedError`）。monkeypatch を撤去、POSIX ホストは os.name が元々 posix なので patch 不要、skipif(os.name=="nt") + docstring 修正。
+  - `test_relative_path_command_skips_which_and_uses_workdir`: `os.path.relpath(sys.executable, start=tmp_path)` が Windows CI でドライブ跨ぎ（チェックアウト D: / TEMP C:）により ValueError。`runner.py` 自体は relpath/relative_to を使わない（grep 確認済み）ためテスト前提側の問題。**棄却した対処**: tmp_path 配下へ python バイナリをコピー/シンボリックリンクして同一ドライブを強制する案 — コピーは venv python が `@executable_path` 相対の dylib 参照に依存するため macOS で dyld ロード失敗を実測（`Library not loaded: @executable_path/../lib/libpython3.12.dylib`）、シンボリックリンクは Windows で管理者権限が必要になりうり両方とも新たなホスト依存を生む。「cmd[0] にパス区切りを含む場合は which を呼ばない」という本来の回帰観点は同ファイル内の `test_which_is_not_called_when_cmd_contains_path_separator`（OS 非依存）が既にカバーしているため、skipif(os.name=="nt") で妥当と判断。
+
+- **環境メモ**: 本セッション中、`.pytest_cache`/`.ruff_cache` への書込みで断続的に `Operation not permitted`（sandbox）が発生。pytest は警告のみで実行継続（結果は信頼できる）、`ruff check .` はキャッシュ作成不能で即失敗したため `ruff check --no-cache .` で回避（サンドボックスを無効化せず、ツール側の正規オプションで書込み自体を回避）。両ファイルとも所有者は自分・パーミッションは通常通りで原因不明（cwd はサンドボックスの書込み許可対象のはずだが再現）。
+
+- **未 push**: コミット・push はユーザー/git-composer 側の判断。push するまで Windows CI は再実行されない。
