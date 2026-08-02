@@ -102,7 +102,7 @@ shelf/
     engines/gemini_cli.py    # [実装] backend=gemini（gemini CLI呼び出し）・JSON フォールバック
     engines/agy.py           # [実装] agy CLI 呼び出し（JSON 出力なし、テキスト解析）
     service.py              # ユースケース: ask/list_notebooks/create_notebook/add_source/index。入口で notebook 名検証+存在確認
-    server.py               # FastMCP・ask / list_notebooks の 2 ツール
+    server.py               # MCPServer・ask / list_notebooks の 2 ツール
     cli.py                  # serve / ls / new / add / rm / index / ask
   tests/
     fakes.py                # FakeAnswerBackend（canned 返却・呼び出し記録）
@@ -371,7 +371,7 @@ def test_import_guards():
 | T8 | **indexer.py**: recall 流用・増分索引・metadata 更新 | T4,T5,T6 | `uv run pytest tests/test_indexer.py` |
 | T9 | **service.py**（ask/list_notebooks/create/add/rm/index）＋ **test_boundaries.py** | T3,T5,T6,T7,T8 | `uv run pytest tests/test_service.py tests/test_boundaries.py` |
 | T10 | **engines/runner.py＋engines/{codex,gemini_cli,agy}.py**: subprocess 統一・backend codex / gemini / agy の各実装 | T7 | `uv run pytest tests/test_runner.py tests/test_engines.py`（/bin/echo で決定論） |
-| T11 | **server.py**: FastMCP・ask/list_notebooks 2 ツール | T9 | `uv run pytest tests/test_server.py` |
+| T11 | **server.py**: MCPServer・ask/list_notebooks 2 ツール | T9 | `uv run pytest tests/test_server.py` |
 | T12 | **cli.py**: build_parser/dispatch（serve/ls/new/add/rm/index/ask） | T9,T11 | `uv run pytest tests/test_cli.py` |
 | T13 | **README**: する/しない表・CLI 使い方・MCP 登録・クラウド送信注意 | T12 | docs レビュー |
 
