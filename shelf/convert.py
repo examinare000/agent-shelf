@@ -275,15 +275,31 @@ def _convert_reflow(path: Path) -> ConvertResult:
     """
     import pymupdf4llm
 
+    safe_error: ConversionError | None = None
     try:
         markdown = pymupdf4llm.to_markdown(str(path), page_chunks=False)
-    except Exception as e:
+    except Exception:
         # pymupdf.FileDataError 等の例外メッセージは絶対パスを含む
         # （実測: "Failed to open file '<絶対パス>' as type epub."）。
         # そのまま利用者へ見せず、DRM/破損の可能性のみを伝える安全な文言に丸める。
-        raise ConversionError(
+        #
+        # WHY ここで raise せず except ブロックの外側で raise する: `raise ... from e`
+        # や無印の `raise`（暗黙の __context__ 連鎖）は、message には出ない絶対パス等の
+        # 生情報をトレースバック経由で保持したまま呼び出し元へ伝播させてしまい、
+        # 「そのまま利用者に見せない」という上記の意図をログ出力・MCP エラーサーフェス
+        # 経由で裏切りうる。加えて Windows では、この生例外のトレースバックが
+        # フレームローカル経由で pymupdf.open() 失敗時に残る未解放ファイルハンドルを
+        # 延命させ、呼び出し元がこの例外を保持している間（テストの
+        # tempfile.TemporaryDirectory クリーンアップ等）に WinError 32
+        # （PermissionError）を誘発しうる（実測: CI ログで cleanup 時に検出）。
+        # except ブロックを抜けて sys.exc_info() がクリアされた後に raise すれば
+        # __context__ は自動的に None のままになり、元例外は即座に GC 対象になる。
+        safe_error = ConversionError(
             "ファイルを読み込めませんでした（DRM 保護や破損の可能性があります）"
-        ) from e
+        )
+
+    if safe_error is not None:
+        raise safe_error
 
     # 100 字未満チェック。「スキャン PDF」という文言は _convert_pdf 専用の
     # 原因説明であり、リフロー形式には無関係（DRM/破損の可能性を案内する）。

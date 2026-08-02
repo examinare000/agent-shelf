@@ -578,6 +578,26 @@ class TestConvertReflowFormats:
             assert tmpdir not in message
             assert "Traceback" not in message
 
+    def test_convert_broken_epub_error_does_not_chain_raw_exception(self):
+        """WHY: 元の pymupdf 例外を __context__/__cause__ 経由で連鎖させたままだと、
+        message には出ない絶対パス等の生情報が、ログ出力やトレースバック表示
+        （例: logging.exception・MCP エラーサーフェス）経由で漏れうる。加えて
+        Windows では、この生例外のトレースバックがフレームローカル経由で
+        MuPDF 側の未解放ファイルハンドルを延命させ、直後の一時ディレクトリ
+        削除で WinError 32 を誘発する（実測: CI ログで cleanup 時に
+        PermissionError）。連鎖を断ち切り、GC が早期にハンドルを解放できる
+        ようにする。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "broken.epub"
+            path.write_bytes(b"not a real zip file at all" * 5)
+
+            with pytest.raises(ConversionError) as exc_info:
+                convert_file(path)
+
+            assert exc_info.value.__cause__ is None
+            assert exc_info.value.__context__ is None
+
     def test_reflow_short_text_raises_safe_generic_error(self):
         """短すぎる抽出結果は PDF 専用文言(スキャン PDF)を流用せず、
         リフロー形式向けの汎用文言(DRM/破損の可能性)にする(中位指摘#6と同種の配慮)。"""
