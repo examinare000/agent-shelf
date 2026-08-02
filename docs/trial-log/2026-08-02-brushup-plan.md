@@ -91,3 +91,37 @@ release/0.5.0-publish への push 後、windows-latest ジョブ（91468134053�
 - **環境メモ**: 本セッション中、`.pytest_cache`/`.ruff_cache` への書込みで断続的に `Operation not permitted`（sandbox）が発生。pytest は警告のみで実行継続（結果は信頼できる）、`ruff check .` はキャッシュ作成不能で即失敗したため `ruff check --no-cache .` で回避（サンドボックスを無効化せず、ツール側の正規オプションで書込み自体を回避）。両ファイルとも所有者は自分・パーミッションは通常通りで原因不明（cwd はサンドボックスの書込み許可対象のはずだが再現）。
 
 - **未 push**: コミット・push はユーザー/git-composer 側の判断。push するまで Windows CI は再実行されない。
+
+## fix/prompt-title-mask: title 未 mask のプロンプト直渡し経路の残存修正（2026-08-02）
+
+B7（永続化時＋カタログ投影時の title mask）適用後も、personal 側還流の反証検証で
+「プロンプト構築へ直接 title を渡す」経路が3箇所（要約自動生成 add/shelve 双方の
+`build_summary_prompt`、digest map/reduce の `title=doc.get("title")`）に残存している
+ことが判明。B7 の mask 適用点はカタログ投影（`_project_notebook_titles`）と永続化
+（`_persist_converted`）の2点のみで、「backend へ渡る全プロンプト経路」を悉皆的に
+洗い出せていなかった（ADR-0002 の不変条件は宣言されたが実装が全経路を網羅していな
+かった）。
+
+- 3経路それぞれで Red→Green（FakeAnswerBackend.calls[0]["prompt"] に secret が
+  含まれないことを固定）。add/shelve の要約経路は `_resolve_description`/
+  `_summarize_for_shelve` 内でプロンプト構築直前に `self._mask` を適用。digest は
+  `doc.get("title")` の代入直後に mask し、map/reduce 両方で共有する変数を経由させた
+  （2箇所への個別適用ではなく代入点1箇所で両方をカバーできる設計）。
+- **掃引で追加発見**: `build_summary_prompt/build_map_prompt/build_reduce_prompt/
+  build_routing_prompt` の4関数への grep だけでは不十分で、shelve の要約失敗時
+  フォールバック（`_shelve_fallback_classification_text`）が5つ目のプロンプト
+  builder `build_classification_prompt`（shelving.py）へ生 title を渡していた
+  ことも判明。要約成功パスは修正済みでも失敗パス（ok=False/例外）だけ生 title の
+  ままという非対称な穴で、grep 対象を4関数に限定していたら見逃していた。
+  教訓: 「関数名の grep」ではなく「同一データ（title）の全流出先」で追跡する方が
+  漏れに強い。
+- 教訓（ADR-0002 への追記候補）: 「プロンプト構築の直前に mask」という決定は
+  正しかったが、適用が漏れていた事実は「不変条件を文書化しただけでは実装の悉皆性を
+  保証しない」ことを示す。新しい prompt builder を追加するレビュー観点として
+  「引数に title/description 等の DB 由来テキストが含まれる場合、呼び出し元で
+  self._mask を通しているか」を機械的にチェックする必要がある。
+- 検証: `uv run pytest -q`（1265 passed）・`uv run ruff check`（All checks passed）。
+  CHANGELOG.md Unreleased・SECURITY.md 脅威モデル節（title の二重防御対象に
+  要約/分類プロンプトを追記）を更新。ADR-0002 自体は「投影時」を「プロンプト構築時
+  全般」と広く解釈すれば矛盾しないため未改訂（決定の原則は変えず適用範囲の実装漏れを
+  埋めた変更として扱う）。
