@@ -2355,6 +2355,69 @@ class TestPathNormalization:
         finally:
             store3.close()
 
+    def test_migrate_normalize_write_failure_on_readonly_db_is_fail_soft(self, tmp_path):
+        """実バグの回帰テスト（実測: Windows CI で
+        sqlite3.OperationalError: attempt to write a readonly database が
+        Store.__init__ から漏れてクラッシュ）。_enable_wal は既に fail-soft だが、
+        Windows ホストでのみ実行される _migrate_normalize_path_separators は
+        無条件に UPDATE を発行しており、読み取り専用 DB を開くと同じ失敗モードで
+        __init__ がクラッシュしていた。POSIX ホストでは _force_windows=True で
+        Windows 分岐を明示的に有効化し、chmod で書込み不能な状態を作ることで、
+        ホストに依らず再現・検証する。
+        """
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        os.chmod(db_path, 0o444)
+        try:
+            store2 = Store(db_path)  # os.name != "nt" のため修正前でもここは通る
+            try:
+                store2._migrate_normalize_path_separators(
+                    _force_windows=True
+                )  # 修正前はここで例外が伝播していた
+                chunk = store2.get_chunk("doc1#0")
+                # 書込めないため正規化されず、旧 `\` のまま残る（フェイルソフト）
+                assert chunk["source_path"] == "physics\\a.md"
+            finally:
+                store2.close()
+        finally:
+            os.chmod(db_path, 0o644)  # tmp_path の後片付けに支障が出ないよう戻す
+
+    def test_migrate_normalize_write_failure_on_lock_contention_is_fail_soft(
+        self, tmp_path, monkeypatch
+    ):
+        """実バグの回帰テスト（実測: Windows CI で sqlite3.OperationalError:
+        database is locked が Store.__init__ から漏れてクラッシュ）。別接続
+        （別プロセスを模す）が BEGIN IMMEDIATE で書き込みロックを保持している間に
+        _migrate_normalize_path_separators を実行すると、上記と同じ未捕捉の
+        UPDATE が "database is locked" で失敗しクラッシュしていた。
+        """
+        monkeypatch.setattr(Store, "_BUSY_TIMEOUT_MS", 50)  # busy_timeout の待ちでテストが遅くならないようにする
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        blocker = sqlite3.connect(str(db_path))
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute("INSERT INTO meta (key, value) VALUES ('probe', '1')")
+        try:
+            store2 = Store(db_path)
+            try:
+                store2._migrate_normalize_path_separators(
+                    _force_windows=True
+                )  # 修正前はここで例外が伝播していた
+                chunk = store2.get_chunk("doc1#0")
+                # ロック競合で書込めず正規化されない（フェイルソフト）
+                assert chunk["source_path"] == "physics\\a.md"
+            finally:
+                store2.close()
+        finally:
+            blocker.rollback()
+            blocker.close()
+
     def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(
         self, tmp_path, monkeypatch
     ):

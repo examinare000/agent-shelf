@@ -329,6 +329,15 @@ class Store:
 
         Args:
             _force_windows: テスト用。True の場合、os.name の値に関わらず Windows 正規化を実行。
+
+        WHY 全体を try/except で囲む（fail-soft）: _enable_wal と同様、読み取り専用
+        ファイルや別接続によるロック競合では書き込み用の PRAGMA/UPDATE 自体が
+        sqlite3.OperationalError を送出しうる(実測: Windows CI で "attempt to
+        write a readonly database")。この修正前は例外がそのまま __init__ に
+        伝播し Store の構築自体がクラッシュしていた(退行)。正規化は「後追いの
+        お手入れ」であり必須の初期化条件ではないため、失敗しても warning に
+        留めて構築を継続する（次回 open 時に競合が解消していれば自動的に
+        再試行される）。
         """
         import os
 
@@ -338,38 +347,46 @@ class Store:
 
         changed = False
 
-        chunks_updated = self._conn.execute(
-            "UPDATE chunks SET source_path = REPLACE(source_path, '\\', '/') "
-            "WHERE source_path LIKE '%\\%'"
-        ).rowcount
-        if chunks_updated > 0:
-            changed = True
+        try:
+            chunks_updated = self._conn.execute(
+                "UPDATE chunks SET source_path = REPLACE(source_path, '\\', '/') "
+                "WHERE source_path LIKE '%\\%'"
+            ).rowcount
+            if chunks_updated > 0:
+                changed = True
 
-        legacy_file_states = self._conn.execute(
-            "SELECT source_file FROM file_state WHERE source_file LIKE '%\\%'"
-        ).fetchall()
-        for row in legacy_file_states:
-            old_key = row["source_file"]
-            new_key = old_key.replace("\\", "/")
-            conflict = self._conn.execute(
-                "SELECT 1 FROM file_state WHERE source_file = ?", (new_key,)
-            ).fetchone()
-            if conflict is not None:
-                self._conn.execute(
-                    "DELETE FROM file_state WHERE source_file = ?", (old_key,)
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE file_state SET source_file = ? WHERE source_file = ?",
-                    (new_key, old_key),
-                )
-            changed = True
+            legacy_file_states = self._conn.execute(
+                "SELECT source_file FROM file_state WHERE source_file LIKE '%\\%'"
+            ).fetchall()
+            for row in legacy_file_states:
+                old_key = row["source_file"]
+                new_key = old_key.replace("\\", "/")
+                conflict = self._conn.execute(
+                    "SELECT 1 FROM file_state WHERE source_file = ?", (new_key,)
+                ).fetchone()
+                if conflict is not None:
+                    self._conn.execute(
+                        "DELETE FROM file_state WHERE source_file = ?", (old_key,)
+                    )
+                else:
+                    self._conn.execute(
+                        "UPDATE file_state SET source_file = ? WHERE source_file = ?",
+                        (new_key, old_key),
+                    )
+                changed = True
 
-        if changed:
-            # citation の source 表示が変わるため、prune_missing 等と同様に
-            # generation を進めてベクタキャッシュを無効化する。
-            self._bump_generation()
-        self._conn.commit()
+            if changed:
+                # citation の source 表示が変わるため、prune_missing 等と同様に
+                # generation を進めてベクタキャッシュを無効化する。
+                self._bump_generation()
+            self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            _logger.warning(
+                "Windows 用パス区切り正規化の書き込みに失敗したため今回はスキップします"
+                "（読み取り専用ファイル・別接続によるロック競合等の一過性要因が考えられます。"
+                "次回 open 時に競合が解消していれば自動的に再試行されます）: %r",
+                exc,
+            )
 
     def _init_fts(self) -> None:
         # fts5 の trigram tokenizer は SQLite のビルドオプション次第で使えない
