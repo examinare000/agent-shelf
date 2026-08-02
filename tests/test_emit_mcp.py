@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -66,6 +67,22 @@ class TestBuildCodexTomlText:
         )
         data = tomllib.loads(text)
         assert data["mcp_servers"]["shelf"]["url"] == "http://127.0.0.1:8765/mcp"
+
+    def test_stdio_escapes_windows_backslash_path(self):
+        """実バグの回帰テスト（実測: Windows CI で tomllib.TOMLDecodeError:
+        Invalid hex value）。Windows の repo_root は `str()` がバックスラッシュ
+        区切りになるため、TOML basic string へ無エスケープで埋め込むと
+        `\\U`・`\\u` 等が不正な Unicode エスケープと解釈される。POSIX ホストでも
+        `Path("C:\\Users\\x")` は文字列としてバックスラッシュをそのまま保持する
+        ため（`\\` は POSIX の区切り文字ではない）、ホストに依らず再現できる。
+        """
+        windows_repo_root = Path("C:\\Users\\runneradmin\\shelf")
+        text = emit_mcp.build_codex_toml_text(
+            transport="stdio", url=None, repo_root=windows_repo_root
+        )
+        data = tomllib.loads(text)  # 修正前はここで TOMLDecodeError
+        server = data["mcp_servers"]["shelf"]
+        assert server["args"][2] == str(windows_repo_root)
 
 
 class TestBuildGeminiJsonText:
