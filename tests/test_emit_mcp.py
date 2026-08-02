@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tomllib
 from pathlib import Path
@@ -36,6 +37,13 @@ class TestBuildClaudeShText:
         assert "claude mcp add --transport http shelf" in text
         assert "http://127.0.0.1:8765/mcp" in text
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="windows-latest ランナーでは無引数の `bash` が実 POSIX シェルではなく"
+        "System32\\bash.exe（WSL 未導入時の案内スタブ）に解決され、`wsl --install` "
+        "案内メッセージを出して非ゼロ終了する（実測: CI ログ、生成スクリプト自体は"
+        "健全）。POSIX ホストでのみ実 bash 構文検証として意味を持つ",
+    )
     def test_stdio_script_is_valid_bash_syntax(self, tmp_path):
         text = emit_mcp.build_claude_sh_text(transport="stdio", url=None, repo_root=tmp_path)
         script = tmp_path / "claude.sh"
@@ -43,6 +51,13 @@ class TestBuildClaudeShText:
         result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="windows-latest ランナーでは無引数の `bash` が実 POSIX シェルではなく"
+        "System32\\bash.exe（WSL 未導入時の案内スタブ）に解決され、`wsl --install` "
+        "案内メッセージを出して非ゼロ終了する（実測: CI ログ、生成スクリプト自体は"
+        "健全）。POSIX ホストでのみ実 bash 構文検証として意味を持つ",
+    )
     def test_http_script_is_valid_bash_syntax(self, tmp_path):
         text = emit_mcp.build_claude_sh_text(
             transport="http", url="http://127.0.0.1:8765/mcp", repo_root=tmp_path
@@ -156,8 +171,6 @@ class TestEmit:
         assert (tmp_path / "README.md").exists()
 
     def test_claude_sh_is_made_executable(self, tmp_path):
-        import os
-
         emit_mcp.emit(
             hosts=["claude"],
             transport="stdio",
