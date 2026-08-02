@@ -60,7 +60,7 @@ Windows バックエンド（RTX 4060 8GB・qwen3:8b 単一常駐）を「**司�
                             ▼
                     Windows バックエンド: shelf serve --http
                             │
-                       server.py (FastMCP 3 ツール)
+                       server.py (MCPServer 3 ツール)
                             │
                        ShelfService (ユースケース束ね)
              ┌──────────────┼───────────────────────────┐

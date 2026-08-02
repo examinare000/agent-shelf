@@ -10,10 +10,12 @@ main() 経由でここに含める。
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 
 import pytest
+from mcp.server.mcpserver import MCPServer
 
 from shelf import cli
 from shelf.cli import build_parser
@@ -567,24 +569,20 @@ class TestDoctorDispatch:
         assert exc_info.value.code == 1
 
 
-class _FakeMcpSettings:
-    def __init__(self) -> None:
-        self.host = "127.0.0.1"
-        self.port = 8000
-        self.transport_security = None
-
-
 class _FakeMcpServer:
-    """FastMCP の代役。settings.host/port の書き換えと run(transport=...) の
-    呼び出され方だけを記録する(実サーバは起動しない)。
+    """MCPServer の代役。run(transport=..., **kwargs) の呼び出され方だけを記録する
+    (実サーバは起動しない)。mcp SDK 2.0 では host/port/transport_security は
+    server.settings への代入ではなく run() の kwargs として渡される(migration guide
+    #5 の破壊的変更。settings オブジェクトはもう host/port フィールドを持たない)。
     """
 
     def __init__(self) -> None:
-        self.settings = _FakeMcpSettings()
-        self.run_calls: list[str | None] = []
+        self.run_calls: list[str] = []
+        self.run_kwargs: list[dict] = []
 
-    def run(self, transport: str | None = None) -> None:
+    def run(self, transport: str = "stdio", **kwargs) -> None:
         self.run_calls.append(transport)
+        self.run_kwargs.append(kwargs)
 
 
 class TestServeDispatch:
@@ -593,7 +591,7 @@ class TestServeDispatch:
     差し替え」作法の応用。実サーバ・実ソケットには一切触れない)。
     """
 
-    def test_default_dispatch_runs_stdio_without_touching_settings(
+    def test_default_dispatch_runs_stdio_without_passing_http_kwargs(
         self, monkeypatch, capsys
     ):
         fake_server = _FakeMcpServer()
@@ -602,9 +600,8 @@ class TestServeDispatch:
 
         cli.main(["serve"])
 
-        assert fake_server.run_calls == [None]
-        assert fake_server.settings.host == "127.0.0.1"
-        assert fake_server.settings.port == 8000
+        assert fake_server.run_calls == ["stdio"]
+        assert fake_server.run_kwargs == [{}]
         # stdio ディスパッチは bind 警告の対象外(--host は --http 時のみ使う)
         # なので stderr には何も出ないはずである。
         assert capsys.readouterr().err == ""
@@ -619,17 +616,18 @@ class TestServeDispatch:
         cli.main(["serve", "--http", "--host", "100.64.0.1", "--port", "9000"])
 
         assert fake_server.run_calls == ["streamable-http"]
-        assert fake_server.settings.host == "100.64.0.1"
-        assert fake_server.settings.port == 9000
+        kwargs = fake_server.run_kwargs[-1]
+        assert kwargs["host"] == "100.64.0.1"
+        assert kwargs["port"] == 9000
 
-    def test_default_dispatch_does_not_touch_transport_security(self, monkeypatch):
+    def test_default_dispatch_passes_no_transport_security(self, monkeypatch):
         fake_server = _FakeMcpServer()
         monkeypatch.setattr(cli, "_build_service", lambda: object())
         monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
 
         cli.main(["serve"])
 
-        assert fake_server.settings.transport_security is None
+        assert "transport_security" not in fake_server.run_kwargs[-1]
 
     def test_shelf_http_enabled_env_triggers_streamable_http_without_http_flag(
         self, monkeypatch
@@ -661,7 +659,7 @@ class TestServeDispatch:
 
         cli.main(["serve", "--stdio"])
 
-        assert fake_server.run_calls == [None]
+        assert fake_server.run_calls == ["stdio"]
 
     def test_shelf_http_enabled_env_dispatch_uses_env_host_port_and_allowed_hosts(
         self, monkeypatch
@@ -682,9 +680,10 @@ class TestServeDispatch:
         cli.main(["serve"])
 
         assert fake_server.run_calls == ["streamable-http"]
-        assert fake_server.settings.host == "192.168.1.9"
-        assert fake_server.settings.port == 9200
-        security = fake_server.settings.transport_security
+        kwargs = fake_server.run_kwargs[-1]
+        assert kwargs["host"] == "192.168.1.9"
+        assert kwargs["port"] == 9200
+        security = kwargs["transport_security"]
         assert security.allowed_hosts == [
             "192.168.1.9:9200",
             "192.168.1.9",
@@ -705,7 +704,7 @@ class TestServeDispatch:
 
         cli.main(["serve", "--http", "--host", "100.113.69.62", "--port", "8765"])
 
-        security = fake_server.settings.transport_security
+        security = fake_server.run_kwargs[-1]["transport_security"]
         assert security.enable_dns_rebinding_protection is True
         assert security.allowed_hosts == ["100.113.69.62:8765", "100.113.69.62"]
         assert security.allowed_origins == [
@@ -734,7 +733,7 @@ class TestServeDispatch:
             ]
         )
 
-        security = fake_server.settings.transport_security
+        security = fake_server.run_kwargs[-1]["transport_security"]
         assert security.allowed_hosts == [
             "100.113.69.62:8765",
             "100.113.69.62",
@@ -767,6 +766,31 @@ class TestServeDispatch:
         cli.main(["serve", "--http", "--host", "127.0.0.1", "--port", "8765"])
 
         assert capsys.readouterr().err == ""
+
+    def test_http_dispatch_kwargs_bind_to_real_sdk_run_streamable_http_async_signature(
+        self, monkeypatch
+    ):
+        """_FakeMcpServer.run(self, transport="stdio", **kwargs) は任意の kwarg 名を
+        黙って受け取るため、cli.py が渡す kwarg 名が実 SDK 側でリネーム/削除されても
+        このダブルだけでは検出できない構造的な穴がある(mcp 2.0 移行で settings.host
+        代入から run() kwarg 化への破壊的変更が起きた際、これが CI で赤くなったのは
+        たまたま import エラーという別経路の静的検出のみだった。
+        adversarial-verifier 指摘)。cli.py が実際に組み立てた kwargs を、実 SDK の
+        `MCPServer.run_streamable_http_async` のシグネチャへ bind_partial して、
+        存在しない/改名されたパラメータ名を渡していないことを直接固定する
+        (transport キー自体は run() 側の引数であり run_streamable_http_async へは
+        転送されないため、bind 対象から意図的に除く)。
+        """
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+
+        cli.main(["serve", "--http", "--host", "100.64.0.1", "--port", "9000"])
+
+        kwargs = fake_server.run_kwargs[-1]
+        signature = inspect.signature(MCPServer.run_streamable_http_async)
+        # TypeError が出れば SDK 側のパラメータ名が変わった/削除されたことを意味する。
+        signature.bind_partial(**kwargs)
 
 
 class TestConsultDispatch:

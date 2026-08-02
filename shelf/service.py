@@ -1,6 +1,6 @@
 """ShelfService: MCP(server.py)/CLI(cli.py) 共通のユースケース束ね層。
 
-なぜこの層を独立させるか: server.py（FastMCP の ask/list_notebooks 2 ツール）と
+なぜこの層を独立させるか: server.py（MCPServer の ask/list_notebooks/consult 3 ツール）と
 cli.py（serve/ls/new/add/rm/index/ask）はどちらも同じ業務ロジックを呼ぶ薄いラッパに
 留めたい。ask フローの grounding 判定・citation 整形・エラーの安全な要約化という
 本質的な複雑さをここに集約することで、両エントリポイントは配線だけの責務になる

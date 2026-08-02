@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **mcp SDK を 2.0 系へ更新**: Dependabot 更新（1.28.1→2.0.0）が `mcp.server.fastmcp`
+  モジュール削除により CI を破壊していたため、`mcp>=1.0.0` から `mcp>=2.0.0` へ最低要求を
+  引き上げ、v2 の破壊的変更に追従した。`FastMCP` クラスは `mcp.server.mcpserver.MCPServer`
+  へ改名（`from mcp.server.fastmcp import FastMCP` は v2 に一切存在しない）。
+  `call_tool()` の戻り値はタプルから `CallToolResult` オブジェクトへ変更され、
+  `.content`（TextContent のリスト）と `.structured_content`（`{"result": ...}` 形式、
+  list を返すツールのみ生成）で参照する。`server.settings.host`/`.port`/`.transport_security`
+  への直接代入は廃止され、`server.run(transport="streamable-http", host=..., port=...,
+  transport_security=...)` のキーワード引数として渡す方式に変更。
+
 ### Fixed
 - **クォート付き複数語の secret 値の過少マスク修正**: 汎用の password/secret/token regex が
   クォート文字列内の複数語を先頭 1 トークンのみマスクしていた問題を修正。値パターンを

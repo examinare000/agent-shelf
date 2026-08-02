@@ -125,3 +125,91 @@ B7（永続化時＋カタログ投影時の title mask）適用後も、persona
   要約/分類プロンプトを追記）を更新。ADR-0002 自体は「投影時」を「プロンプト構築時
   全般」と広く解釈すれば矛盾しないため未改訂（決定の原則は変えず適用範囲の実装漏れを
   埋めた変更として扱う）。
+
+## deps/mcp-2.0-migration: mcp SDK 1.28.1→2.0.0 移行（2026-08-02）
+
+Dependabot PR #12 が `ModuleNotFoundError: No module named 'mcp.server.fastmcp'` で
+CI 失敗中だった移行作業。公式移行ガイドの記述は概要のみだったため、`uv sync` 後の
+実インストール物（inspect.signature 等）を実際に対話実行して確認した上で実装した
+（推測で書かない、というブリーフの指示通り）。
+
+- **確認した実 API（v2.0.0、site-packages を直接 introspect）**:
+  - `MCPServer("shelf")` は `mcp.server.mcpserver.MCPServer`（`mcp.server` からも
+    re-export されている）。`custom_route`/`tool()` デコレータのシグネチャは v1 と
+    同一で変更不要だった。
+  - `server.settings` は `debug`/`log_level`/`dependencies` 等のみを持つ pydantic
+    モデルで **host/port/transport_security フィールドが存在しない**。
+    `server.settings.host = "..."` は `ValueError: "Settings" object has no field
+    "host"` を送出する（実行して確認済み）。host/port/transport_security は
+    `server.run(transport="streamable-http", host=..., port=..., transport_security=...)`
+    のキーワード引数として渡す方式に変わっていた（ブリーフの推測 #5 と一致、実測で
+    確定)。
+  - `call_tool()` は `(content_blocks, {"result": ...})` のタプルではなく
+    `CallToolResult` オブジェクト1個を返す。`.content`（TextContent のリスト）と
+    `.structured_content`（`{"result": <戻り値>}` 形式。list を返すツールのみ生成
+    され、素の `dict` を返すツールでは `None` のまま）を実際に呼んで確認した。
+  - `TransportSecuritySettings`（`mcp.server.transport_security`）はモジュール
+    パス・フィールドとも無変更。
+  - `mcp.server.fastmcp` は v2 に一切存在しない（deprecated shim すら無し、
+    import で即 `ModuleNotFoundError`）。
+- **test_boundaries.py の "fastmcp" エントリの扱い**: 実は v1 時点から
+  `_RESTRICTED_TO_OWNER["fastmcp"]` は死んだエントリだった。実際の import 文は
+  `from mcp.server.fastmcp import FastMCP` で AST 上のトップレベルモジュール名は
+  `"mcp"`（`split(".")[0]`）であり `"fastmcp"` という名前が `modules` 集合に入る
+  ことは無かった（このリポジトリで `import fastmcp` 直下 import をしたファイルも
+  皆無、git log 確認済み）。v2 でも同型の実効性のない防御的エントリとして
+  `"mcpserver"` にリネームし、コメントでその旨（実効性が無い理由）を明記した。
+  **棄却した案**: エントリを削除する — ブリーフが「新モジュール名に合わせて更新」
+  と明示していたこと、および将来 `mcp.server.mcpserver` 相当が本当にトップレベル
+  import される変更が入った場合の防御として意図が伝わる形で残す方を選んだ。
+- **Red→Green の順序**: server.py の import を先に MCPServer へ直してから
+  test_server.py の CallToolResult 対応、cli.py の kwargs 化前に一度
+  `_FakeMcpServer` を新シグネチャへ更新した状態で旧 cli.py 実装に対して実行し、
+  `AttributeError: '_FakeMcpServer' object has no attribute 'settings'` で正しい
+  理由の Red を確認してから cli.py を書き換えた（サンドボックスの `git stash`
+  書き込み拒否で往復に手間取ったが、`/tmp/claude` へのバックアップコピーで代替）。
+- 検証: `uv run pytest -q`（1282 passed）・`uv run ruff check --no-cache .`
+  （All checks passed）。CI が実行するのはこの2コマンドのみ（pyright/mypy 等の
+  typecheck step は無い）。
+
+### 完了宣言の反証検証（adversarial-verifier、FAIL → 追修正）
+
+コア移行（改名・CallToolResult・run() kwargs 化）自体は実 API 照合で正しいと
+確認されたが、以下の残件で FAIL:
+
+- **旧称 FastMCP の残存**: `git grep -n -i fastmcp` で `shelf/service.py:3`
+  （docstring が「FastMCP の ask/list_notebooks 2 ツール」のまま。移行前から
+  ツール数も陳腐化していた — 実際は ask/list_notebooks/consult の3ツール）・
+  `docs/design-shelf-mcp.md:105,374`・`docs/design-shelf-reference-service.md:63`
+  がヒット。grep 対象を「移行に必要な範囲」（server.py/cli.py/tests/pyproject.toml）
+  に限定し、docstring・設計書中のクラス名言及まで悉皆的に洗い出せていなかった
+  （B7 の「関数名の grep だけでは不十分」教訓と同型の見落とし方）。
+  → service.py は MCPServer 改名+3ツールへ修正、design-shelf-mcp.md の2箇所と
+  design-shelf-reference-service.md の1箇所は MCPServer への改名のみ実施
+  （design-shelf-mcp.md の「2 ツール」は T11 タスク定義時点の歴史的記述であり
+  consult 追加前の設計書のため、ツール数はブリーフが明示的に指示した service.py
+  のみ修正し、他は改名のみに留めた）。
+- **CHANGELOG.md 未記載**: 依存の最低バージョン引き上げ（mcp>=1.0.0→2.0.0）と
+  破壊的変更3点への追従が [Unreleased] に記載されていなかった。先例
+  （CHANGELOG.md:54 の anyio 直接依存化の書式）に倣い `### Changed` を新設して追記。
+- **テストダブルの構造的欠陥（推奨修正・採用）**: `_FakeMcpServer.run(transport,
+  **kwargs)` が任意の kwarg 名を黙って受け取るため、settings→run() 引数移動の
+  ような破壊的変更クラスをテストで検出できず、今回 CI が赤くなったのは import
+  エラーという別経路の偶然の静的検出のみだったという指摘。cli.py が実際に
+  組み立てた kwargs を実 `MCPServer.run_streamable_http_async` のシグネチャへ
+  `inspect.signature(...).bind_partial(**kwargs)` で bind するテストを追加し、
+  cli.py 側の kwarg 名を意図的に `transportSecurity`（誤字）へ変えて
+  `TypeError: got an unexpected keyword argument 'transportSecurity'` の Red を
+  実際に確認してから正しい実装へ復元し Green を確認した（テストダブル自体では
+  検出できないことを実演した上での追加）。
+
+崩されなかった主張: コア移行の実 API 照合結果（MCPServer 改名・
+CallToolResult.content/.structured_content・run() kwargs 化のいずれも実測通り）。
+
+検証: `uv run pytest -q`（1283 passed）・`uv run ruff check --no-cache .`
+（All checks passed）・`git grep -n -i fastmcp` のヒットが trial-log 自身・
+test_boundaries.py の意図的な履歴コメント・CHANGELOG.md の移行事実の記述のみに
+絞られたことを確認。
+
+棚卸し: テストダブルの実シグネチャ結合（と mcp>=2.0.0 の上限なし維持の判断）を
+docs/adr/0003-bind-test-doubles-to-real-sdk-signatures.md へ昇格した。

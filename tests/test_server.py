@@ -1,7 +1,9 @@
 """MCP ツール ask / list_notebooks / consult の単体テスト。
 
-FastMCP.call_tool() は (content_blocks, {"result": <戻り値>}) を返すため、
-"result" 側で戻り値の型・中身を検証する（recall/tests/test_server.py と同型）。
+MCPServer.call_tool() は CallToolResult を返す（mcp SDK 2.0 の破壊的変更。1.x は
+(content_blocks, {"result": <戻り値>}) のタプルだった）。content 属性が TextContent
+のリスト、structured_content 属性が {"result": <戻り値>} 形式の構造化出力
+(list[dict] を返すツールのみ生成される。素の dict はスキーマ非対応で None のまま)。
 ロジックは server.py に一切持たせず ShelfService へ委譲するだけなので、ここでは
 「委譲が正しく配線されているか」「公開ツールが3つだけか」だけを検証する。
 Store(":memory:") + FakeEmbedder + FakeAnswerBackend を注入し、実DB・実埋め込み
@@ -77,12 +79,13 @@ class _BlockingAnswerBackend:
 
 
 def _ask_result(server, args: dict) -> dict:
-    """ask の戻り値注釈は design doc 通り素の `dict`。素の dict には FastMCP が
-    structured output スキーマを生成しないため、call_tool は TextContent 1件のみを
-    返す(list_notebooks の list[dict] とは挙動が異なる)。JSON 本文をパースして比較する。
+    """ask の戻り値注釈は design doc 通り素の `dict`。素の dict には MCPServer が
+    structured output スキーマを生成しないため、call_tool の結果は content に
+    TextContent 1件のみを持つ(list_notebooks の list[dict] とは挙動が異なる)。
+    JSON 本文をパースして比較する。
     """
-    content = _call(server, "ask", args)
-    return json.loads(content[0].text)
+    result = _call(server, "ask", args)
+    return json.loads(result.content[0].text)
 
 
 class TestAsk:
@@ -109,7 +112,7 @@ class TestAsk:
 
     def test_slow_ask_does_not_block_concurrent_list_notebooks(self, tmp_path):
         """ask がバックエンド応答待ちでもイベントループを専有せず、他ツール呼び出しを
-        並行して処理できることを検証する。sync def のままだと FastMCP はイベントループ
+        並行して処理できることを検証する。sync def のままだと MCPServer はイベントループ
         上で素呼びするため、backend.answer() の threading.Event.wait() がループ全体を
         止め、list_notebooks は ask の完了(Event解放)後まで一切進行できない
         (Red確認: pytest.fail に到達する)。async def + anyio.to_thread.run_sync 化後は
@@ -178,8 +181,8 @@ class TestListNotebooks:
         service = _service_with_one_chunk(tmp_path)
         server = create_server(service)
 
-        _, structured = _call(server, "list_notebooks", {})
-        result = structured["result"]
+        call_result = _call(server, "list_notebooks", {})
+        result = call_result.structured_content["result"]
 
         # _service_with_one_chunk は corpus に md ファイルを直接置いて index_notebook
         # を呼ぶだけで documents テーブルへの upsert(add_source 経由)は行わないため、
@@ -232,8 +235,8 @@ class TestConsult:
         )
         server = create_server(service)
 
-        content = _call(server, "consult", {"question": _QUERY_TEXT})
-        result = json.loads(content[0].text)
+        call_result = _call(server, "consult", {"question": _QUERY_TEXT})
+        result = json.loads(call_result.content[0].text)
 
         # service.consult() の返却形式を確認
         assert "question" in result
@@ -247,7 +250,7 @@ class TestConsult:
     def test_slow_consult_does_not_block_concurrent_list_notebooks(self, tmp_path):
         """consult がバックエンド応答待ちでもイベントループを専有せず、他ツール呼び出しを
         並行して処理できることを検証する。TestAsk の同名テストと同型（sync def のままだと
-        FastMCP がイベントループ上で素呼びするため、司書ルーティング呼び出しの
+        MCPServer がイベントループ上で素呼びするため、司書ルーティング呼び出しの
         threading.Event.wait() でループ全体が止まり list_notebooks は consult の完了まで
         進行できない）。consult は本 PR（MCP ツールの async 化）の主目的のツールであり、
         ask だけでなく consult 自身についても非専有性を直接証明する必要がある。
@@ -324,7 +327,7 @@ def test_only_the_three_expected_tools_are_registered(tool_name, tmp_path):
 class TestHealthRoute:
     """GET /health は Task Scheduler 等の死活監視用の無認証エンドポイント
     (design判断: 認証・Host 検査の外にあるため公開情報は status/version の2つのみ)。
-    FastMCP.streamable_http_app() が実際に組み立てる Starlette app に対して
+    MCPServer.streamable_http_app() が実際に組み立てる Starlette app に対して
     starlette.testclient.TestClient で疎通を検証する(register済みcustom_routeの
     実体を確認するため。実ネットワークは使わない、単一プロセス内ASGI呼び出し)。
     """

@@ -587,8 +587,10 @@ def main(argv: list[str] | None = None) -> None:
         if settings.http:
             # Tailscale VPN 内での bind を前提とし、認証は VPN 境界に委ねる
             # (design doc §1)。エンドポイントは mcp SDK の既定 "/mcp"。
-            server.settings.host = settings.host
-            server.settings.port = settings.port
+            # mcp SDK 2.0 では host/port/transport_security は server.settings への
+            # 代入ではなく run() の kwargs として渡す(1.x からの破壊的変更。
+            # settings は debug/log_level 等のみを保持し host/port フィールドを持たない)。
+            #
             # mcp SDK の DNS リバインディング保護は既定で localhost 系 Host しか
             # 許可しないため、bind 先が非 localhost だと「Invalid Host header」で
             # initialize が弾かれる(実機検証で確認)。bind 先自身(host:port と host)
@@ -597,7 +599,7 @@ def main(argv: list[str] | None = None) -> None:
             # (build_transport_security の docstring参照)。
             allowed_hosts = [f"{settings.host}:{settings.port}", settings.host]
             allowed_hosts.extend(settings.allowed_hosts)
-            server.settings.transport_security = build_transport_security(allowed_hosts)
+            transport_security = build_transport_security(allowed_hosts)
             # env(SHELF_HTTP_HOST)経由で 0.0.0.0/:: に bind するケースでも警告が
             # 出るよう、args.host ではなく解決後の settings.host を渡す(args.host は
             # CLI 未指定時 None サンチネルのままで、env 由来の全インターフェース bind
@@ -605,7 +607,12 @@ def main(argv: list[str] | None = None) -> None:
             warning = _bind_warning(settings.host)
             if warning is not None:
                 print(warning, file=sys.stderr)
-            server.run(transport="streamable-http")
+            server.run(
+                transport="streamable-http",
+                host=settings.host,
+                port=settings.port,
+                transport_security=transport_security,
+            )
         else:
             server.run()
     elif args.command == "ls":
