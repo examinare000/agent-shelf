@@ -5,7 +5,7 @@
 - **信頼境界は VPN（Tailscale tailnet）**: HTTP transport（`shelf serve --http`）に認証機構はなく、接続元の制限は tailnet 境界に委譲しています。パブリックネットワークに露出するアドレスへの bind は想定外であり、非推奨です。
 - **DNS リバインディング保護は有効**: 許可 Host は bind 先（`host:port` と `host`）+ `--allowed-host` での明示追加のみ（`shelf/server.py` の `build_transport_security`）。VPN 境界内でもブラウザ経由攻撃の緩和として保護は無効化しません。
 - **MCP surface は読み取り 3 ツールのみ**: `ask` / `list_notebooks` / `consult`。notebook 作成・資料投入・削除などコーパスを変更する操作は CLI（人間操作）に限定し、MCP には公開していません。
-- **シークレットマスキングは取込時に適用**: 資料は corpus への永続化前に `mask()` を通します。マスク規則の正本は `distill/extract.py`（`SHELF_EXTRACT_PY` で差し替え可能。`shelf/masking.py` が importlib で読み込む単一ソース方式）。
+- **シークレットマスキングは取込時に適用**: 資料は corpus への永続化前に `mask()` を通します。マスク規則の正本は `distill/extract.py`（`SHELF_EXTRACT_PY` で差し替え可能。`shelf/masking.py` が importlib で読み込む単一ソース方式）。文書 title は「backend へ送出される全テキストは mask 済み」という不変条件（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）のもと、永続化時に加えて、ルーティングカタログ投影・要約/分類プロンプト構築・digest map/reduce プロンプト構築の直前でも再度 mask を適用する二重防御としています（修正適用前に永続化された既存行にも遡って有効）。
 
 ### 既知の制限
 

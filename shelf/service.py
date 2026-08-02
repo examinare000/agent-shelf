@@ -743,8 +743,12 @@ class ShelfService:
         summary: str | None = None
         try:
             backend = self._backend_factory(backend_name or self._default_backend)
+            # title は converter が抽出した生値のまま渡ってくる（markdown 本文と異なり
+            # 呼び出し元でまだ mask を通していない）。プロンプト構築の直前で mask を
+            # 適用し、機密含み文書名が要約生成の backend へ素通しにならないようにする。
+            masked_title = self._mask(title) if self._mask is not None and title else title
             raw = backend.answer(
-                build_summary_prompt(markdown, title=title),
+                build_summary_prompt(markdown, title=masked_title),
                 workdir=self._corpus_dir / notebook,
                 schema=SUMMARY_SCHEMA,
             )
@@ -1151,8 +1155,12 @@ class ShelfService:
         テキストで継続しファイルを失わない）。
         """
         try:
+            # title は converter が抽出した生値のまま渡ってくる。add_source 側
+            # （_resolve_description）と同じ流儀で、プロンプト構築の直前に mask を
+            # 適用する。
+            masked_title = self._mask(title) if self._mask is not None and title else title
             raw = backend.answer(
-                build_summary_prompt(markdown, title=title),
+                build_summary_prompt(markdown, title=masked_title),
                 workdir=self._corpus_dir,
                 schema=SUMMARY_SCHEMA,
             )
@@ -1163,7 +1171,11 @@ class ShelfService:
                     return masked, masked
         except Exception:
             pass
-        return _shelve_fallback_classification_text(title, markdown), None
+        # フォールバックの classification_text も build_classification_prompt
+        # 経由で classify_backend へ渡るため、成功パスと同じく masked_title を使う
+        # （掃引で発見: 従来はここだけ生 title を使っており、要約生成が失敗した
+        # 場合に限って未 mask の title が分類プロンプトへ漏れていた）。
+        return _shelve_fallback_classification_text(masked_title, markdown), None
 
     def _prepare_shelve_candidates(
         self, root: Path, summarize_backend: AnswerBackend
@@ -1691,7 +1703,13 @@ class ShelfService:
             return "本文チャンクが見つかりません（インデックス未生成または空文書）"
 
         backend = self._backend_factory(backend_name)
-        title = doc.get("title")
+        # doc.get("title") は DB 由来。cc78b8e（永続化時 mask）適用前に永続化された
+        # 既存行は未 mask のままの場合があり（カタログ投影と同じ「既存行には遡及
+        # しない」問題）、そのまま使うと map/reduce プロンプトへ恒常的に露出する。
+        # プロンプト構築の直前で再度 mask を適用する（mask は冪等なので新規行への
+        # 二重適用は安全）。
+        raw_title = doc.get("title")
+        title = self._mask(raw_title) if self._mask is not None and raw_title else raw_title
         workdir = self._corpus_dir / notebook
 
         # map フェーズ: ウィンドウごとに学びを抽出する。1ウィンドウの失敗（backend 例外・
