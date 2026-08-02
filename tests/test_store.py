@@ -2418,15 +2418,23 @@ class TestPathNormalization:
             blocker.rollback()
             blocker.close()
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="monkeypatch.setattr(os, 'name', 'posix') は pathlib のクラス選択"
+        "（posixpath/ntpath どちらの実装で Path() を構築するか）にも波及するため、"
+        "Windows ホストではこの偽装自体が Store.__init__ 内の Path(db_path) 生成で"
+        "NotImplementedError: cannot instantiate 'PosixPath' となり検証が破綻する"
+        "（実測: Windows CI）。os.name の偽装は pathlib を壊すため使えず、この分岐"
+        "（POSIX でのみバックスラッシュ保護）は POSIX ホストでのみ検証できる",
+    )
     def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(
-        self, tmp_path, monkeypatch
+        self, tmp_path
     ):
         """POSIX 環境ではバックスラッシュが正当なファイル名として保留される
 
-        Store.__init__ は os.name の実値で分岐を決めるため、実行ホストが
-        Windows（実 os.name=="nt"）だと固定しない限りこの分岐（skip）を
-        検証できない。os.name を明示的に "posix" へ固定し、ホスト OS に
-        依らずこの分岐を確認する。
+        Store.__init__ は os.name の実値で分岐を決める。POSIX ホストでは
+        os.name が元々 "posix" のため monkeypatch による偽装は不要（かつ
+        Windows ホストでは pathlib を壊すため使えない。上記 skipif 参照）。
         """
         db_path = tmp_path / "posix.db"
         store1 = Store(db_path)
@@ -2434,8 +2442,6 @@ class TestPathNormalization:
         self._insert_legacy_chunk(store1, source_path="physics\\a.md")
         store1.close()
 
-        # os.name を "posix" に固定し、Store.__init__ 内の正規化 skip 分岐を確認する
-        monkeypatch.setattr(os, "name", "posix")
         store2 = Store(db_path)
         try:
             chunk = store2.get_chunk("doc1#0")
