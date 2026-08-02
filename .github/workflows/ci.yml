@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  test-matrix:
     strategy:
       fail-fast: false
       matrix:
@@ -21,6 +21,21 @@ jobs:
       - run: uv sync
       - run: uv run pytest -q
       - run: uv run ruff check .
+
+  # ruleset の必須チェックは context 名 "test" を要求するが、matrix 化により
+  # 実チェック名は "test-matrix (os)" になり永久に報告されなくなる（PR #13 で
+  # BLOCKED を実測）。matrix 全体の成否を単一 context "test" へ集約して報告する。
+  test:
+    needs: test-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: matrix 全 OS の結果を集約する
+        run: |
+          if [ "${{ needs.test-matrix.result }}" != "success" ]; then
+            echo "test-matrix result: ${{ needs.test-matrix.result }}"
+            exit 1
+          fi
 
   gitleaks:
     runs-on: ubuntu-latest
