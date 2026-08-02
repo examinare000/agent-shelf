@@ -1,7 +1,7 @@
 """shelf パッケージ内の import 境界を静的に強制する（docs/design-shelf-mcp.md §3, §6）。
 
 なぜ実行時の sys.modules 検査ではなく AST 静的走査か: sqlite3/subprocess/fastembed/
-pymupdf4llm/markitdown/mcp/fastmcp を実際に import すると、ONNX モデルのロードや
+pymupdf4llm/markitdown/mcp/mcpserver を実際に import すると、ONNX モデルのロードや
 未インストールの外部 CLI への依存など重い・環境依存の副作用が走る。ast.parse による
 静的走査なら、対象パッケージを一切 import せずに「どのファイルが何を import する
 文を書いているか」だけを軽量・決定論的に検証できる。関数内・条件分岐内で行われる
@@ -16,7 +16,11 @@ from pathlib import Path
 _SHELF_PACKAGE_DIR = Path(__file__).resolve().parent.parent / "shelf"
 
 # モジュール名(トップレベル) -> それを import してよい唯一のファイル名。
-# mcp/fastmcp は server.py 専用。
+# mcp/mcpserver は server.py 専用(mcp SDK 2.0 で FastMCP/mcp.server.fastmcp から
+# MCPServer/mcp.server.mcpserver へ改名された。"mcpserver" キーは旧 "fastmcp" キーと
+# 同じくトップレベル import 名としては実在しない(実際の import 文はトップレベル
+# "mcp" に潰れる)ため実効性のない防御的エントリだが、旧キーとの対応を保つために
+# 改名前と同じ意図で残す)。
 _RESTRICTED_TO_OWNER: dict[str, str] = {
     "sqlite3": "store.py",
     "subprocess": "runner.py",
@@ -25,7 +29,7 @@ _RESTRICTED_TO_OWNER: dict[str, str] = {
     "pymupdf": "convert.py",
     "markitdown": "convert.py",
     "mcp": "server.py",
-    "fastmcp": "server.py",
+    "mcpserver": "server.py",
 }
 
 # ドメイン層: 外部SDK・DB・subprocessを一切知らず、ポートと純粋関数だけに依存するべき

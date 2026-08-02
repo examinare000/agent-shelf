@@ -16,7 +16,7 @@ import importlib.metadata
 from collections.abc import Sequence
 
 import anyio.to_thread
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -45,8 +45,8 @@ def build_transport_security(allowed_hosts: Sequence[str]) -> TransportSecurityS
     )
 
 
-def create_server(service: ShelfService) -> FastMCP:
-    mcp = FastMCP("shelf")
+def create_server(service: ShelfService) -> MCPServer:
+    mcp = MCPServer("shelf")
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request) -> Response:
@@ -74,7 +74,7 @@ def create_server(service: ShelfService) -> FastMCP:
 
         service.ask はサブスク CLI（SHELF_ANSWER_TIMEOUT=300s）の応答を待つため、
         イベントループを直接ブロックしないようワーカースレッドへ逃がす
-        （FastMCP は sync def のツールをイベントループ上で素呼びするため、async 化
+        （MCPServer は sync def のツールをイベントループ上で素呼びするため、async 化
         しないと他クライアントの呼び出しが全て足止めされる）。
         abandon_on_cancel=True を渡しているため、呼び出しがキャンセルされても
         ワーカースレッドと配下のサブプロセスは待たずに戻る（キャンセル後もそれらは
