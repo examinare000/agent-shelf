@@ -156,6 +156,28 @@ DIGEST_BACKEND = os.environ.get("SHELF_DIGEST_BACKEND", "")
 # クラウド課金を避け、かつ実効コンテキストが小さいモデル前提の設計（設計書 §13.1 決定6）。
 SHELVE_BACKEND = os.environ.get("SHELF_SHELVE_BACKEND", "ollama")
 
+
+def _parse_allowed_hosts(raw: str) -> list[str]:
+    """カンマ区切りの許可ホスト一覧を list[str] へパースする。
+
+    前後空白を除去し、空要素（連続カンマ・末尾カンマ由来）は捨てる。
+    未設定時は空文字列が渡り、空リストになる（= 追加の許可ホストなし）。
+    """
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+# `shelf serve --http` の起動設定を env からも解決できるようにする3変数。
+# Windows サービス定義（serve-shelf.ps1）が env→CLIフラグの翻訳を自前で行って
+# いたため、ここで env を解決することでサービス定義側を薄くできる。CLI フラグは
+# 常にこれらの env より優先する（優先順位の解決は cli.resolve_serve_settings の責務、
+# ここでは「env→既定値」の解決のみを担う）。
+HTTP_ENABLED = _bool_env("SHELF_HTTP_ENABLED", False)
+HTTP_HOST = os.environ.get("SHELF_HTTP_HOST", "127.0.0.1")
+HTTP_PORT = _int_env("SHELF_HTTP_PORT", 8765)
+# 変数名は SHELF_HTTP_ALLOWED_HOSTS ではなく SHELF_ALLOWED_HOSTS（serve-shelf.ps1 の
+# 既存 env 名と一致させる必要があるため、HTTP_ プレフィックスを付けない）。
+ALLOWED_HOSTS = _parse_allowed_hosts(os.environ.get("SHELF_ALLOWED_HOSTS", ""))
+
 # ask/consult のチャンク検索を、cosine ベクトル検索単体ではなく FTS5 キーワード
 # 検索（BM25）との RRF（Reciprocal Rank Fusion）併用にするかどうか。既定 true:
 # ベクトル検索は意味的に近いが語彙が一致しない文を拾える一方、固有名詞・型番・
@@ -164,3 +186,16 @@ SHELVE_BACKEND = os.environ.get("SHELF_SHELVE_BACKEND", "ollama")
 # fts5/trigram tokenizer が使えない環境では store.fts_enabled=False により
 # 自動的にベクトル単体へ劣化する（このフラグは「使うかどうかの意図」のみを表す）。
 HYBRID_SEARCH = _bool_env("SHELF_HYBRID_SEARCH", True)
+
+# ローカルファイル投入（add_source/add_directory、および内部で同じ走査規則を
+# 共有する shelve）のファイルサイズ上限（MB）。守る対象は誤投入・暴走であって
+# 正当な蔵書ではない（スキャン書籍PDFは数百MBになり得る）ため、既定は大きめの
+# 300MBとし、運用でより厳しく絞りたい場合は env で調整できるようにする。
+# URL 経由の投入（convert.py の 20MB 上限）とは独立した値（ローカルファイルと
+# 外部URL取得ではリスクの性質が異なるため）。
+# 0以下は「常に拒否」という意図しない全否定になり、かつエラーメッセージに
+# 負数/0MBが埋め込まれる違和感を生むため、不正値（int変換失敗）と同様に既定へ
+# フォールバックする（他の *_MB/*_NOTES 系と異なり、0以下が意味を持たない値のため
+# 共有ヘルパ _int_env 自体は変更せずここだけで個別にクランプする）。
+_max_file_mb_raw = _int_env("SHELF_MAX_FILE_MB", 300)
+MAX_FILE_MB = _max_file_mb_raw if _max_file_mb_raw > 0 else 300

@@ -1840,9 +1840,10 @@ wheels = [
 
 [[package]]
 name = "shelf"
-version = "0.4.3"
+version = "0.5.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "fastembed" },
     { name = "markitdown", extra = ["docx", "pptx", "xls", "xlsx"] },
     { name = "mcp" },
@@ -1860,6 +1861,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.1" },
     { name = "fastembed", specifier = ">=0.4.0" },
     { name = "markitdown", extras = ["docx", "xlsx", "xls", "pptx"] },
     { name = "mcp", specifier = ">=1.0.0" },

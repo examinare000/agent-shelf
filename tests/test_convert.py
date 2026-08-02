@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import tempfile
 import urllib.request
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
@@ -16,6 +17,90 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from shelf.convert import ConversionError, ConvertResult, convert_file, convert_url, pick_converter
+
+
+_CHAPTER_BODY_TEMPLATE = (
+    "This is the body content of chapter {i}. It contains enough text to exceed "
+    "the minimum character threshold used by the pipeline to distinguish "
+    "successfully extracted content from failed extraction."
+)
+
+
+def _build_minimal_epub(path: Path, n_chapters: int = 2) -> None:
+    """テスト専用の最小 EPUB を構築する(mimetype 無圧縮先頭 + META-INF/container.xml +
+    content.opf + XHTML 本文 n_chapters 章)。実ライブラリ(pymupdf4llm/pymupdf)が
+    EPUB として認識できる最小構成であることを事前に scratchpad で実測確認済み。
+    """
+    with zipfile.ZipFile(path, "w") as z:
+        # mimetype は非圧縮でアーカイブ先頭に置くのが EPUB 仕様上の要件。
+        z.writestr(
+            zipfile.ZipInfo("mimetype"), "application/epub+zip", compress_type=zipfile.ZIP_STORED
+        )
+        z.writestr(
+            "META-INF/container.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>""",
+        )
+
+        manifest_items = []
+        spine_items = []
+        for i in range(1, n_chapters + 1):
+            manifest_items.append(
+                f'<item id="chap{i}" href="chap{i}.xhtml" media-type="application/xhtml+xml"/>'
+            )
+            spine_items.append(f'<itemref idref="chap{i}"/>')
+            z.writestr(
+                f"OEBPS/chap{i}.xhtml",
+                f"""<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><title>Chapter {i}</title></head>
+<body><h1>Chapter {i}</h1><p>{_CHAPTER_BODY_TEMPLATE.format(i=i)}</p></body>
+</html>""",
+            )
+
+        z.writestr(
+            "OEBPS/content.opf",
+            f"""<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="BookId" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Minimal Test EPUB</dc:title>
+    <dc:language>en</dc:language>
+    <dc:identifier id="BookId">urn:uuid:12345678-1234-1234-1234-123456789012</dc:identifier>
+  </metadata>
+  <manifest>{''.join(manifest_items)}</manifest>
+  <spine>{''.join(spine_items)}</spine>
+</package>""",
+        )
+
+
+def _build_minimal_fb2(path: Path, n_sections: int = 2) -> None:
+    """テスト専用の最小 FictionBook(.fb2) を構築する(素の XML、zip 化不要)。
+
+    実ライブラリ(pymupdf4llm/pymupdf)が FictionBook として認識できる最小構成
+    であることを事前に scratchpad で実測確認済み(section/title/p のみで十分)。
+    """
+    sections = []
+    for i in range(1, n_sections + 1):
+        sections.append(
+            f"<section><title><p>Chapter {i}</p></title>"
+            f"<p>{_CHAPTER_BODY_TEMPLATE.format(i=i)}</p></section>"
+        )
+    fb2_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+<description>
+<title-info>
+<genre>test</genre>
+<author><first-name>Test</first-name><last-name>Author</last-name></author>
+<book-title>Minimal Test FB2</book-title>
+</title-info>
+</description>
+<body>{''.join(sections)}</body>
+</FictionBook>"""
+    path.write_text(fb2_xml, encoding="utf-8")
 
 
 def _pdf_chunk(text, page: int | None = None, page_number: int | None = None) -> defaultdict:
@@ -136,6 +221,24 @@ class TestPickConverter:
         with pytest.raises(ConversionError) as exc_info:
             pick_converter("README")
         assert "対応形式" in str(exc_info.value)
+
+
+class TestPickConverterReflowFormats:
+    """EPUB/FB2/XPS はリフロー形式として PDF ('pymupdf4llm') とは別の
+    'pymupdf4llm-reflow' 経路に振り分ける。documents.converter へ記録される
+    値でリフロー由来と判別できるようにするため、名称を分ける(タスク要件)。"""
+
+    def test_epub_extension(self):
+        assert pick_converter("book.epub") == "pymupdf4llm-reflow"
+
+    def test_fb2_extension(self):
+        assert pick_converter("book.fb2") == "pymupdf4llm-reflow"
+
+    def test_xps_extension(self):
+        assert pick_converter("book.xps") == "pymupdf4llm-reflow"
+
+    def test_epub_extension_case_insensitive(self):
+        assert pick_converter("Book.EPUB") == "pymupdf4llm-reflow"
 
 
 class TestInsertPageMarkers:
@@ -388,6 +491,126 @@ class TestConvertPdf:
                 with pytest.raises(ConversionError) as exc_info:
                     convert_file(path)
                 assert "抽出できませんでした" in str(exc_info.value)
+
+
+class TestConvertPdfErrorMessageIncludesOcrGuidance:
+    """テキスト抽出失敗時の PDF 専用文言に、OCR は同梱していない旨と代替手段
+    (ocrmypdf 等での事前 OCR)の案内を追記したことの確認。"""
+
+    def test_scan_pdf_error_mentions_ocrmypdf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "scanned.pdf"
+            path.write_bytes(b"%PDF-1.4 dummy")
+
+            with patch("pymupdf4llm.to_markdown") as mock_to_markdown:
+                mock_to_markdown.return_value = [_pdf_chunk(None), _pdf_chunk("")]
+
+                with pytest.raises(ConversionError) as exc_info:
+                    convert_file(path)
+
+            assert "ocrmypdf" in str(exc_info.value)
+
+
+class TestConvertReflowFormats:
+    """EPUB/FB2/XPS の実変換(pymupdf4llm 経由)。
+
+    WHY マーカーを挿入しないか: リフロー形式の「ページ番号」は pymupdf-layout が
+    page_width=612 で再レイアウトした際の副産物であり、ページ数自体が再レイアウト
+    条件(章立て・本文量等)次第で変動するため、読者が実際に手にする版のページとは
+    一致しない虚構である。ページベースの引用は蔵書の「正確な出典」目標に反する
+    ため、<!-- page: N --> マーカーは挿入せず、引用の位置情報は既存の見出し
+    パンくず(chunker)に委ねる。
+    """
+
+    def test_convert_epub_returns_markdown_with_chapter_content(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "book.epub"
+            _build_minimal_epub(path, n_chapters=3)
+
+            result = convert_file(path)
+
+            assert isinstance(result, ConvertResult)
+            assert result.converter == "pymupdf4llm-reflow"
+            assert "Chapter 1" in result.markdown
+            assert "Chapter 3" in result.markdown
+
+    def test_convert_fb2_returns_markdown_with_section_content(self):
+        """FB2(FictionBook) も EPUB と同じ pymupdf4llm-reflow 経路で実変換できる
+        ことのスモーク。ページマーカーが挿入されないことも合わせて確認する。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "book.fb2"
+            _build_minimal_fb2(path, n_sections=2)
+
+            result = convert_file(path)
+
+            assert isinstance(result, ConvertResult)
+            assert result.converter == "pymupdf4llm-reflow"
+            assert "Chapter 1" in result.markdown
+            assert "Chapter 2" in result.markdown
+            assert "<!-- page:" not in result.markdown
+
+    def test_convert_epub_has_no_page_markers(self):
+        # page_chunks=False を使う実装のため章数・ページ数によらずマーカーは
+        # 出ない。複数章の EPUB でも成り立つことを確認する。
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "book.epub"
+            _build_minimal_epub(path, n_chapters=8)
+
+            result = convert_file(path)
+
+            assert "<!-- page:" not in result.markdown
+
+    def test_convert_broken_epub_raises_safe_conversion_error(self):
+        """壊れた/DRM保護された EPUB は、絶対パスやライブラリの生例外メッセージを
+        含まない安全な ConversionError に丸める。pymupdf.FileDataError は実際には
+        "Failed to open file '<絶対パス>' as type epub." のように絶対パスを
+        メッセージへ含めるため、そのまま利用者に見せてはならない(実測確認済み)。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "broken.epub"
+            path.write_bytes(b"not a real zip file at all" * 5)
+
+            with pytest.raises(ConversionError) as exc_info:
+                convert_file(path)
+
+            message = str(exc_info.value)
+            assert str(path) not in message
+            assert tmpdir not in message
+            assert "Traceback" not in message
+
+    def test_convert_broken_epub_error_does_not_chain_raw_exception(self):
+        """WHY: 元の pymupdf 例外を __context__/__cause__ 経由で連鎖させたままだと、
+        message には出ない絶対パス等の生情報が、ログ出力やトレースバック表示
+        （例: logging.exception・MCP エラーサーフェス）経由で漏れうる。加えて
+        Windows では、この生例外のトレースバックがフレームローカル経由で
+        MuPDF 側の未解放ファイルハンドルを延命させ、直後の一時ディレクトリ
+        削除で WinError 32 を誘発する（実測: CI ログで cleanup 時に
+        PermissionError）。連鎖を断ち切り、GC が早期にハンドルを解放できる
+        ようにする。
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "broken.epub"
+            path.write_bytes(b"not a real zip file at all" * 5)
+
+            with pytest.raises(ConversionError) as exc_info:
+                convert_file(path)
+
+            assert exc_info.value.__cause__ is None
+            assert exc_info.value.__context__ is None
+
+    def test_reflow_short_text_raises_safe_generic_error(self):
+        """短すぎる抽出結果は PDF 専用文言(スキャン PDF)を流用せず、
+        リフロー形式向けの汎用文言(DRM/破損の可能性)にする(中位指摘#6と同種の配慮)。"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "book.fb2"
+            path.write_bytes(b"<x/>")
+
+            with patch("pymupdf4llm.to_markdown", return_value="short"):
+                with pytest.raises(ConversionError) as exc_info:
+                    convert_file(path)
+
+            assert "PDF" not in str(exc_info.value)
+            assert "抽出できませんでした" in str(exc_info.value)
 
 
 class TestDecideSkipOcr:

@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import threading
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,7 +38,7 @@ from shelf.digests import (
     parse_reduce,
     select_reduce_input,
 )
-from shelf.indexer import IndexStats, index_notebook
+from shelf.indexer import DIGEST_SEQ_BASE, IndexStats, index_notebook
 from shelf.librarian import Librarian
 from shelf.names import doc_id_for, validate_notebook_name
 from shelf.ports import (
@@ -44,6 +46,7 @@ from shelf.ports import (
     FileSummary,
     NotebookCard,
     RetrievedChunk,
+    RouteOutcome,
     RouteTarget,
     StudyNote,
 )
@@ -78,15 +81,28 @@ _SHELVE_DIGEST_RECOMMENDATION = (
     "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
 )
 
+# _build_catalog が NotebookCard.titles へ投影する文書タイトルの件数上限（タスク B7-1）。
+# tags と違い digest 実行なしでも常に存在する既存 DB 情報（documents.title）を使い、
+# 未 digest notebook のカタログ痩せを緩和する。件数を絞るのはプロンプト肥大防止
+# （司書ルーティングプロンプトは notebook 数 × カード情報量に比例して膨らむ）。
+_CATALOG_TITLE_LIMIT = 5
+
+# 投影する各タイトルの切り詰め長（タスク B7-1）。長大なタイトル1件がプロンプトを
+# 支配しないよう、代表資料の目安が伝わる程度の短さに抑える境界防御。
+_CATALOG_TITLE_MAX_LEN = 60
+
 
 @dataclass(frozen=True)
 class IngestResult:
     """_ingest_file の戻り値。doc_id に加え、converter からの利用者向け通知
     （例: OCRスキップ）を notes として運ぶ。notes は既定で空タプル（該当なし）。
+    duplicates は同一 content_hash を持つ他資料（自分自身を除く。B3）——
+    notebook 横断の内容重複を利用者へ warn するためのもので、既定で空タプル。
     """
 
     doc_id: str
     notes: tuple[str, ...] = ()
+    duplicates: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -164,7 +180,20 @@ def _stem_for(origin: str) -> str:
     return Path(origin).stem
 
 
-def _validate_file_origin(origin: str) -> dict | None:
+def _content_hash_of(markdown: str) -> str:
+    """変換後 markdown の sha256 hexdigest。documents.content_hash（内容重複検出・
+    B3）と digest の skip 判定用 source_hash（「内容が変わったか」を問う）が
+    同じ問いを扱うため、算出レシピを1箇所に統一する。
+
+    注意: ハッシュ対象は変換「後」の markdown であり、コンバータのバージョンに
+    依存する（例: pymupdf4llm の出力仕様が変われば同一の元ファイルでも markdown の
+    文字列表現が変わり、このハッシュ値も変わり得る）。「原本ファイルの同一性」
+    ではなく「現在の変換パイプラインが生成した内容の同一性」を表す点に注意。
+    """
+    return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
+def _validate_file_origin(origin: str, *, max_file_mb: int) -> dict | None:
     """ファイル系 origin をパス/サイズ観点で検証する（design doc §7、中位指摘#5）。
 
     is_symlink() は元のパス（resolve 前）に対して判定する必要がある。resolve() は
@@ -173,6 +202,11 @@ def _validate_file_origin(origin: str) -> dict | None:
     resolve 後の is_file() はディレクトリ・デバイスファイル等の特殊ファイルを
     自然に弾く（通常ファイルにのみ True を返す）ため、シンボリックリンク拒否と
     合わせて「シンボリックリンク・ディレクトリ・特殊ファイル拒否」を満たす。
+
+    max_file_mb（config.MAX_FILE_MB 由来。既定300MB）は誤投入・暴走を防ぐための
+    上限であり、正当な蔵書（スキャン書籍PDFは数百MBになり得る）を弾かない大きめの
+    既定値。エラーメッセージは convert.py の URL サイズ超過エラーと同じ流儀で
+    上限値のみを含め、フルパスは含めない（内部ファイルシステム詳細を漏らさない）。
     """
     raw_path = Path(origin)
     if raw_path.is_symlink():
@@ -181,6 +215,18 @@ def _validate_file_origin(origin: str) -> dict | None:
     resolved = raw_path.resolve()
     if not resolved.is_file():
         return {"error": f"ファイルが存在しないか、通常ファイルではありません: {origin}"}
+
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        # is_file() 通過後、走査中のファイル削除・権限変更等のレースで stat() が
+        # 失敗し得る（indexer.py の「1ファイルの失敗で全体を止めない」既存原則と
+        # 同じ防御）。生の例外を漏らさず安全なエラー辞書を返す。
+        return {"error": "ファイルにアクセスできませんでした"}
+
+    max_bytes = max_file_mb * 1024 * 1024
+    if size > max_bytes:
+        return {"error": f"ファイルサイズが上限（{max_file_mb}MB）を超えています"}
 
     return None
 
@@ -209,6 +255,7 @@ class ShelfService:
         librarian: Librarian | None = None,
         shelve_backend: str = "ollama",
         shelver: Shelver | None = None,
+        max_file_mb: int = 300,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -258,6 +305,22 @@ class ShelfService:
         # （_get_librarian）。テストは FakeLibrarian や FakeAnswerBackend 経由でここへ
         # 差し込める（設計書 §9-B）。
         self._librarian = librarian
+        # _get_librarian の遅延構築を複数ワーカースレッドから安全に行うための
+        # double-checked locking 用ロック（タスク A2）。ask() 主目的の呼び出し元
+        # （router 未使用）で backend_factory を毎回呼ばずに済ませる既存の遅延方針
+        # （__init__ 時ではなく初回 consult() まで構築を遅らせる理由。下記
+        # _get_librarian の docstring 参照）は維持しつつ、check（if self._librarian
+        # is None）と set（self._librarian = ...）の間に別スレッドが割り込んで
+        # backend_factory を二重に呼ぶ・Librarian を二重構築するレースを防ぐ。
+        self._librarian_lock = threading.Lock()
+        # self._embedder は単一の共有インスタンス（実装は FastEmbedEmbedder=
+        # onnxruntime InferenceSession + HF tokenizer）で、consult() のタスク A4
+        # 並行化により複数ワーカースレッドから同時に embed_query() が呼ばれうる。
+        # onnxruntime/tokenizer 側の並行呼び出し安全性を一次情報で確認できていない
+        # ため、「安全なはず」に賭けず service 側でクエリ埋め込みを直列化する
+        # （embed_query 1回はミリ秒オーダーで直列化コストは無視できる一方、
+        # 未検証の並行実行は ONNX セッション破損等の再現困難なバグに繋がりうる）。
+        self._embed_lock = threading.Lock()
         # shelve() 専用の推論バックエンド名（config.SHELVE_BACKEND 由来・既定 "ollama"）。
         # service.py は config を import しない既存流儀（default_backend と同じ）に
         # 揃え、呼び出し側（cli.py。V8 の担当）が明示的に値を渡す前提のコンストラクタ
@@ -267,6 +330,15 @@ class ShelfService:
         # 注入されなければ shelve() 初回呼び出し時に backend_factory から遅延構築し、
         # 以後キャッシュする（_get_shelver・_get_librarian と同型のパターン）。
         self._shelver = shelver
+        # _get_shelver 用の double-checked locking ロック（_librarian_lock と同型・
+        # タスク A2）。
+        self._shelver_lock = threading.Lock()
+        # config.MAX_FILE_MB(env SHELF_MAX_FILE_MB)。ローカルファイル投入
+        # （add_source/add_directory、および _iter_directory_candidates の走査規則を
+        # 共有する shelve）のサイズ上限（MB）。service.py は config を import しない
+        # 既存流儀（default_backend 等と同じ）に揃え、呼び出し側（cli.py）が明示的に
+        # 値を渡す前提のコンストラクタ引数に留める。
+        self._max_file_mb = max_file_mb
 
     # -- notebook 名検証（共通ヘルパ） -----------------------------------------
 
@@ -340,7 +412,11 @@ class ShelfService:
                 warning="notebook has no indexed sources",
             )
 
-        query_vec = self._embedder.embed_query(question)
+        # 共有 embedder（実装は onnxruntime + tokenizer）を並行呼び出しから守るため
+        # 直列化する（__init__ の self._embed_lock docstring 参照。クエリ埋め込み
+        # 1回はミリ秒オーダーで直列化コストは無視できる）。
+        with self._embed_lock:
+            query_vec = self._embedder.embed_query(question)
         merged_ids, hybrid_active = self._retrieve_ids(notebook, question, ids, matrix, query_vec)
         chunks = self._load_chunks(merged_ids)
         if hybrid_active:
@@ -524,28 +600,55 @@ class ShelfService:
         return citations
 
     @staticmethod
+    def _digest_chunk_id_to_note_id(chunk_id: str) -> str:
+        """digest チャンクの id ("{notebook}/{doc_id}#{digest_seq}") を、対応する
+        study_notes.id ("{notebook}/{doc_id}#d{n}") へ変換する。
+
+        indexer.index_notebook は digest_seq = DIGEST_SEQ_BASE - note["seq"] で
+        チャンク id を生成する(indexer.py 参照)ため、逆算 n = DIGEST_SEQ_BASE -
+        digest_seq で study_notes.seq を復元できる。この関係は文字列操作だけで
+        閉じるため、store への追加問い合わせは不要（最小の対応方法として採用）。
+        """
+        prefix, _, digest_seq_text = chunk_id.rpartition("#")
+        seq = DIGEST_SEQ_BASE - int(digest_seq_text)
+        return f"{prefix}#d{seq}"
+
+    @classmethod
     def _build_insights(
-        insight_ids: list[int], insight_chunks: list[RetrievedChunk]
+        cls, insight_ids: list[int], insight_chunks: list[RetrievedChunk]
     ) -> list[dict]:
         """L番号(insight_ids)を retrieved された digest チャンクの学びに変換する。
 
         _build_citations と対称の構造だが、(source, page) 重複除去はしない: 学びノートは
         同一資料から複数件が独立した価値を持つため（citations の「同一箇所の重複引用を
-        1件にまとめる」判断とは意図が異なる）。note_id は chunks テーブルの id
-        （例 "nb/doc#-2"）をそのまま使う。study_notes.id の "#d{n}" 形式ではないが、
-        indexer.py/ports.py を編集できない本タスク(R8)の範囲では retrieved チャンクの
-        id が学びノートを一意に指す唯一の値であり、これで足りる（R9/R10 への申し送り
-        事項として完了報告に明記）。
+        1件にまとめる」判断とは意図が異なる）。note_id は study_notes.id
+        （"{notebook}/{doc_id}#d{n}" 形式）へ正規化する: 応答の note_id が指す先は
+        本来 study_notes テーブルであるべきで、chunks.id（例 "nb/doc#-2"）をそのまま
+        返すと呼び出し元が study_notes を引けない不整合になるため。chunk.id 自体は
+        応答互換のため chunk_id として additive に残す。
         """
         insights: list[dict] = []
         for l in insight_ids:  # noqa: E741 - 設計書 §5-C の "l" 番号をそのまま踏襲
             if not (1 <= l <= len(insight_chunks)):
                 continue
             chunk = insight_chunks[l - 1]
+            try:
+                note_id = cls._digest_chunk_id_to_note_id(chunk.id)
+            except (ValueError, IndexError) as exc:
+                # 現行の indexer.py 生成規則では到達不能だが、フェイルソフト方針
+                # （design doc既定）に合わせ、想定外形式の chunk.id で ask/consult
+                # 全体を落とさず、この insight だけをスキップして warning に残す。
+                _logger.warning(
+                    "digest チャンクの id が想定外形式のため insight をスキップしました: "
+                    "chunk_id=%r error=%r",
+                    chunk.id, exc,
+                )
+                continue
             insights.append(
                 {
                     "l": l,
-                    "note_id": chunk.id,
+                    "note_id": note_id,
+                    "chunk_id": chunk.id,
                     "source": chunk.source_path,
                     "text": chunk.text[:QUOTE_MAX_LEN],
                     # additive: map-reduce パイプライン(§7-B)が付与した代表節・
@@ -758,6 +861,15 @@ class ShelfService:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(markdown, encoding="utf-8")
 
+        # title は取込資料が持ち込む生メタデータであり、攻撃者が制御可能な入力
+        # （設計書 §7-A「backend へ送る全テキストは mask 済み」）。description/persona と
+        # 同じ流儀で永続化前に mask を通す（レビュー指摘 must#1: 未 mask のまま保存すると
+        # NotebookCard.titles 経由で司書ルーティングプロンプトへ恒常露出してしまう）。
+        masked_title = (
+            self._mask(title) if title is not None and self._mask is not None else title
+        )
+
+        content_hash = _content_hash_of(markdown)
         now = datetime.now(UTC).isoformat()
         self._store.upsert_document(
             id=doc_id,
@@ -767,12 +879,22 @@ class ShelfService:
             normalized_path=normalized_path,
             converter=converter,
             added_at=now,
-            title=title,
+            title=masked_title,
+            content_hash=content_hash,
             fetched_at=now if is_url else None,
             description=description,
             description_source=description_source,
         )
-        return IngestResult(doc_id=doc_id, notes=conversion_notes)
+        # notebook 横断の内容重複検出（B3）: 自分自身を除いた同一 content_hash の
+        # 資料を warn 対象として持ち帰る。skip はしない（同一書籍を複数の棚に
+        # 意図的に置く運用は正当なため、拒否ではなく記録に留める）。
+        duplicate_rows = self._store.find_documents_by_content_hash(
+            content_hash, exclude_doc_id=doc_id
+        )
+        duplicates = tuple(
+            {"doc_id": row["id"], "notebook": row["notebook"]} for row in duplicate_rows
+        )
+        return IngestResult(doc_id=doc_id, notes=conversion_notes, duplicates=duplicates)
 
     def add_source(
         self,
@@ -813,7 +935,7 @@ class ShelfService:
                 return self.add_directory(notebook, origin, auto_summary=auto_summary)
             # URL 系 origin は convert_url 側の Content-Length/打ち切り読みでサイズを
             # 制御するため対象外（design doc §7 はファイル系 origin の規定）。
-            file_error = _validate_file_origin(origin)
+            file_error = _validate_file_origin(origin, max_file_mb=self._max_file_mb)
             if file_error is not None:
                 return file_error
             # add_directory（resolve 済み絶対パスで origin 記録）と表記を揃える。
@@ -847,22 +969,28 @@ class ShelfService:
         if ingest_result.notes:
             # notes が空のときはキー自体を付けない(JSONノイズを避ける)。
             response["notes"] = list(ingest_result.notes)
+        if ingest_result.duplicates:
+            # duplicates も同じ流儀（空なら省略）。B3: notebook 横断の内容重複警告。
+            response["duplicates"] = list(ingest_result.duplicates)
         return response
 
     # -- add_directory ---------------------------------------------------------
 
     @staticmethod
-    def _iter_directory_candidates(root: Path, skipped: list[dict]) -> Iterator[Path]:
+    def _iter_directory_candidates(
+        root: Path, skipped: list[dict], *, max_file_mb: int
+    ) -> Iterator[Path]:
         """root 配下を再帰走査し、対応形式の通常ファイルの Path だけを yield する。
 
         add_directory と shelve（設計書 §13.2 手順1「add_directory と同一規則」）が
         共有するスキャン規則: 隠しファイル/ディレクトリ（root からの相対パス構成要素の
-        いずれかが "." 始まり）は記録すらせず黙って除外し、symlink・未対応形式は
-        呼び出し元が渡す skipped リストへ記録したうえで除外する。rglob はディレクトリ
-        シンボリックリンクを辿らない（Python 3.11+）ため、tree 外へ迷い出る走査
-        ループの心配なくそのまま使える。root は呼び出し元が resolve 済みである前提
-        （yield する Path も resolve 済み絶対パスの子孫になる）。
+        いずれかが "." 始まり）は記録すらせず黙って除外し、symlink・未対応形式・
+        サイズ上限超過は呼び出し元が渡す skipped リストへ記録したうえで除外する。
+        rglob はディレクトリシンボリックリンクを辿らない（Python 3.11+）ため、tree 外へ
+        迷い出る走査ループの心配なくそのまま使える。root は呼び出し元が resolve 済み
+        である前提（yield する Path も resolve 済み絶対パスの子孫になる）。
         """
+        max_bytes = max_file_mb * 1024 * 1024
         for path in sorted(root.rglob("*")):
             rel_parts = path.relative_to(root).parts
             if any(part.startswith(".") for part in rel_parts):
@@ -883,6 +1011,27 @@ class ShelfService:
                 pick_converter(str(path))
             except ConversionError:
                 skipped.append({"origin": str(path), "reason": "未対応の形式です"})
+                continue
+
+            try:
+                size = path.stat().st_size
+            except OSError:
+                # 走査中のファイル削除・権限変更等のレースで stat() が失敗し得る
+                # （indexer.py の「1ファイルの失敗で全体を止めない」既存原則と同じ
+                # 防御・コードレビュー指摘対応）。生の例外を漏らさず継続する。
+                skipped.append({"origin": str(path), "reason": "ファイルを読み取れませんでした"})
+                continue
+
+            if size > max_bytes:
+                # 1件の拒否で一括投入全体を止めない既存流儀（symlink・未対応形式と
+                # 同じ「skipped へ記録して継続」）。単体投入(add_source)は即時エラー
+                # 辞書を返すのに対し、一括投入では他ファイルの価値を優先する。
+                skipped.append(
+                    {
+                        "origin": str(path),
+                        "reason": f"ファイルサイズが上限（{max_file_mb}MB）を超えています",
+                    }
+                )
                 continue
 
             yield path
@@ -913,7 +1062,7 @@ class ShelfService:
         skipped: list[dict] = []
         errors: list[dict] = []
 
-        for path in self._iter_directory_candidates(root, skipped):
+        for path in self._iter_directory_candidates(root, skipped, max_file_mb=self._max_file_mb):
             origin = str(path)
             try:
                 ingest_result = self._ingest_file(
@@ -942,6 +1091,9 @@ class ShelfService:
             if ingest_result.notes:
                 # add_source と同様、notes は非空のときだけエントリに付与する。
                 added_entry["notes"] = list(ingest_result.notes)
+            if ingest_result.duplicates:
+                # 同上。B3: notebook 横断の内容重複警告をファイル単位で伝える。
+                added_entry["duplicates"] = list(ingest_result.duplicates)
             added.append(added_entry)
 
         chunks_written = 0
@@ -971,12 +1123,18 @@ class ShelfService:
         遅延構築して以後キャッシュする（_get_librarian と同型・設計書 §13.3）。
         Shelver は corpus_dir 直下を workdir として使う（分類時点ではまだ投入先
         notebook が確定していないため、notebook 別サブディレクトリを持てない）。
+
+        _get_librarian と同じ理由で double-checked locking により保護する
+        （タスク A2。複数ワーカースレッドから同時に shelve() が呼ばれても
+        backend_factory の二重呼び出し・Shelver の二重構築を起こさない）。
         """
         if self._shelver is None:
-            backend = self._backend_factory(self._shelve_backend)
-            self._shelver = Shelver(
-                backend, workdir=self._corpus_dir, notebook_backend=self._shelve_backend
-            )
+            with self._shelver_lock:
+                if self._shelver is None:
+                    backend = self._backend_factory(self._shelve_backend)
+                    self._shelver = Shelver(
+                        backend, workdir=self._corpus_dir, notebook_backend=self._shelve_backend
+                    )
         return self._shelver
 
     def _summarize_for_shelve(
@@ -1021,7 +1179,7 @@ class ShelfService:
         skipped: list[dict] = []
         errors: list[dict] = []
 
-        for path in self._iter_directory_candidates(root, skipped):
+        for path in self._iter_directory_candidates(root, skipped, max_file_mb=self._max_file_mb):
             origin = str(path)
             # 既に(いずれかのnotebookに)投入済みの origin は変換・要約・分類の
             # コストを払わずスキップする（設計書 §13.1 決定4/§13.7）。
@@ -1081,7 +1239,9 @@ class ShelfService:
             root, summarize_backend
         )
 
-        catalog = self._build_catalog()
+        # shelving._format_card は titles を使わないため、titles 投影クエリを
+        # 発行させない（レビュー指摘 must#2）。
+        catalog = self._build_catalog(include_titles=False)
         plan = self._get_shelver().plan(summaries, catalog)
         errors = [*errors, *plan.errors]
 
@@ -1105,6 +1265,7 @@ class ShelfService:
                 ],
                 "skipped": skipped,
                 "errors": errors,
+                "notes": plan.notes,
             }
 
         for spec in plan.created:
@@ -1154,7 +1315,9 @@ class ShelfService:
             "skipped": skipped,
             "errors": errors,
             "chunks_written": chunks_written,
-            "notes": [_SHELVE_DIGEST_RECOMMENDATION],
+            # plan.notes（タスク B7-3: silent な notebook 名リマップの注記）を、
+            # 既存の digest 案内メッセージより先に並べる（発生順・分類段が先）。
+            "notes": [*plan.notes, _SHELVE_DIGEST_RECOMMENDATION],
         }
 
     # -- index -----------------------------------------------------------------
@@ -1174,13 +1337,20 @@ class ShelfService:
 
     # -- consult（司書ルーティング入口・設計書 §5-A/§6） -------------------------
 
-    def _build_catalog(self) -> list[NotebookCard]:
+    def _build_catalog(self, *, include_titles: bool = True) -> list[NotebookCard]:
         """Librarian.route() に渡す投影 DTO を store.list_notebooks() から組み立てる。
 
         Librarian は store を一切知らない（設計書 §3「カタログは service が組み立てて
         Librarian に渡す」）ため、この変換は service の責務。tags は
         store.list_tags_by_notebook() を1回だけ引いて notebook 名で引き当てる
-        （notebook 数ぶん個別クエリを発行しない・N+1 回避）。
+        （notebook 数ぶん個別クエリを発行しない・N+1 回避）。titles は tags と異なり
+        digest 未実行でも常に取得できる既存情報だが、store.list_document_titles は
+        notebook 単位の API のため notebook ごとに個別クエリになる（タスク B7-1:
+        LLM 追加呼び出しゼロの範囲でのコスト規律のため、DB read 側の N+1 は許容する）。
+
+        include_titles=False（shelve() 経由）では titles クエリ自体を発行しない
+        （レビュー指摘 must#2）: shelving._format_card は titles を使わないため、
+        shelve() の分類プロンプト経路で毎ファイルぶん無駄な DB read が発生していた。
         """
         tags_by_notebook = self._store.list_tags_by_notebook()
         return [
@@ -1190,9 +1360,33 @@ class ShelfService:
                 persona=row["persona"],
                 doc_count=row["documents"],
                 tags=tuple(tags_by_notebook.get(row["name"], ())),
+                titles=(
+                    self._project_notebook_titles(row["name"]) if include_titles else ()
+                ),
             )
             for row in self._store.list_notebooks()
         ]
+
+    def _project_notebook_titles(self, notebook: str) -> tuple[str, ...]:
+        """notebook の代表資料タイトルを、投入順（added_at 昇順）で先頭
+        _CATALOG_TITLE_LIMIT 件、_CATALOG_TITLE_MAX_LEN 字へ切り詰めて返す
+        （タスク B7-1）。
+
+        store.list_document_titles が「投入順・タイトルありのみ・SQL 側 LIMIT」を
+        保証する（レビュー指摘 must#2: id はスラグ+ハッシュでアルファベット順であり
+        投入順ではないため、投入順の並びは store 層の ORDER BY added_at に委ねる）。
+
+        mask は description/persona と同じく service 側の不変条件（設計書 §7-A）だが、
+        ここでも重ねて適用する（レビュー指摘 must#1(a)）: _persist_converted 側の
+        永続化時 mask（(b)）は新規行のみの恒久対処であり、それ以前に保存された
+        既存 DB 行はカバーできない。mask は冪等（正規表現置換は一度マッチした文字列に
+        再度マッチしない）ため、二重適用しても安全。
+        """
+        titles = self._store.list_document_titles(notebook, _CATALOG_TITLE_LIMIT)
+        return tuple(
+            (self._mask(title) if self._mask is not None else title)[:_CATALOG_TITLE_MAX_LEN]
+            for title in titles
+        )
 
     def _get_librarian(self) -> Librarian:
         """注入された Librarian があればそれを使い、無ければ backend_factory から
@@ -1201,15 +1395,23 @@ class ShelfService:
         設計書 §6-D）。ask() を主目的に ShelfService を構築する呼び出し元
         （router 未使用）で余計な backend_factory 呼び出しを起こさないよう、
         __init__ 時ではなく初回 consult() 呼び出し時まで構築を遅らせる。
+
+        複数ワーカースレッドから同時に consult() が呼ばれうる構成（タスク A2）を
+        考慮し、double-checked locking で保護する: ロック外の1回目のチェックで
+        大半の呼び出し（既に構築済み）はロック取得コストなしで早期リターンでき、
+        未構築時のみ _librarian_lock を取ってから再チェック（ロック待ちの間に
+        別スレッドが構築済みかもしれない）した上で構築する。
         """
         if self._librarian is None:
-            backend_name = self._router_backend or self._default_backend
-            self._librarian = Librarian(
-                self._backend_factory(backend_name),
-                workdir=self._corpus_dir,
-                top_n=self._route_top_n,
-                fallback=self._route_fallback,
-            )
+            with self._librarian_lock:
+                if self._librarian is None:
+                    backend_name = self._router_backend or self._default_backend
+                    self._librarian = Librarian(
+                        self._backend_factory(backend_name),
+                        workdir=self._corpus_dir,
+                        top_n=self._route_top_n,
+                        fallback=self._route_fallback,
+                    )
         return self._librarian
 
     def consult(self, question: str) -> dict:
@@ -1218,10 +1420,13 @@ class ShelfService:
         catalog が空の場合は Librarian.route() 自体を呼ばずに短絡する（apply_fallback
         も同じ分岐で対象ゼロを返すが、catalog が空だと事前に分かっている以上、
         無駄な backend 呼び出しを避けるほうがレイテンシ・コスト面で望ましい）。
-        route() が空リストを返す理由（カタログ空／answerable=false／パース失敗／
-        backend失敗のいずれか）は routing.apply_fallback 内部で吸収され Librarian の
-        外からは区別できないため、ここでは一律「資料からは分からない」型の返却
-        （grounded=false・専門家を呼ばない）に倒す（部品からの申し送り事項）。
+        route() が空リストを返す理由は grounded=false（専門家を呼ばない）へ一律で
+        倒すが、warning 文言は RouteOutcome の診断情報（router_error/parse_ok）を
+        使って3通りに出し分ける（タスク B7-2・_consult_no_targets_warning 参照）:
+        (1) backend 呼び出し自体の失敗（router_error）、(2) 司書応答が JSON として
+        解釈できなかった解析失敗（parse_ok=False）、(3) 解析は成功したが
+        answerable=false、または targets 空で fallback=conservative という
+        「回答不能」寄りの経路。
         """
         catalog = self._build_catalog()
         if not catalog:
@@ -1235,11 +1440,7 @@ class ShelfService:
         librarian = self._get_librarian()
         outcome = librarian.route(question, catalog)
         if not outcome.targets:
-            warning = (
-                f"司書ルーティングの backend 呼び出しに失敗: {outcome.router_error}"
-                if outcome.router_error is not None
-                else "資料からは分からない"
-            )
+            warning = self._consult_no_targets_warning(outcome)
             return {
                 "question": question,
                 "answered": False,
@@ -1250,9 +1451,51 @@ class ShelfService:
         return {
             "question": question,
             "answered": True,
-            "routed": [self._consult_target(target) for target in outcome.targets],
+            "routed": self._consult_targets(outcome.targets),
             "warning": None,
         }
+
+    def _consult_no_targets_warning(self, outcome: RouteOutcome) -> str:
+        """targets が空の consult() 応答に添える warning 文言を、原因ごとに出し分ける
+        （タスク B7-2）。優先順位は Librarian.route の診断情報の確度順:
+        1. router_error（backend 呼び出し自体の失敗・既存の文言のまま維持）。
+        2. parse_ok=False（司書応答が JSON として解釈できなかった「解析失敗」。
+           parse_routing は総崩れ時に answerable も強制的に False にするため
+           （routing.py 参照）、parse_ok を router_error の次に優先して判定しないと
+           「回答不能」と誤表示してしまう）。
+        3. それ以外（parse は成功したが answerable=false、または targets 空で
+           fallback=conservative）は総称して「回答不能」寄りの文言にする。
+        """
+        if outcome.router_error is not None:
+            return f"司書ルーティングの backend 呼び出しに失敗: {outcome.router_error}"
+        if not outcome.parse_ok:
+            return "ルーティング応答の解析に失敗しました"
+        return "資料からは分からないと判断しました"
+
+    def _consult_targets(self, targets: list[RouteTarget]) -> list[dict]:
+        """target ごとの専門家推論を実行し、ルーティング順のリストで返す（タスク A4）。
+
+        各 target は独立（別 notebook・別 backend 呼び出し=サブプロセス/HTTP）であり、
+        Store はスレッド安全化済み（RLock は短時間の DB 操作のみを保護し、LLM 呼び出しは
+        ロック外）なので、2 件以上なら ThreadPoolExecutor で並行実行して SHELF_ROUTE_TOP_N
+        段の直列レイテンシ（最悪 300s×2）を max() へ縮める。1 件以下は executor 生成の
+        オーバーヘッドを避けるため従来どおり直接呼び出す（挙動・意味論を完全に保存）。
+
+        executor.map はイテラブルの順序を完了順ではなく投入順で返す（内部で
+        futures をリスト順に result() する）ため、結果はルーティング順のまま保たれる。
+        例外はそのイテレーション時に result() 経由で再送出され、list() 内で consult()
+        の呼び出し元まで素通しに伝播する（既存の「try/except を挟まない」意味論を維持）。
+
+        トレードオフ: 先頭 target が生例外を投げた場合でも、まだ実行中の後続 target は
+        cancel 不能（既に走り始めた ThreadPoolExecutor のワーカーは中断できない）で、
+        with ブロック終了時の shutdown(wait=True) がその完了を待ってから例外が
+        呼び出し元へ伝播する。逐次実装なら後続 target はそもそも開始されないため、
+        並行化によりこの経路の最悪待ち時間が増える（最悪 300s）。
+        """
+        if len(targets) <= 1:
+            return [self._consult_target(target) for target in targets]
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            return list(executor.map(self._consult_target, targets))
 
     def _consult_target(self, target: RouteTarget) -> dict:
         """ルーティング対象 1 件に対して専門家推論を実行し、透明性情報と集約する。
@@ -1422,7 +1665,7 @@ class ShelfService:
         except OSError:
             return "資料ファイルを読み取れませんでした"
 
-        content_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        content_hash = _content_hash_of(markdown)
 
         if not force:
             # skip 判定は「source_hash 一致」だけでなく「既存ノートが現行パイプライン

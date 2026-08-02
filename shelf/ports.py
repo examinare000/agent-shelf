@@ -67,6 +67,10 @@ class NotebookCard:
     # 既定値を付けることで、tags を知らない既存呼び出し箇所（_build_catalog 等）を
     # 壊さずに追加する（他 DTO の additive 拡張と同じ後方互換方針）。
     tags: tuple[str, ...] = ()
+    # 未 digest の notebook はタグが空でカタログが痩せてルーティング精度が落ちるため、
+    # digest 抜きでも既存 DB 情報（文書タイトル）だけでカードを補う投影（タスク B7-1）。
+    # tags と同じ後方互換方針で既定値を空タプルにする。
+    titles: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,12 @@ class RouteOutcome:
 
     targets: list[RouteTarget] = field(default_factory=list)
     router_error: str | None = None  # raw.ok=False の時のみ非 None（安全な要約）
+    # RoutingDecision.parse_ok をそのまま運ぶ（タスク B7-2）。service.consult が
+    # 「answerable=false（回答不能）」と「parse_ok=false（解析失敗）」を区別した
+    # warning 文言を出し分けるための情報。既定 True は tags/titles と同じ
+    # additive 拡張の後方互換方針（tests/fakes.py の FakeLibrarian 等、既存の
+    # RouteOutcome() 構築箇所を壊さない）。
+    parse_ok: bool = True
 
 
 @dataclass(frozen=True)
@@ -199,7 +209,7 @@ class ShelvePlan:
     """`Shelver.plan()` の集約結果（分類段・設計書 §13.6）。
 
     dry-run 出力・適用時の両方の元になる第一級データ構造（§13.1 決定 2）。
-    4 フィールドとも mutable な list のため、他の集約 DTO（RoutingDecision.targets）と
+    5 フィールドとも mutable な list のため、他の集約 DTO（RoutingDecision.targets）と
     同じく field(default_factory=list) でインスタンス間の共有を断つ。
     """
 
@@ -207,3 +217,7 @@ class ShelvePlan:
     created: list[NewNotebookSpec] = field(default_factory=list)
     skipped: list[dict] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)
+    # classify_step が検出した silent fallback（LLM 提案名の既定名への強制リマップ・
+    # タスク B7-3）の注記。既存の service.shelve() "notes" キーと同じ str リストの
+    # 流儀に合わせる（additive・既存 ShelvePlan() 構築箇所を壊さない）。
+    notes: list[str] = field(default_factory=list)

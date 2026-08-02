@@ -52,19 +52,38 @@ def build_claude_sh_text(*, transport: str, url: str | None, repo_root: Path) ->
     )
 
 
+def _toml_basic_string(value: str) -> str:
+    r"""TOML basic string へ埋め込むための最小限エスケープ（`\`→`\\`、`"`→`\"`）。
+
+    WHY: Windows の repo_root は str() がバックスラッシュ区切り（例:
+    `C:\Users\...`）になる。TOML の basic string はバックスラッシュを
+    エスケープ導入文字として扱うため、無エスケープで埋め込むと `\U`・`\u` 等が
+    不正な Unicode エスケープと解釈され tomllib.TOMLDecodeError になる
+    （実測: Windows CI で "Invalid hex value"）。TOML 1.0 のエスケープ規則に
+    従い、バックスラッシュとダブルクォートのみを最小限エスケープする
+    （このモジュールが埋め込む値はコマンド名・パス・URL に限られ、
+    制御文字を含む想定はしていない）。
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def build_codex_toml_text(*, transport: str, url: str | None, repo_root: Path) -> str:
     """codex `[mcp_servers.shelf]` 設定断片を組み立てる。"""
     if transport == "http":
-        return f'[mcp_servers.shelf]\nurl = "{url}"\n'
+        return f'[mcp_servers.shelf]\nurl = "{_toml_basic_string(url)}"\n'
     argv = build_stdio_argv(repo_root)
-    args_toml = ", ".join(f'"{a}"' for a in argv[1:])
-    return f'[mcp_servers.shelf]\ncommand = "{argv[0]}"\nargs = [{args_toml}]\n'
+    args_toml = ", ".join(f'"{_toml_basic_string(a)}"' for a in argv[1:])
+    return f'[mcp_servers.shelf]\ncommand = "{_toml_basic_string(argv[0])}"\nargs = [{args_toml}]\n'
 
 
 def build_gemini_json_text(*, transport: str, url: str | None, repo_root: Path) -> str:
     """gemini `mcpServers` 設定断片を組み立てる。"""
     if transport == "http":
-        server: dict = {"url": url}
+        # Gemini CLI 公式ドキュメント（settings.json の mcpServers 仕様）では、
+        # streamable-http 接続は "httpUrl" キーで指定し、"url" キーは SSE
+        # transport 用と区別されている。ただし実機（実 Gemini CLI 起動）では
+        # 未検証のため、Gemini CLI のバージョンによっては挙動が異なる可能性がある。
+        server: dict = {"httpUrl": url}
     else:
         argv = build_stdio_argv(repo_root)
         server = {"command": argv[0], "args": argv[1:]}

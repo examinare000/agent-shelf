@@ -351,6 +351,122 @@ def test_hybrid_search_env_falsy_values(monkeypatch, value):
     importlib.reload(config)
 
 
+def test_max_file_mb_default_is_300():
+    # 誤投入・暴走を防ぐための上限であり、正当な蔵書（スキャン書籍PDFは数百MBに
+    # なり得る）を弾かない大きめの既定値とする。
+    assert config.MAX_FILE_MB == 300
+
+
+def test_max_file_mb_env_override(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MAX_FILE_MB", "10")
+        importlib.reload(config)
+        assert config.MAX_FILE_MB == 10
+    importlib.reload(config)
+
+
+def test_max_file_mb_invalid_value_falls_back_to_default(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MAX_FILE_MB", "abc")
+        importlib.reload(config)
+        assert config.MAX_FILE_MB == 300
+    importlib.reload(config)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "-300"])
+def test_max_file_mb_non_positive_value_falls_back_to_default(monkeypatch, value):
+    # 0以下は「常に拒否」("ファイルサイズが上限（0MB）を超えています"等の違和感ある
+    # エラーメッセージ)になってしまうため、不正値と同様に既定へフォールバックする
+    # （コードレビュー指摘）。
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MAX_FILE_MB", value)
+        importlib.reload(config)
+        assert config.MAX_FILE_MB == 300
+    importlib.reload(config)
+
+
+def test_http_enabled_default_is_false():
+    assert config.HTTP_ENABLED is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "True", "TRUE"])
+def test_http_enabled_env_truthy_values(monkeypatch, value):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_HTTP_ENABLED", value)
+        importlib.reload(config)
+        assert config.HTTP_ENABLED is True
+    importlib.reload(config)
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", ""])
+def test_http_enabled_env_falsy_values(monkeypatch, value):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_HTTP_ENABLED", value)
+        importlib.reload(config)
+        assert config.HTTP_ENABLED is False
+    importlib.reload(config)
+
+
+def test_http_host_default_is_localhost():
+    assert config.HTTP_HOST == "127.0.0.1"
+
+
+def test_http_host_env_override(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_HTTP_HOST", "100.64.0.1")
+        importlib.reload(config)
+        assert config.HTTP_HOST == "100.64.0.1"
+    importlib.reload(config)
+
+
+def test_http_port_default_is_8765():
+    assert config.HTTP_PORT == 8765
+
+
+def test_http_port_env_override(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_HTTP_PORT", "9000")
+        importlib.reload(config)
+        assert config.HTTP_PORT == 9000
+    importlib.reload(config)
+
+
+def test_http_port_invalid_value_falls_back_to_default(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_HTTP_PORT", "not-a-number")
+        importlib.reload(config)
+        assert config.HTTP_PORT == 8765
+    importlib.reload(config)
+
+
+def test_allowed_hosts_default_is_empty_list():
+    assert config.ALLOWED_HOSTS == []
+
+
+def test_allowed_hosts_env_single_value(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_ALLOWED_HOSTS", "avalon.tailxxxx.ts.net:8765")
+        importlib.reload(config)
+        assert config.ALLOWED_HOSTS == ["avalon.tailxxxx.ts.net:8765"]
+    importlib.reload(config)
+
+
+def test_allowed_hosts_env_multiple_comma_separated_values(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_ALLOWED_HOSTS", "hostA:8765,hostB:8765")
+        importlib.reload(config)
+        assert config.ALLOWED_HOSTS == ["hostA:8765", "hostB:8765"]
+    importlib.reload(config)
+
+
+def test_allowed_hosts_env_strips_whitespace_and_drops_empty_elements(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_ALLOWED_HOSTS", " hostA:8765 , ,hostB:8765,")
+        importlib.reload(config)
+        assert config.ALLOWED_HOSTS == ["hostA:8765", "hostB:8765"]
+    importlib.reload(config)
+
+
 class TestSessionWideConfigIsolation:
     """tests/conftest.py の autouse フィクスチャによる SHELF_CONFIG 固定を検証する。
 

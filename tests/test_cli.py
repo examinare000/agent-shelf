@@ -11,11 +11,13 @@ main() 経由でここに含める。
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
 from shelf import cli
 from shelf.cli import build_parser
+from shelf.doctor import CheckResult
 from shelf.indexer import IndexStats
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
@@ -27,17 +29,20 @@ class TestServeCommand:
         args = build_parser().parse_args(["serve"])
         assert args.command == "serve"
 
-    def test_http_defaults_to_false(self):
+    def test_http_defaults_to_none_sentinel(self):
+        # None は「CLI 指定なし」を表すサンチネル。実際の既定値解決(フラグ > env > 既定)は
+        # resolve_serve_settings が担うため、argparse 自体は env より優先すべきかを
+        # 判定できるよう None のままにする。
         args = build_parser().parse_args(["serve"])
-        assert args.http is False
+        assert args.http is None
 
-    def test_host_defaults_to_localhost(self):
+    def test_host_defaults_to_none_sentinel(self):
         args = build_parser().parse_args(["serve"])
-        assert args.host == "127.0.0.1"
+        assert args.host is None
 
-    def test_port_defaults_to_8765(self):
+    def test_port_defaults_to_none_sentinel(self):
         args = build_parser().parse_args(["serve"])
-        assert args.port == 8765
+        assert args.port is None
 
     def test_http_flag_can_be_set(self):
         args = build_parser().parse_args(["serve", "--http"])
@@ -73,6 +78,160 @@ class TestServeCommand:
         )
         assert args.allowed_host == ["avalon.tailxxxx.ts.net:8765", "otherhost:8765"]
 
+    def test_stdio_flag_defaults_to_false(self):
+        args = build_parser().parse_args(["serve"])
+        assert args.stdio is False
+
+    def test_stdio_flag_can_be_set(self):
+        args = build_parser().parse_args(["serve", "--stdio"])
+        assert args.stdio is True
+
+
+class TestBindWarning:
+    """--host が全インターフェース bind を意味する値のとき、意図しない公開を
+    避けるための警告メッセージを返す純関数(_bind_warning)を検証する。
+    """
+
+    def test_none_for_localhost(self):
+        assert cli._bind_warning("127.0.0.1") is None
+
+    def test_none_for_arbitrary_single_interface(self):
+        assert cli._bind_warning("100.64.0.1") is None
+
+    def test_warns_for_ipv4_all_interfaces(self):
+        warning = cli._bind_warning("0.0.0.0")
+        assert warning is not None
+        assert "全インターフェース" in warning
+
+    def test_warning_message_mentions_ipv6_loopback_alternative(self):
+        # IPv4 の 127.0.0.1 だけでなく IPv6 の ::1 にも触れ、IPv6 で bind
+        # している利用者にも推奨先が伝わるようにする。
+        warning = cli._bind_warning("0.0.0.0")
+        assert warning is not None
+        assert "::1" in warning
+
+    def test_warns_for_ipv6_all_interfaces(self):
+        warning = cli._bind_warning("::")
+        assert warning is not None
+        assert "全インターフェース" in warning
+
+    def test_none_for_ipv6_loopback(self):
+        assert cli._bind_warning("::1") is None
+
+    def test_none_for_ipv6_arbitrary_address(self):
+        assert cli._bind_warning("2001:db8::1") is None
+
+
+class TestResolveServeSettings:
+    """resolve_serve_settings の優先順位(CLI フラグ > env)を検証する純関数テスト。
+
+    build_transport_security と同じ流儀で、config モジュールを直接読まず呼び出し元が
+    解決済みの値を明示的に渡す(reload 不要でテストできる・呼び出し元の責務を分離する)。
+    """
+
+    def test_flags_present_win_over_differing_env(self):
+        args = build_parser().parse_args(
+            [
+                "serve",
+                "--http",
+                "--host",
+                "100.64.0.1",
+                "--port",
+                "9000",
+                "--allowed-host",
+                "flaghost:9000",
+            ]
+        )
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=False,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=["envhost:8765"],
+        )
+        assert settings.http is True
+        assert settings.host == "100.64.0.1"
+        assert settings.port == 9000
+        assert settings.allowed_hosts == ["flaghost:9000"]
+
+    def test_env_only_is_used_when_no_flags_given(self):
+        args = build_parser().parse_args(["serve"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=True,
+            env_host="192.168.1.5",
+            env_port=9100,
+            env_allowed_hosts=["envhost:9100"],
+        )
+        assert settings.http is True
+        assert settings.host == "192.168.1.5"
+        assert settings.port == 9100
+        assert settings.allowed_hosts == ["envhost:9100"]
+
+    def test_conflicting_http_host_port_flags_win_while_unset_allowed_host_falls_back_to_env(
+        self,
+    ):
+        # http/host/port は CLI で明示指定(env と競合)しているため常にフラグが勝つ。
+        # 一方 --allowed-host は未指定のため、この項目だけ独立に env 側へフォール
+        # バックする(4項目が一括で「フラグ優先」になるわけではないことの固定)。
+        args = build_parser().parse_args(
+            ["serve", "--http", "--host", "flag.example", "--port", "1111"]
+        )
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=False,
+            env_host="env.example",
+            env_port=2222,
+            env_allowed_hosts=["envhost:2222"],
+        )
+        assert settings.http is True
+        assert settings.host == "flag.example"
+        assert settings.port == 1111
+        assert settings.allowed_hosts == ["envhost:2222"]
+
+    def test_neither_flags_nor_meaningful_env_falls_back_to_env_defaults(self):
+        # env_* 自体には config.py 側で既に「未設定時のハードコード既定値」が
+        # 解決済みの前提(責務分離)。ここでは resolve_serve_settings がその値を
+        # そのまま透過することだけを検証する。
+        args = build_parser().parse_args(["serve"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=False,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=[],
+        )
+        assert settings.http is False
+        assert settings.host == "127.0.0.1"
+        assert settings.port == 8765
+        assert settings.allowed_hosts == []
+
+    def test_stdio_flag_wins_over_http_flag_and_env(self):
+        # --stdio は MCP クライアント登録(裸の `shelf serve` に依存)が env による
+        # 無言のすり替えに巻き込まれないための脱出口。優先順位は --stdio > --http >
+        # env > 既定であり、--http フラグと SHELF_HTTP_ENABLED が両方 true でも
+        # --stdio が最終的に勝つ。
+        args = build_parser().parse_args(["serve", "--http", "--stdio"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=True,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=[],
+        )
+        assert settings.http is False
+
+    def test_stdio_flag_wins_over_env_alone(self):
+        args = build_parser().parse_args(["serve", "--stdio"])
+        settings = cli.resolve_serve_settings(
+            args,
+            env_http_enabled=True,
+            env_host="127.0.0.1",
+            env_port=8765,
+            env_allowed_hosts=[],
+        )
+        assert settings.http is False
+
 
 class TestLsCommand:
     def test_notebook_defaults_to_none(self):
@@ -83,6 +242,52 @@ class TestLsCommand:
     def test_notebook_can_be_specified(self):
         args = build_parser().parse_args(["ls", "physics"])
         assert args.notebook == "physics"
+
+
+class TestLsDispatch:
+    """ls コマンドの main() が引数の有無で service.list_notebooks() /
+    store.list_documents() のどちらへ到達するかを、_build_service/_build_store を
+    fake に差し替えて検証する(TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_without_notebook_calls_list_notebooks_via_build_service(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+
+        class _FakeService:
+            def list_notebooks(self):
+                calls.append("list_notebooks")
+                return [
+                    {
+                        "notebook": "nb", "description": None, "backend": "codex",
+                        "sources": 1, "chunks": 2,
+                    }
+                ]
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["ls"])
+
+        assert calls == ["list_notebooks"]
+        assert "nb" in capsys.readouterr().out
+
+    def test_with_notebook_calls_list_documents_via_build_store(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeStore:
+            def list_documents(self, notebook):
+                calls.append(notebook)
+                return [
+                    {"id": "doc1", "origin": "file.txt", "origin_type": "txt", "added_at": "now"}
+                ]
+
+        monkeypatch.setattr(cli, "_build_store", lambda: _FakeStore())
+
+        cli.main(["ls", "physics"])
+
+        assert calls == ["physics"]
+        assert "doc1" in capsys.readouterr().out
 
 
 class TestNewCommand:
@@ -108,6 +313,27 @@ class TestNewCommand:
         """ローカル LLM バックエンド追加（design doc §10-4）。"""
         args = build_parser().parse_args(["new", "physics", "--backend", "ollama"])
         assert args.backend == "ollama"
+
+
+class TestNewDispatch:
+    """new コマンドの main() が service.create_notebook へ description/backend を
+    正しく橋渡しすることを、_build_service を fake に差し替えて検証する
+    (TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_calls_create_notebook_with_description_and_backend(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeService:
+            def create_notebook(self, name, description=None, backend=None):
+                calls.append((name, description, backend))
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["new", "physics", "--desc", "物理の論文", "--backend", "gemini"])
+
+        assert calls == [("physics", "物理の論文", "gemini")]
+        assert "physics" in capsys.readouterr().out
 
 
 class TestAddCommand:
@@ -197,12 +423,56 @@ class TestIndexCommand:
         assert args.all is True
 
 
+class TestIndexDispatch:
+    """index コマンドの main() が service.index へ notebook/full を橋渡しし、結果を
+    _print_index_stats で出力することを、_build_service を fake に差し替えて検証する
+    (TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_calls_service_index_with_full_flag_and_prints_stats(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeService:
+            def index(self, notebook, full=False):
+                calls.append((notebook, full))
+                return IndexStats(indexed=1, skipped=0, pruned=0, chunks_written=3, errors=[])
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["index", "physics", "--all"])
+
+        assert calls == [("physics", True)]
+        assert "chunks_written=3" in capsys.readouterr().out
+
+
 class TestAskCommand:
     def test_parses_notebook_and_question(self):
         args = build_parser().parse_args(["ask", "physics", "何が書いてある?"])
         assert args.command == "ask"
         assert args.notebook == "physics"
         assert args.question == "何が書いてある?"
+
+
+class TestAskDispatch:
+    """ask コマンドの main() が service.ask へ notebook/question を橋渡しし、結果を
+    JSON で出力することを、_build_service を fake に差し替えて検証する
+    (TestAddDispatch と同じ「差し替え」作法)。
+    """
+
+    def test_calls_service_ask_and_prints_json_result(self, monkeypatch, capsys):
+        calls = []
+
+        class _FakeService:
+            def ask(self, notebook, question):
+                calls.append((notebook, question))
+                return {"answer": "42", "citations": []}
+
+        monkeypatch.setattr(cli, "_build_service", lambda: _FakeService())
+
+        cli.main(["ask", "physics", "何が書いてある?"])
+
+        assert calls == [("physics", "何が書いてある?")]
+        assert json.loads(capsys.readouterr().out) == {"answer": "42", "citations": []}
 
 
 class TestConsultCommand:
@@ -249,6 +519,54 @@ class TestPersonaCommand:
             build_parser().parse_args(["persona", "physics", "--set", "text", "--clear"])
 
 
+class TestDoctorCommand:
+    def test_parses_with_no_extra_args(self):
+        args = build_parser().parse_args(["doctor"])
+        assert args.command == "doctor"
+
+
+class TestDoctorDispatch:
+    """main() の doctor ディスパッチが doctor.run_checks() の結果を印字し、
+    1件でも ok=False なら SystemExit(1) することを、run_checks を差し替えて検証する
+    (実PATH/実DB/実ネットワークには一切触れない)。
+    """
+
+    def test_prints_ok_and_ng_marks_with_detail(self, monkeypatch, capsys):
+        results = [
+            CheckResult(name="engine:codex", ok=True, detail="codex コマンドが見つかりました"),
+            CheckResult(name="ollama", ok=False, detail="http://x へ疎通できません"),
+        ]
+        monkeypatch.setattr(cli.doctor, "run_checks", lambda: results)
+
+        with pytest.raises(SystemExit):
+            cli.main(["doctor"])
+
+        out = capsys.readouterr().out
+        assert "✓ engine:codex: codex コマンドが見つかりました" in out
+        assert "✗ ollama: http://x へ疎通できません" in out
+
+    def test_exits_zero_when_all_ok(self, monkeypatch):
+        results = [CheckResult(name="engine:codex", ok=True, detail="ok")]
+        monkeypatch.setattr(cli.doctor, "run_checks", lambda: results)
+
+        try:
+            cli.main(["doctor"])
+        except SystemExit as e:
+            assert e.code in (0, None)
+
+    def test_exits_one_when_any_check_fails(self, monkeypatch):
+        results = [
+            CheckResult(name="engine:codex", ok=True, detail="ok"),
+            CheckResult(name="ollama", ok=False, detail="ng"),
+        ]
+        monkeypatch.setattr(cli.doctor, "run_checks", lambda: results)
+
+        with pytest.raises(SystemExit) as exc_info:
+            cli.main(["doctor"])
+
+        assert exc_info.value.code == 1
+
+
 class _FakeMcpSettings:
     def __init__(self) -> None:
         self.host = "127.0.0.1"
@@ -275,7 +593,9 @@ class TestServeDispatch:
     差し替え」作法の応用。実サーバ・実ソケットには一切触れない)。
     """
 
-    def test_default_dispatch_runs_stdio_without_touching_settings(self, monkeypatch):
+    def test_default_dispatch_runs_stdio_without_touching_settings(
+        self, monkeypatch, capsys
+    ):
         fake_server = _FakeMcpServer()
         monkeypatch.setattr(cli, "_build_service", lambda: object())
         monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
@@ -285,6 +605,9 @@ class TestServeDispatch:
         assert fake_server.run_calls == [None]
         assert fake_server.settings.host == "127.0.0.1"
         assert fake_server.settings.port == 8000
+        # stdio ディスパッチは bind 警告の対象外(--host は --http 時のみ使う)
+        # なので stderr には何も出ないはずである。
+        assert capsys.readouterr().err == ""
 
     def test_http_dispatch_sets_host_port_and_streamable_http_transport(
         self, monkeypatch
@@ -307,6 +630,66 @@ class TestServeDispatch:
         cli.main(["serve"])
 
         assert fake_server.settings.transport_security is None
+
+    def test_shelf_http_enabled_env_triggers_streamable_http_without_http_flag(
+        self, monkeypatch
+    ):
+        """SHELF_HTTP_ENABLED=true(--http フラグ未指定)でも streamable-http が
+        選ばれることを、config 属性を直接差し替えて検証する(env→config 解決自体は
+        test_config.py が担当するため、ここでは cli 側の分岐のみを見る)。
+        """
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+        monkeypatch.setattr(cli.config, "HTTP_ENABLED", True)
+
+        cli.main(["serve"])
+
+        assert fake_server.run_calls == ["streamable-http"]
+
+    def test_stdio_flag_forces_stdio_even_when_shelf_http_enabled_env_is_true(
+        self, monkeypatch
+    ):
+        """MCP クライアント登録は裸の `shelf serve`(暗黙 stdio 前提)に依存するため、
+        SHELF_HTTP_ENABLED=true が環境に立っていても `--stdio` で明示的に脱出できる
+        ことを検証する(レビュー指摘: env による無言のすり替えへの脱出口)。
+        """
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+        monkeypatch.setattr(cli.config, "HTTP_ENABLED", True)
+
+        cli.main(["serve", "--stdio"])
+
+        assert fake_server.run_calls == [None]
+
+    def test_shelf_http_enabled_env_dispatch_uses_env_host_port_and_allowed_hosts(
+        self, monkeypatch
+    ):
+        """SHELF_HTTP_ENABLED=true と併せて SHELF_HTTP_HOST/SHELF_HTTP_PORT/
+        SHELF_ALLOWED_HOSTS も env のみで指定された場合(CLI フラグなし)に、
+        resolve_serve_settings の kwarg 取り違えなく main() まで正しく配線される
+        ことを E2E で検証する(レビュー指摘(b): env→config→dispatch の一気通貫)。
+        """
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+        monkeypatch.setattr(cli.config, "HTTP_ENABLED", True)
+        monkeypatch.setattr(cli.config, "HTTP_HOST", "192.168.1.9")
+        monkeypatch.setattr(cli.config, "HTTP_PORT", 9200)
+        monkeypatch.setattr(cli.config, "ALLOWED_HOSTS", ["envhost:9200"])
+
+        cli.main(["serve"])
+
+        assert fake_server.run_calls == ["streamable-http"]
+        assert fake_server.settings.host == "192.168.1.9"
+        assert fake_server.settings.port == 9200
+        security = fake_server.settings.transport_security
+        assert security.allowed_hosts == [
+            "192.168.1.9:9200",
+            "192.168.1.9",
+            "envhost:9200",
+        ]
 
     def test_http_dispatch_sets_transport_security_to_bind_target_by_default(
         self, monkeypatch
@@ -362,6 +745,28 @@ class TestServeDispatch:
             "http://100.113.69.62",
             "http://avalon.tailxxxx.ts.net:8765",
         ]
+
+    def test_http_dispatch_warns_on_stderr_when_binding_all_interfaces(
+        self, monkeypatch, capsys
+    ):
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+
+        cli.main(["serve", "--http", "--host", "0.0.0.0", "--port", "8765"])
+
+        assert "全インターフェース" in capsys.readouterr().err
+        # 警告があってもサーバ起動自体は妨げない
+        assert fake_server.run_calls == ["streamable-http"]
+
+    def test_http_dispatch_does_not_warn_for_localhost(self, monkeypatch, capsys):
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: object())
+        monkeypatch.setattr(cli, "create_server", lambda service: fake_server)
+
+        cli.main(["serve", "--http", "--host", "127.0.0.1", "--port", "8765"])
+
+        assert capsys.readouterr().err == ""
 
 
 class TestConsultDispatch:
@@ -502,6 +907,26 @@ class TestPersonaDispatch:
 
         captured = capsys.readouterr().out
         assert "エラー" in captured
+
+    def test_display_only_path_does_not_build_service(self, monkeypatch, capsys):
+        """表示のみの分岐(--set/--clear なし)は store だけで完結すべきで、
+        実 FastEmbedEmbedder を構築する _build_service を呼んではいけない
+        (呼ぶとモデル未キャッシュ環境で実ネットワークダウンロードが走り、
+        テストが恒久ハングするバグの再発防止)。
+        """
+        store = Store(":memory:")
+        store.create_notebook("physics", description="物理")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+
+        def _fail_if_called():
+            raise AssertionError("_build_service は表示のみの分岐で呼ばれてはならない")
+
+        monkeypatch.setattr(cli, "_build_service", _fail_if_called)
+
+        cli.main(["persona", "physics"])
+
+        captured = capsys.readouterr().out
+        assert "未設定" in captured
 
 
 class TestRmDocNotebookMismatch:
@@ -1029,7 +1454,37 @@ class TestSetupDispatchErrors:
         assert "エラー" in captured
         assert not config_path.exists()
 
+    def test_config_dir_path_collision_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        """設定ディレクトリの親パスが既にファイルとして存在する場合、書込み失敗を報告する。
+
+        chmod によるディレクトリ書込み禁止は Windows では効果がない（chmod は
+        読み取り専用属性のトグルのみで、ディレクトリへのファイル作成は妨げない）
+        ため、親コンポーネントを「ディレクトリではなくファイル」にする方式で OS
+        非依存に書込み失敗を再現する。setup.write_config_env は書込み前に
+        path.parent.mkdir(parents=True, exist_ok=True) を呼ぶため、親が既存の
+        非ディレクトリだと mkdir 自体が FileExistsError（OSError のサブクラス）を
+        送出する（実測: NotADirectoryError ではない）。POSIX 限定の権限拒否
+        （chmod 0o000）シナリオは test_unwritable_config_dir_reports_japanese_error
+        を参照（Windows では本テストがその代替）。
+        """
+        not_a_dir = tmp_path / "not-a-directory"
+        not_a_dir.write_text("this is a file, not a directory", encoding="utf-8")
+        config_path = not_a_dir / "config.env"
+        monkeypatch.setattr(cli.config, "resolve_config_path", lambda: config_path)
+
+        cli.main(["setup", "--yes"])
+
+        captured = capsys.readouterr().out
+        assert "エラー" in captured
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="chmod 0o000 は Windows のディレクトリ書込み可否に影響しないため無効"
+        "（Windows での同種シナリオは test_config_dir_path_collision_reports_japanese_error"
+        "のパス衝突版が代替する）",
+    )
     def test_unwritable_config_dir_reports_japanese_error(self, monkeypatch, tmp_path, capsys):
+        """書込み権限のないディレクトリ（chmod 0o000）への書込みはエラーを報告する（POSIX 限定）。"""
         readonly_dir = tmp_path / "readonly"
         readonly_dir.mkdir()
         readonly_dir.chmod(0o000)
@@ -1154,3 +1609,25 @@ class TestBuildServiceWiring:
         assert captured_kwargs["digest_map_notes"] == 7
         assert captured_kwargs["digest_map_window_chars"] == 1234
         assert captured_kwargs["digest_backend"] == "gemini"
+
+    def test_wires_max_file_mb_from_config(self, monkeypatch):
+        import shelf.embedder as embedder_module
+
+        captured_kwargs: dict = {}
+
+        class _FakeEmbedder:
+            def __init__(self, model_name: str) -> None:
+                self.model_name = model_name
+
+        class _FakeShelfService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        monkeypatch.setattr(embedder_module, "FastEmbedEmbedder", _FakeEmbedder)
+        monkeypatch.setattr(cli, "_build_store", lambda: Store(":memory:"))
+        monkeypatch.setattr(cli, "ShelfService", _FakeShelfService)
+        monkeypatch.setattr(cli.config, "MAX_FILE_MB", 42)
+
+        cli._build_service()
+
+        assert captured_kwargs["max_file_mb"] == 42

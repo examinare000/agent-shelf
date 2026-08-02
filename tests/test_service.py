@@ -14,6 +14,10 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
+import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +38,36 @@ from shelf.prompts import ANSWER_SCHEMA, SUMMARY_SCHEMA
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
 from tests.fakes import FakeAnswerBackend, FakeEmbedder, FakeLibrarian
+
+
+def _symlink_creation_supported() -> bool:
+    """実行環境で symlink 作成が許可されているかをプローブする。
+
+    Windows は symlink 作成に管理者権限または開発者モードを要求するため、
+    OS 名ではなく実際の作成可否で判定する。これにより権限が付与された
+    Windows CI では通常どおりテストが実行され続け、権限がない環境だけが
+    skip される（「既定は cross-platform 化で skip を避ける」の例外として、
+    symlink 作成そのものを検証するテストには代替手段がないため）。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "target"
+        target.write_text("x")
+        link = Path(d) / "link"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            return False
+        return True
+
+
+requires_symlinks = pytest.mark.skipif(
+    not _symlink_creation_supported(),
+    reason=(
+        "symlink 作成に OS 権限が必要（Windows で管理者権限/開発者モードなしの場合は不可）。"
+        "既知のトレードオフ: GitHub-hosted windows-latest ランナーは既定で開発者モードが"
+        "無効なため、この4テストは通常そこで恒常的に skip される。"
+    ),
+)
 
 
 class _FakeConverter:
@@ -92,6 +126,19 @@ class _SelectivelyFailingConverter:
 
     def convert_url(self, url: str) -> ConvertResult:
         raise NotImplementedError
+
+
+def _write_sparse_file(path: Path, size_bytes: int) -> None:
+    """size_bytes ちょうどの疎（sparse）ファイルを作る。
+
+    サイズ上限テストのために実際に数百MB/数MBのデータを書き込むと低速・ディスク
+    浪費になるため、seek + 末尾1バイト書き込みで論理サイズだけを確保する
+    （実データ内容はテスト対象外）。
+    """
+    with path.open("wb") as f:
+        if size_bytes > 0:
+            f.seek(size_bytes - 1)
+            f.write(b"\0")
 
 
 class _PermissionErrorConverter:
@@ -616,7 +663,13 @@ def test_ask_hybrid_search_clamps_digest_overrepresentation_and_promotes_body(
     result = service.ask("nb_clamp", "clamp_anchor_word")
 
     assert len(result["insights"]) == 2
+    # note_id は study_notes.id 形式へ正規化される（chunk.id はこのフィクスチャの
+    # ように DIGEST_SEQ_BASE(-2) 未満の digest_seq を仮定しない合成値のため、
+    # 変換式 n = DIGEST_SEQ_BASE - digest_seq をそのまま適用した値になる）。
     assert {i["note_id"] for i in result["insights"]} == {
+        "nb_clamp/doc#d-1", "nb_clamp/doc#d0",
+    }
+    assert {i["chunk_id"] for i in result["insights"]} == {
         "nb_clamp/doc#-1", "nb_clamp/doc#-2",
     }
     assert len(result["citations"]) == 4
@@ -972,6 +1025,39 @@ def test_add_source_applies_mask_before_writing_corpus_file(
     assert "<REDACTED>" in written
 
 
+# -- add_source: mask を title 永続化前にも適用（レビュー指摘 must#1: 未 mask のまま
+# documents.title へ保存され、NotebookCard.titles 経由で司書ルーティングプロンプトへ
+# 恒常露出していた） -------------------------------------------------------------
+
+
+def test_add_source_masks_title_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """title は取込資料の生メタデータ（攻撃者制御可能）であり、description/persona と
+    同じく永続化前に mask を通す（設計書 §7-A「backend へ送る全テキストは mask 済み」）。
+    """
+    store.create_notebook("nb", backend="codex")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("placeholder content, unused by fake converter", encoding="utf-8")
+    converter = _FakeConverter(markdown="# Doc\n\nbody\n", title=f"秘密資料 {secret}")
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path,
+        converter=converter, mask=fake_mask,
+    )
+
+    result = service.add_source("nb", str(source_file), auto_summary=False)
+
+    document = store.get_document(result["doc_id"])
+    assert document is not None
+    assert secret not in document["title"]
+    assert "<REDACTED>" in document["title"]
+
+
 # -- add_source: doc_id が notebook 依存になり、別 notebook への同一 origin 投入で
 # documents 行が移動しない（中位指摘#3） -----------------------------------------
 
@@ -1088,6 +1174,7 @@ def test_add_source_dispatches_empty_directory_and_returns_error_dict(
     assert converter.file_calls == []
 
 
+@requires_symlinks
 def test_add_source_rejects_symlink_to_directory_without_dispatching(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -1111,6 +1198,7 @@ def test_add_source_rejects_symlink_to_directory_without_dispatching(
     assert converter.file_calls == []
 
 
+@requires_symlinks
 def test_add_source_rejects_symlink_origin(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -1128,6 +1216,199 @@ def test_add_source_rejects_symlink_origin(
 
     assert "error" in result
     assert converter.file_calls == []
+
+
+def test_add_source_rejects_file_exceeding_max_file_mb(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """SHELF_MAX_FILE_MB を超えるローカルファイルは誤投入・暴走防止のため拒否する
+    （テスト高速化のため max_file_mb=1 を注入。既定300MBの意味は test_config.py 側で
+    別途検証済み）。エラーメッセージはサイズ上限を含み、フルパスは含めない
+    （convert.py の URL サイズ超過エラーと同じ「安全なメッセージ」流儀）。
+    """
+    store.create_notebook("nb", backend="codex")
+    max_bytes = 1 * 1024 * 1024
+    oversized = tmp_path / "huge.txt"
+    _write_sparse_file(oversized, max_bytes + 1)
+    converter = _FakeConverter(markdown="unused")
+    service = ShelfService(
+        store,
+        embedder,
+        lambda name: FakeAnswerBackend(),
+        tmp_path,
+        converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.add_source("nb", str(oversized), auto_summary=False)
+
+    assert "error" in result
+    assert "1MB" in result["error"]
+    assert str(oversized) not in result["error"]
+    assert converter.file_calls == []
+
+
+def test_add_source_accepts_file_exactly_at_max_file_mb_boundary(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """ちょうど上限サイズのファイルは拒否しない（超過のみ拒否、境界値は許可）。"""
+    store.create_notebook("nb", backend="codex")
+    max_bytes = 1 * 1024 * 1024
+    boundary = tmp_path / "boundary.txt"
+    _write_sparse_file(boundary, max_bytes)
+    converter = _FakeConverter(markdown="# Doc\n\n" + "content " * 20)
+    service = ShelfService(
+        store,
+        embedder,
+        lambda name: FakeAnswerBackend(),
+        tmp_path,
+        converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.add_source("nb", str(boundary), auto_summary=False)
+
+    assert "error" not in result
+    assert converter.file_calls == [boundary.resolve()]
+
+
+def test_add_source_returns_safe_error_when_stat_raises_during_size_check(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """走査中のファイル削除・権限変更等のレースで size チェック用の stat() が
+    OSError を送出しても、生の例外を漏らさず安全なエラー辞書を返す（indexer.py の
+    「1ファイルの失敗で全体を止めない」既存原則と同じ防御・コードレビュー指摘対応）。
+
+    is_file() は self.stat() 経由で内部的に stat を呼ぶため、Path.stat 自体を
+    無条件に差し替えると is_file() 側まで巻き込んでしまう。is_file()/is_dir() を
+    os.path 系のプリミティブ（Path.stat を経由しない）へ差し替えることで、
+    「is_file() 判定は成功済みだが、直後の size チェック用 stat() だけがレースで
+    失敗する」という狙った状況だけを再現する。
+    """
+    store.create_notebook("nb", backend="codex")
+    target = tmp_path / "flaky.txt"
+    target.write_text("content", encoding="utf-8")
+    target_str = str(target.resolve())
+
+    real_stat = Path.stat
+
+    def flaky_stat(self: Path, *args, **kwargs):
+        # is_symlink() は lstat()(follow_symlinks=False)経由で内部的に stat() を
+        # 呼ぶため、それは巻き込まず通す。size チェック用の通常 stat()
+        # (follow_symlinks=True、既定)だけを対象にレースを再現する。
+        if str(self) == target_str and kwargs.get("follow_symlinks", True):
+            raise OSError("stat failed (race)")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    # is_file()/is_dir() も内部で self.stat() を呼ぶため、Path.stat を経由しない
+    # os.path 系プリミティブへ差し替えて意図しない巻き込みを避ける。
+    monkeypatch.setattr(Path, "is_file", lambda self: os.path.isfile(str(self)))
+    monkeypatch.setattr(Path, "is_dir", lambda self: os.path.isdir(str(self)))
+
+    converter = _FakeConverter(markdown="unused")
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_source("nb", str(target), auto_summary=False)
+
+    assert result == {"error": "ファイルにアクセスできませんでした"}
+    assert converter.file_calls == []
+
+
+# -- add_source: content_hash 記録 + notebook 横断の内容重複検出（B3） -------------
+# documents.content_hash はスキーマ・upsert_document 双方で対応済みだったが、
+# _ingest_file が渡していなかったため常に NULL だった。同一内容の資料が別パス・
+# 別 notebook から投入されても重複を検出できていなかったギャップを埋める。
+
+
+def test_add_source_persists_content_hash(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("original file content, unused by fake converter", encoding="utf-8")
+    markdown = "# Doc\n\nfresh content about penguins.\n"
+    converter = _FakeConverter(markdown=markdown)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_source("nb", str(source_file), auto_summary=False)
+
+    document = store.get_document(result["doc_id"])
+    assert document is not None
+    assert document["content_hash"] == hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+
+
+def test_add_same_content_to_two_notebooks_reports_duplicate(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """同一内容の資料を別 notebook へ add すると、2件目の応答に先行資料が
+    duplicates として載る。skip はしない（同一書籍を複数の棚に意図的に置く運用は
+    正当であるため・warn + 記録の方針）。
+    """
+    store.create_notebook("nb_a", backend="codex")
+    store.create_notebook("nb_b", backend="codex")
+    markdown = "# Doc\n\nidentical markdown content shared across sources.\n"
+    converter = _FakeConverter(markdown=markdown)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+    source_a = tmp_path / "a.txt"
+    source_a.write_text("a-side original file, unused by fake converter", encoding="utf-8")
+    source_b = tmp_path / "b.txt"
+    source_b.write_text("b-side original file, unused by fake converter", encoding="utf-8")
+
+    result_a = service.add_source("nb_a", str(source_a), auto_summary=False)
+    result_b = service.add_source("nb_b", str(source_b), auto_summary=False)
+
+    assert "duplicates" not in result_a
+    assert result_b["duplicates"] == [{"doc_id": result_a["doc_id"], "notebook": "nb_a"}]
+
+
+def test_add_different_content_no_duplicates_key(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("original file content, unused by fake converter", encoding="utf-8")
+    converter = _FakeConverter(markdown="# Doc\n\nunique content, no duplicates.\n")
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_source("nb", str(source_file), auto_summary=False)
+
+    assert "duplicates" not in result
+
+
+def test_add_directory_attaches_duplicates_to_matching_added_entry(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """add_directory の added エントリ単位でも、add_source と同様に content_hash
+    重複が個別に伝わる（notes の既存パターンと同じ idiom）。
+    """
+    store.create_notebook("nb", backend="codex")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "a.txt").write_text("a-side original content", encoding="utf-8")
+    (root / "b.txt").write_text("b-side original content", encoding="utf-8")
+    converter = _FakeConverter(markdown="# Doc\n\n" + "identical content " * 10)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_directory("nb", str(root), auto_summary=False)
+
+    assert len(result["added"]) == 2
+    # sorted(rglob) により a.txt が先に処理されるため、先行資料を持たない a.txt の
+    # エントリには duplicates キー自体が付かない。
+    assert "duplicates" not in result["added"][0]
+    assert result["added"][1]["duplicates"] == [
+        {"doc_id": result["added"][0]["doc_id"], "notebook": "nb"}
+    ]
 
 
 # -- add_directory: ディレクトリ再帰投入（shelf add にディレクトリを渡した場合） -------
@@ -1213,6 +1494,83 @@ def test_add_directory_skips_unsupported_extension_without_calling_converter(
     assert converter.file_calls == [Path(str((root / "note.md").resolve()))]
 
 
+def test_add_directory_skips_file_exceeding_max_file_mb_and_continues(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """サイズ上限超過ファイルは skipped に理由付きで記録され、他ファイルの処理は
+    継続する（1ファイルの拒否で全体を止めない add_directory の既存流儀）。
+    """
+    store.create_notebook("nb", backend="codex")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    max_bytes = 1 * 1024 * 1024
+    _write_sparse_file(root / "huge.txt", max_bytes + 1)
+    converter = _FakeConverter(markdown="# Doc\n\n" + "converted content " * 10)
+    service = ShelfService(
+        store,
+        embedder,
+        lambda name: FakeAnswerBackend(),
+        tmp_path,
+        converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.add_directory("nb", str(root), auto_summary=False)
+
+    assert len(result["added"]) == 1
+    assert result["added"][0]["origin"] == str((root / "note.md").resolve())
+    assert result["skipped"] == [
+        {"origin": str((root / "huge.txt").resolve()), "reason": "ファイルサイズが上限（1MB）を超えています"}
+    ]
+    assert converter.file_calls == [Path(str((root / "note.md").resolve()))]
+
+
+def test_add_directory_skips_file_when_stat_raises_during_size_check_and_continues(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """走査中のファイル削除・権限変更等のレースで size チェック用の stat() が
+    OSError を送出しても、一括投入全体を止めず skipped に記録して継続する
+    （indexer.py の「1ファイルの失敗で全体を止めない」既存原則と同じ防御・
+    コードレビュー指摘対応）。
+    """
+    store.create_notebook("nb", backend="codex")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    flaky = root / "flaky.txt"
+    flaky.write_text("content", encoding="utf-8")
+    flaky_str = str(flaky.resolve())
+
+    real_stat = Path.stat
+
+    def flaky_stat(self: Path, *args, **kwargs):
+        # is_symlink() は lstat()(follow_symlinks=False)経由で内部的に stat() を
+        # 呼ぶため、それは巻き込まず通す。size チェック用の通常 stat()
+        # (follow_symlinks=True、既定)だけを対象にレースを再現する。
+        if str(self) == flaky_str and kwargs.get("follow_symlinks", True):
+            raise OSError("stat failed (race)")
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    # is_dir() も内部で self.stat() を呼ぶため、Path.stat を経由しない os.path 系
+    # プリミティブへ差し替えて意図しない巻き込みを避ける。
+    monkeypatch.setattr(Path, "is_dir", lambda self: os.path.isdir(str(self)))
+
+    converter = _FakeConverter(markdown="# Doc\n\n" + "converted content " * 10)
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, converter=converter
+    )
+
+    result = service.add_directory("nb", str(root), auto_summary=False)
+
+    assert len(result["added"]) == 1
+    assert result["added"][0]["origin"] == str((root / "note.md").resolve())
+    assert result["skipped"] == [{"origin": flaky_str, "reason": "ファイルを読み取れませんでした"}]
+    assert converter.file_calls == [Path(str((root / "note.md").resolve()))]
+
+
+@requires_symlinks
 def test_add_directory_skips_symlinked_file_and_does_not_follow_symlinked_directory(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -1841,7 +2199,11 @@ def test_ask_returns_insights_built_from_retrieved_digest_chunks(
     assert result["insights"] == [
         {
             "l": 1,
-            "note_id": "nb_digest/doc#-2",
+            # note_id は study_notes.id 形式("{notebook}/{doc_id}#d{n}")に正規化される
+            # (indexer.DIGEST_SEQ_BASE=-2 かつ seq=0 の学びノート → digest chunk id
+            # "nb_digest/doc#-2" から復元)。chunk.id は additive に chunk_id で残す。
+            "note_id": "nb_digest/doc#d0",
+            "chunk_id": "nb_digest/doc#-2",
             "source": "nb_digest/doc.md",
             "text": "whales migrate long distances",
             "section": None,
@@ -1854,6 +2216,83 @@ def test_ask_returns_insights_built_from_retrieved_digest_chunks(
             "section": None, "page": None, "quote": _CHUNK_TEXT,
         }
     ]
+
+
+def test_ask_insight_note_id_for_non_first_digest_seq(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """seq=0 の退化ケースだけでなく、2件目以降の学びノート(digest_seq=-3=DIGEST_SEQ_BASE-1)
+    でも study_notes.id への変換式が正しいことを確認する。"""
+    store.create_notebook("nb_digest", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_digest/doc#-3", "notebook": "nb_digest", "doc_id": "doc",
+                "source_path": "nb_digest/doc.md", "section": None, "page": None,
+                "seq": -3, "text": "second learning note", "embedding": _KNOWN_VEC,
+                "kind": "digest",
+            },
+        ]
+    )
+    local_embedder = FakeEmbedder(dim=8, known={_QUERY_TEXT: _KNOWN_VEC})
+    payload = {
+        "answer": "second note [L1]",
+        "citations": [],
+        "insights": [{"l": 1}],
+        "confident": True,
+    }
+    backend = FakeAnswerBackend(canned=RawAnswer(text=json.dumps(payload), ok=True, error=None))
+    service = ShelfService(store, local_embedder, lambda name: backend, tmp_path)
+
+    result = service.ask("nb_digest", _QUERY_TEXT)
+
+    assert result["insights"][0]["note_id"] == "nb_digest/doc#d1"
+    assert result["insights"][0]["chunk_id"] == "nb_digest/doc#-3"
+
+
+def test_ask_insight_with_malformed_digest_chunk_id_is_skipped_and_logs_warning(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path, caplog
+) -> None:
+    """フェイルソフト方針: _digest_chunk_id_to_note_id が想定外形式の chunk.id
+    （"#" 区切り無し・digest_seq が非数値等）で ValueError を送出しても ask() 全体を
+    落とさず、該当 insight だけをスキップして warning ログに留める。現状の
+    indexer.py の生成規則では到達不能だが、フェイルソフト方針(design doc既定)に
+    合わせる防御。"""
+    store.create_notebook("nb_malformed", backend="codex")
+    store.upsert_chunks(
+        [
+            {
+                "id": "nb_malformed/doc#0", "notebook": "nb_malformed", "doc_id": "doc",
+                "source_path": "nb_malformed/doc.md", "section": None, "page": None,
+                "seq": 0, "text": _CHUNK_TEXT, "embedding": _KNOWN_VEC, "kind": "body",
+            },
+            {
+                # "#" 区切りが無い想定外形式の digest チャンク id。
+                "id": "malformed-digest-id-without-hash", "notebook": "nb_malformed",
+                "doc_id": "doc", "source_path": "nb_malformed/doc.md", "section": None,
+                "page": None, "seq": -2, "text": "malformed digest note",
+                "embedding": _KNOWN_VEC, "kind": "digest",
+            },
+        ]
+    )
+    local_embedder = FakeEmbedder(dim=8, known={_QUERY_TEXT: _KNOWN_VEC})
+    payload = {
+        "answer": "whales eat krill [S1] and migrate [L1]",
+        "citations": [{"s": 1}],
+        "insights": [{"l": 1}],
+        "confident": True,
+    }
+    backend = FakeAnswerBackend(canned=RawAnswer(text=json.dumps(payload), ok=True, error=None))
+    service = ShelfService(store, local_embedder, lambda name: backend, tmp_path)
+
+    with caplog.at_level("WARNING"):
+        result = service.ask("nb_malformed", _QUERY_TEXT)
+
+    assert result["insights"] == []
+    assert result["citations"][0]["chunk_id"] == "nb_malformed/doc#0"
+    assert any(
+        "malformed-digest-id-without-hash" in record.message for record in caplog.records
+    )
 
 
 def test_ask_insight_includes_section_and_page_from_digest_chunk(
@@ -1891,7 +2330,8 @@ def test_ask_insight_includes_section_and_page_from_digest_chunk(
     assert result["insights"] == [
         {
             "l": 1,
-            "note_id": "nb_digest/doc#-2",
+            "note_id": "nb_digest/doc#d0",
+            "chunk_id": "nb_digest/doc#-2",
             "source": "nb_digest/doc.md",
             "text": "whales migrate long distances",
             "section": "§2.3",
@@ -1927,6 +2367,8 @@ def test_consult_returns_answered_false_when_no_notebooks_exist(
 def test_consult_returns_answered_false_when_librarian_finds_no_targets(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
+    """司書が有効な JSON をパースした上で answerable=false と判断した場合
+    （タスク B7-2）。「解析失敗」ではなく「回答不能」である旨を明示する。"""
     _seed_notebook(store, embedder, tmp_path, notebook="nb")
     backend = FakeAnswerBackend(canned=_routing_answer([], answerable=False))
     service = ShelfService(store, embedder, lambda name: backend, tmp_path)
@@ -1937,9 +2379,30 @@ def test_consult_returns_answered_false_when_librarian_finds_no_targets(
         "question": "何か質問",
         "answered": False,
         "routed": [],
-        "warning": "資料からは分からない",
+        "warning": "資料からは分からないと判断しました",
     }
     assert len(backend.calls) == 1  # ルーティングのみ呼ばれ、専門家推論は呼ばれない
+
+
+def test_consult_reports_parse_failure_warning_when_routing_response_is_malformed(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """司書応答が JSON として解釈できず、fallback も空（既定=conservative）の場合
+    （タスク B7-2）。answerable=false（回答不能）と文言を区別し、原因が解析失敗で
+    あることを利用者に伝える。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb")
+    backend = FakeAnswerBackend(canned="これはJSONではない壊れたテキスト")
+    service = ShelfService(store, embedder, lambda name: backend, tmp_path)
+
+    result = service.consult("何か質問")
+
+    assert result == {
+        "question": "何か質問",
+        "answered": False,
+        "routed": [],
+        "warning": "ルーティング応答の解析に失敗しました",
+    }
+    assert len(backend.calls) == 1
 
 
 def test_consult_routes_to_single_expert_and_aggregates_answer(
@@ -2021,6 +2484,149 @@ def test_consult_catalog_includes_notebook_tags_saved_by_digest(
     assert set(catalog[0].tags) == {"量子力学", "スピン"}
 
 
+def _upsert_doc_with_title(
+    store: Store,
+    notebook: str,
+    doc_id: str,
+    title: str | None,
+    added_at: str = "2024-01-01T00:00:00+00:00",
+) -> None:
+    store.upsert_document(
+        id=doc_id, notebook=notebook, origin=f"{doc_id}.md", origin_type="md",
+        normalized_path=f"{notebook}/{doc_id}.md", converter="raw",
+        added_at=added_at, title=title,
+    )
+
+
+def test_consult_catalog_projects_up_to_5_document_titles_in_insertion_order(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """未 digest（tags 空）の notebook でも既存 DB 情報（文書タイトル）だけで
+    カタログを補い、ルーティング精度低下を緩和する（タスク B7-1）。上限 5 件は
+    プロンプト肥大防止のための境界防御で、6 件目以降は投影しない。
+
+    id（=doc_id_for が生成するスラグ+ハッシュ）は投入順とは無関係のアルファベット順
+    になるため（レビュー指摘 must#2）、id の辞書順とは逆順になる added_at を割り当てて
+    「投入順（added_at）で並ぶこと」を実質的に検証する（id 昇順で読むと誤って
+    タイトル6〜タイトル2 が返る＝本テストで検出できる）。
+    """
+    store.create_notebook("nb", backend="codex")
+    for i in range(1, 7):
+        _upsert_doc_with_title(
+            store, "nb", f"doc{7 - i}", f"タイトル{i}",
+            added_at=f"2024-01-0{i}T00:00:00+00:00",
+        )
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("タイトル1", "タイトル2", "タイトル3", "タイトル4", "タイトル5")
+
+
+def test_consult_catalog_truncates_titles_to_60_chars(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """長大なタイトルがプロンプトを肥大させないよう、投影時に60字へ切り詰める
+    （タスク B7-1）。"""
+    store.create_notebook("nb", backend="codex")
+    long_title = "あ" * 100
+    _upsert_doc_with_title(store, "nb", "doc1", long_title)
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("あ" * 60,)
+
+
+def test_consult_catalog_omits_documents_without_title(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    store.create_notebook("nb", backend="codex")
+    _upsert_doc_with_title(store, "nb", "doc1", None)
+    _upsert_doc_with_title(store, "nb", "doc2", "タイトル2")
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert catalog[0].titles == ("タイトル2",)
+
+
+def test_consult_catalog_masks_titles_from_pre_existing_unmasked_rows(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """レビュー指摘 must#1(a): _project_notebook_titles 自体でも self._mask を適用し、
+    本修正以前に永続化された未 mask の既存 DB 行もカバーする（(b) の永続化時 mask は
+    新規行のみの恒久対処であり、既存行には遡及しないため）。"""
+    store.create_notebook("nb", backend="codex")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    _upsert_doc_with_title(store, "nb", "doc1", f"秘密資料 {secret}")
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        librarian=fake_librarian, mask=fake_mask,
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert secret not in catalog[0].titles[0]
+    assert "<REDACTED>" in catalog[0].titles[0]
+
+
+def test_shelve_does_not_query_document_titles(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """レビュー指摘 must#2: shelve() の分類プロンプト（shelving._format_card）は
+    titles を使わないため、shelve() 経路のカタログ構築では titles 投影クエリ自体を
+    発行しない（_build_catalog(include_titles=False)）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    store.create_notebook("physics", backend="codex")
+    _upsert_doc_with_title(store, "physics", "doc1", "物理タイトル")
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+    calls: list[str] = []
+    original = store.list_document_titles
+
+    def spy(notebook: str, limit: int) -> list[str]:
+        calls.append(notebook)
+        return original(notebook, limit)
+
+    store.list_document_titles = spy
+
+    service.shelve(str(root), dry_run=True)
+
+    assert calls == []
+
+
 def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -2040,6 +2646,286 @@ def test_consult_degrades_gracefully_when_expert_backend_call_fails(
     assert routed["answer"] == ""
     assert routed["citations"] == []
     assert routed["insights"] == []
+
+
+def test_consult_degrades_only_the_failing_target_when_multiple_experts_fan_out(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """複数 target への fan-out で 1 件の backend 失敗が他の target を巻き込まない
+    （add_directory の「1件の失敗で全体を止めない」流儀・タスク A4 で維持すべき既存挙動）。
+    呼び出し順ではなく notebook 名で成否を切り替えるフェイクにし、並行実行時の
+    レース（backend.calls の消費順序が不定になる）に依存しない判定にする。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_ok", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_fail", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_ok", score=0.9, subquery=_QUERY_TEXT, reason="OK"),
+        RouteTarget(notebook="nb_fail", score=0.8, subquery=_QUERY_TEXT, reason="FAIL"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+
+    class PerNotebookBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            if workdir.name == "nb_fail":
+                return RawAnswer(text="", ok=False, error="timeout")
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = PerNotebookBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    routed_by_notebook = {r["notebook"]: r for r in result["routed"]}
+    assert routed_by_notebook["nb_ok"]["grounded"] is True
+    assert routed_by_notebook["nb_ok"]["answer"] != ""
+    assert routed_by_notebook["nb_fail"]["grounded"] is False
+    assert routed_by_notebook["nb_fail"]["answer"] == ""
+    assert routed_by_notebook["nb_fail"]["citations"] == []
+
+
+def test_consult_preserves_routing_order_even_when_second_target_finishes_first(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """並行実行しても routed[] はルーティング順（実行完了順ではない）を保つ。
+    nb_a の呼び出しを nb_b の呼び出しが終わるまで足止めし、完了順が逆転しても
+    routed[0] が nb_a（ルーティング1番目）のままであることを固定する。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    nb_b_done = threading.Event()
+    answer_json = _grounded_raw_answer([1]).text
+
+    class ReversedCompletionBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            if workdir.name == "nb_a":
+                # nb_b の完了（下の else 節での set）を待ってから返る。並行実行でなければ
+                # nb_b はまだ呼ばれていないため、この wait はタイムアウトするだけで
+                # 順序は元々崩れない（決定論的・sleep 非依存）。
+                nb_b_done.wait(timeout=0.3)
+            else:
+                nb_b_done.set()
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = ReversedCompletionBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    assert [r["notebook"] for r in result["routed"]] == ["nb_a", "nb_b"]
+
+
+def test_consult_calls_experts_concurrently_for_multiple_targets(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """2 target の専門家呼び出しが並行実行されることを、両方の backend.answer() が
+    「同時に実行中」であることを待ち合わせる threading.Barrier(2) で証明する。
+    逐次実装ではもう一方の呼び出しがまだ backend.answer() に到達していない状態で
+    最初の呼び出しが Barrier に足止めされ、相方が来ないままタイムアウトして
+    BrokenBarrierError が consult() から伝播し Red になる（sleep 非依存・決定論的）。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    barrier = threading.Barrier(2, timeout=1.0)
+    answer_json = _grounded_raw_answer([1]).text
+
+    class BarrierSyncedBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            barrier.wait()  # 両方が同時に到達しない限りタイムアウトして例外化する
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = BarrierSyncedBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    assert [r["notebook"] for r in result["routed"]] == ["nb_a", "nb_b"]
+    assert all(r["grounded"] for r in result["routed"])
+
+
+def test_consult_serializes_embed_query_calls_across_concurrent_targets(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """並行実行される複数 target が共有 embedder.embed_query() を同時に叩かない
+    ことを検証する。embedder は単一の共有インスタンス（実装は onnxruntime
+    InferenceSession + HF tokenizer）で、並行呼び出し安全性を一次情報で確認できて
+    いないため service 側で直列化する（レビュー指摘: 共有 embedder の並行安全性）。
+    検出用ラッパーは embed_query 内の同時実行数を計測し、直列化されていれば
+    max_concurrent は常に 1 のまま。実行中にごく短い sleep を挟むのは Green 側の
+    判定確定性(Lock がある限り2つ目は関数に入ることすらできない)には影響せず、
+    直列化されていない場合に確実に重なりを検出できるよう競合の窓を広げるためだけ
+    に入れている。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+    backend = FakeAnswerBackend(canned=answer_json)
+
+    class ConcurrencyDetectingEmbedder:
+        """FakeEmbedder をラップし、embed_query の同時実行数を計測する検出用ダブル。"""
+
+        def __init__(self, inner: FakeEmbedder) -> None:
+            self._inner = inner
+            self.model_name = inner.model_name
+            self._active_lock = threading.Lock()
+            self._active = 0
+            self.max_concurrent = 0
+
+        def embed_documents(self, texts: list[str]):
+            return self._inner.embed_documents(texts)
+
+        def embed_query(self, text: str):
+            with self._active_lock:
+                self._active += 1
+                self.max_concurrent = max(self.max_concurrent, self._active)
+            time.sleep(0.02)  # 競合の窓を広げるためだけの遅延（同期プリミティブではない）
+            with self._active_lock:
+                self._active -= 1
+            return self._inner.embed_query(text)
+
+    detecting_embedder = ConcurrencyDetectingEmbedder(embedder)
+    service = ShelfService(
+        store, detecting_embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert result["answered"] is True
+    assert detecting_embedder.max_concurrent == 1
+
+
+def test_consult_propagates_raw_exception_from_expert_backend_call(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """1 件の target が backend.answer() で生例外を投げた場合、その例外型が
+    consult() の呼び出し元まで正しく伝播する（レビュー指摘: 生例外パスの挙動）。
+    もう一方の target は正常応答を返す canned にし、実行中の相方が cancel 不能な
+    まま shutdown(wait=True) の完了を待ってから例外が伝播する（_consult_targets の
+    docstring 参照）ことを、例外型・メッセージが失われずに届くことで確認する。"""
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_a", text=_CHUNK_TEXT)
+    _seed_notebook(store, embedder, tmp_path, notebook="nb_b", text=_CHUNK_TEXT)
+    targets = [
+        RouteTarget(notebook="nb_a", score=0.9, subquery=_QUERY_TEXT, reason="A"),
+        RouteTarget(notebook="nb_b", score=0.8, subquery=_QUERY_TEXT, reason="B"),
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+
+    class RaisingBackend:
+        name = "fake"
+
+        def answer(self, prompt: str, workdir: Path, schema: dict | None) -> RawAnswer:
+            if workdir.name == "nb_a":
+                raise ValueError("boom: unexpected backend crash")
+            return RawAnswer(text=answer_json, ok=True, error=None)
+
+    backend = RaisingBackend()
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path, librarian=fake_librarian
+    )
+
+    with pytest.raises(ValueError, match="boom: unexpected backend crash"):
+        service.consult(_QUERY_TEXT)
+
+
+# -- スレッド安全性: _get_librarian/_get_shelver の遅延 check-then-set 対策（タスク A2）---
+
+
+def test_get_librarian_builds_backend_factory_only_once_under_concurrent_access(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """複数ワーカースレッドから同時に consult() する構成（後続タスクで async def +
+    anyio.to_thread 化）で、_get_librarian の遅延 check-then-set が二重構築を
+    起こさないことを検証する。backend_factory 内に意図的な遅延を挟み、
+    「None チェックを通過してから代入するまでの間」に複数スレッドが割り込める
+    レースウィンドウを広げる。"""
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def backend_factory(name: str) -> FakeAnswerBackend:
+        nonlocal call_count
+        time.sleep(0.05)
+        with count_lock:
+            call_count += 1
+        return FakeAnswerBackend()
+
+    service = ShelfService(store, embedder, backend_factory, tmp_path)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            service._get_librarian()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert errors == []
+    assert call_count == 1
+
+
+def test_get_shelver_builds_backend_factory_only_once_under_concurrent_access(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """_get_librarian と同型の遅延構築キャッシュを持つ _get_shelver（shelve()経由）
+    についても、並行呼び出しで backend_factory が1回しか呼ばれないことを検証する。"""
+    call_count = 0
+    count_lock = threading.Lock()
+
+    def backend_factory(name: str) -> FakeAnswerBackend:
+        nonlocal call_count
+        time.sleep(0.05)
+        with count_lock:
+            call_count += 1
+        return FakeAnswerBackend()
+
+    service = ShelfService(store, embedder, backend_factory, tmp_path)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            service._get_shelver()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert errors == []
+    assert call_count == 1
 
 
 def test_shelf_service_digest_constructor_defaults_share_digests_constants():
@@ -3362,6 +4248,7 @@ def test_shelve_skips_origin_already_ingested_in_other_notebook(
     assert len(store.list_documents("physics")) == 1
 
 
+@requires_symlinks
 def test_shelve_scan_rules_skip_hidden_symlink_and_unsupported_files(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -3404,6 +4291,46 @@ def test_shelve_scan_rules_skip_hidden_symlink_and_unsupported_files(
     assert len(result["skipped"]) == 2
 
 
+def test_shelve_skips_file_exceeding_max_file_mb_and_continues(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """shelve は add_directory と同じ _iter_directory_candidates を共有するため、
+    max_file_mb によるサイズ上限超過も skipped に記録され、他ファイルの分類は継続する
+    （コードレビュー指摘: _prepare_shelve_candidates の呼び出しから max_file_mb が
+    将来落ちても検知できるようにする回帰テスト）。dry_run=True で永続副作用なく検証。
+    """
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    max_bytes = 1 * 1024 * 1024
+    _write_sparse_file(root / "huge.txt", max_bytes + 1)
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+        max_file_mb=1,
+    )
+
+    result = service.shelve(str(root), dry_run=True)
+
+    assert result["plan"] == [
+        {
+            "origin": str((root / "note.md").resolve()),
+            "notebook": "quantum-notes",
+            "new_notebook": True,
+            "summary": "量子力学の基礎資料",
+            "reason": "既存に合致なし",
+        }
+    ]
+    assert result["skipped"] == [
+        {"origin": str((root / "huge.txt").resolve()), "reason": "ファイルサイズが上限（1MB）を超えています"}
+    ]
+
+
 def test_shelve_converts_each_file_once_uses_summary_as_description_and_recommends_digest(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -3437,6 +4364,94 @@ def test_shelve_converts_each_file_once_uses_summary_as_description_and_recommen
     assert result["notes"] == [
         "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
     ]
+
+
+def test_shelve_dry_run_surfaces_silent_notebook_name_remap_note(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """LLM が名前提案の指示を無視し、全角のみの notebook 名を提案した場合
+    （タスク B7-3）。既定名へサイレントにリマップされたことを dry-run の
+    計画結果にも可視化する。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned='{"action": "new", "notebook": "量子力学", "description": "d", "reason": "r"}'
+    )
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+
+    result = service.shelve(str(root), dry_run=True)
+
+    assert len(result["notes"]) == 1
+    assert "notebook" in result["notes"][0]
+
+
+def test_shelve_apply_surfaces_silent_notebook_name_remap_note_before_digest_recommendation(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned='{"action": "new", "notebook": "量子力学", "description": "d", "reason": "r"}'
+    )
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter,
+    )
+
+    result = service.shelve(str(root), dry_run=False)
+
+    assert len(result["notes"]) == 2
+    assert "notebook" in result["notes"][0]
+    assert result["notes"][1] == (
+        "学びノートは自動生成されません。`shelf digest <notebook>` の実行を検討してください。"
+    )
+
+
+def test_shelve_apply_masks_title_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """shelve() 経路（_prepare_shelve_candidates→_persist_converted）でも title は
+    mask を通す（レビュー指摘 must#1・add_source と同じ不変条件）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(
+        markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n",
+        title=f"秘密資料 {secret}",
+    )
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    result = service.shelve(str(root), dry_run=False)
+
+    document = store.get_document(result["added"][0]["doc_id"])
+    assert document is not None
+    assert secret not in document["title"]
+    assert "<REDACTED>" in document["title"]
 
 
 def test_consult_reports_router_error_when_librarian_backend_fails(store, embedder, tmp_path):

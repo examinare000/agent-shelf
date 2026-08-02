@@ -5,7 +5,9 @@
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+import threading
 
 import numpy as np
 import pytest
@@ -257,6 +259,76 @@ class TestDocumentCRUD:
         docs = store.list_documents("physics")
 
         assert [d["id"] for d in docs] == ["doc1"]
+
+    def test_list_document_titles_orders_by_added_at_not_id(self, store):
+        """id (=doc_id_for のスラグ+ハッシュ) はアルファベット順であり投入順とは
+        無関係。added_at（投入時刻）順で返すことを、id の辞書順と added_at の投入順が
+        逆転するデータで検証する（レビュー指摘 must#2: レビュアーが実データで
+        id 昇順=投入順という誤前提の逆転を再現した）。"""
+        _make_notebook(store, name="physics")
+        _make_document(
+            store, id_="zebra-doc", notebook="physics", origin="a.pdf",
+            normalized_path="corpus/physics/zebra-doc.md",
+            added_at="2026-01-01T00:00:00Z", title="最初に投入",
+        )
+        _make_document(
+            store, id_="apple-doc", notebook="physics", origin="b.pdf",
+            normalized_path="corpus/physics/apple-doc.md",
+            added_at="2026-01-02T00:00:00Z", title="次に投入",
+        )
+
+        titles = store.list_document_titles("physics", limit=5)
+
+        assert titles == ["最初に投入", "次に投入"]
+
+    def test_list_document_titles_excludes_null_titles(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf",
+            normalized_path="corpus/physics/doc1.md", title=None,
+        )
+        _make_document(
+            store, id_="doc2", notebook="physics", origin="b.pdf",
+            normalized_path="corpus/physics/doc2.md", title="タイトルあり",
+        )
+
+        titles = store.list_document_titles("physics", limit=5)
+
+        assert titles == ["タイトルあり"]
+
+    def test_list_document_titles_respects_limit(self, store):
+        _make_notebook(store, name="physics")
+        for i in range(3):
+            _make_document(
+                store, id_=f"doc{i}", notebook="physics", origin=f"{i}.pdf",
+                normalized_path=f"corpus/physics/doc{i}.md",
+                added_at=f"2026-01-0{i + 1}T00:00:00Z", title=f"タイトル{i}",
+            )
+
+        titles = store.list_document_titles("physics", limit=2)
+
+        assert titles == ["タイトル0", "タイトル1"]
+
+    def test_list_document_titles_filters_by_notebook(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf",
+            normalized_path="corpus/physics/doc1.md", title="物理タイトル",
+        )
+        _make_document(
+            store, id_="doc2", notebook="math", origin="b.pdf",
+            normalized_path="corpus/math/doc2.md", title="数学タイトル",
+        )
+
+        titles = store.list_document_titles("physics", limit=5)
+
+        assert titles == ["物理タイトル"]
+
+    def test_list_document_titles_returns_empty_list_when_no_documents(self, store):
+        _make_notebook(store, name="physics")
+
+        assert store.list_document_titles("physics", limit=5) == []
 
     def test_delete_document_removes_its_chunks(self, store):
         _make_notebook(store, name="physics")
@@ -914,6 +986,59 @@ class TestFindDocumentsByOrigin:
         }
 
 
+class TestFindDocumentsByContentHash:
+    """B3: 同一内容の資料が別パス・別 notebook から投入されるケースの重複検出。
+    find_documents_by_origin と同じ設計（notebook を跨いで全表検索）だが、
+    キーが origin ではなく content_hash である点が異なる。
+    """
+
+    def test_returns_hits_across_notebooks_for_matching_hash(self, store):
+        _make_notebook(store, name="physics")
+        _make_notebook(store, name="math")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf",
+            content_hash="abc123",
+        )
+        _make_document(
+            store, id_="doc2", notebook="math", origin="b.pdf",
+            content_hash="abc123",
+        )
+
+        hits = store.find_documents_by_content_hash("abc123")
+
+        assert {(h["id"], h["notebook"]) for h in hits} == {
+            ("doc1", "physics"), ("doc2", "math"),
+        }
+
+    def test_returns_empty_list_when_hash_not_found(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics", content_hash="abc123")
+
+        assert store.find_documents_by_content_hash("not-a-hash") == []
+
+    def test_excludes_given_doc_id(self, store):
+        _make_notebook(store, name="physics")
+        _make_document(
+            store, id_="doc1", notebook="physics", origin="a.pdf", content_hash="abc123",
+        )
+        _make_document(
+            store, id_="doc2", notebook="physics", origin="b.pdf", content_hash="abc123",
+        )
+
+        hits = store.find_documents_by_content_hash("abc123", exclude_doc_id="doc1")
+
+        assert [h["id"] for h in hits] == ["doc2"]
+
+    def test_null_content_hash_rows_are_never_matched(self, store):
+        # content_hash が未計算(NULL)の行は、どんなハッシュ値の問い合わせでもヒット
+        # しない（SQL の NULL 比較セマンティクス通り、= 演算子は NULL に対して常に
+        # 偽になるため、明示フィルタなしで自然に除外できる）。
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics", origin="a.pdf", content_hash=None)
+
+        assert store.find_documents_by_content_hash("abc123") == []
+
+
 class TestMeta:
     def test_get_meta_returns_none_when_absent(self, store):
         assert store.get_meta("model") is None
@@ -1448,13 +1573,18 @@ class TestKeywordTopK:
 
         assert store.keyword_topk("physics", "quantum", limit=10) == []
 
-    def test_keyword_topk_degrades_and_disables_fts_on_broken_read_state(
+    def test_keyword_topk_disables_fts_then_retries_once_and_stays_quiet_after(
         self, store, monkeypatch, caplog
     ):
-        """コードレビュー指摘#1: 読み取り(MATCH SELECT)自体が壊れている(read-only DB・
-        fts5 モジュール消失等)場合も keyword_topk の docstring 契約どおり例外にせず
-        [] に劣化させ、以後の呼び出しでは fts_enabled を落として静かにスキップし
-        続けることを検証する(壊れたクエリを毎回再実行して警告ログを連発しない)。
+        """コードレビュー指摘#1の回帰に加え、FTS ラッチ回復(1回だけの自己修復
+        リトライ)を検証する。読み取り(MATCH SELECT)自体が壊れている(read-only DB・
+        fts5 モジュール消失等)場合、初回は keyword_topk の docstring 契約どおり
+        例外にせず [] に劣化させ fts_enabled を落とす。次回のキーワード検索では
+        _init_fts を1回だけ再試行する(別プロセスによる chunks_fts の DROP 等、
+        一過性の要因からの自己修復機会)。再試行も失敗すれば、以後は無限リトライ
+        せず静かにスキップし続ける(壊れたクエリを毎回再実行して警告ログを
+        連発しない)。回復に成功するケースは
+        test_keyword_topk_recovers_when_retry_succeeds で別途検証する。
         """
         _make_notebook(store, name="physics")
         _make_document(store, id_="doc1", notebook="physics")
@@ -1465,9 +1595,21 @@ class TestKeywordTopK:
             assert store.keyword_topk("physics", "quantum", limit=10) == []
 
         assert store.fts_enabled is False
-        assert len(caplog.records) == 1  # 警告は初回失敗時に1回だけ
+        assert len(caplog.records) == 1  # 初回失敗の警告
 
-        # フラグが立った後、壊れた接続へ再クエリしないことを保証する。
+        # 次回検索での1回きりの再試行も失敗する状況を作る(retry 自体の失敗を模す)。
+        def failing_probe(self):
+            raise sqlite3.OperationalError("simulated: retry probe also fails")
+
+        monkeypatch.setattr(Store, "_probe_fts", failing_probe)
+
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+
+        assert store.fts_enabled is False
+        assert len(caplog.records) == 2  # 再試行1回分の警告が追加される
+
+        # 再試行を使い切った後、壊れた接続へ再クエリしないことを保証する。
         # sqlite3.Connection は C 拡張型でメソッドの直接差し替えができないため、
         # Store._conn 自体を MagicMock に差し替えて execute 未呼び出しを検証する。
         from unittest.mock import MagicMock
@@ -1478,7 +1620,155 @@ class TestKeywordTopK:
         with caplog.at_level("WARNING"):
             assert store.keyword_topk("physics", "quantum", limit=10) == []
         fake_conn.execute.assert_not_called()
-        assert len(caplog.records) == 1  # 2回目の呼び出しで警告が増えない(黙ってスキップ)
+        assert len(caplog.records) == 2  # 3回目の呼び出しで警告が増えない(黙ってスキップ)
+
+    def test_keyword_topk_recovers_when_retry_succeeds(self, store):
+        """FTS ラッチ回復: 別プロセスが chunks_fts を DROP した一過性の障害から、
+        次回のキーワード検索が1回だけ _init_fts を再試行して自己修復できることを
+        検証する(プロセス再起動なしでハイブリッド検索が復活する)。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store._conn.execute("DROP TABLE chunks_fts")  # 別プロセスが DROP した状況を模す
+
+        assert store.keyword_topk("physics", "quantum", limit=10) == []  # 初回は失敗して劣化
+        assert store.fts_enabled is False
+
+        hits = store.keyword_topk("physics", "quantum", limit=10)  # 次回検索で1回だけ再試行
+
+        assert store.fts_enabled is True
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#0"]
+
+    def test_retry_backfill_failure_does_not_rearm(self, store, monkeypatch, caplog):
+        """コードレビュー指摘(must-2a-i): リトライ自身の CREATE+probe は成功して
+        一瞬 fts_enabled=True になるが、その直後のバックフィル(_rebuild_fts)が
+        失敗するケース。_fts_disable_after_failure がこの時点の fts_enabled=True
+        を「直前まで健全だった」と誤認して再アームすると、障害が持続的な場合に
+        毎クエリ無限リトライになってしまう(不変条件違反)。リトライ実行中に
+        発生した失敗からは再アームされないことを検証する。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store._conn.execute("DROP TABLE chunks_fts")  # 読み取りが壊れた状態を人工的に作る
+
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []  # 初回失敗、リトライ予算がアーム
+        assert store.fts_enabled is False
+        assert len(caplog.records) == 1
+
+        def failing_rebuild(self):
+            raise sqlite3.OperationalError("simulated: retry backfill fails")
+
+        monkeypatch.setattr(Store, "_rebuild_fts", failing_rebuild)
+
+        with caplog.at_level("WARNING"):
+            # リトライ本体: CREATE+probe は成功(fts_enabled が一瞬 True になる)が
+            # backfill が失敗し、最終的に fts_enabled=False へ戻る。
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert store.fts_enabled is False
+        assert len(caplog.records) == 2  # リトライの失敗分の警告が1件追加される
+
+        # 再アームされていないため、以後の呼び出しでは接続へ再クエリしない。
+        from unittest.mock import MagicMock
+
+        fake_conn = MagicMock()
+        monkeypatch.setattr(store, "_conn", fake_conn)
+        with caplog.at_level("WARNING"):
+            assert store.keyword_topk("physics", "quantum", limit=10) == []
+        fake_conn.execute.assert_not_called()
+        assert len(caplog.records) == 2
+
+    def test_retry_success_followed_by_immediate_query_failure_does_not_rearm(
+        self, store, monkeypatch
+    ):
+        """コードレビュー指摘(must-2a-ii): リトライ自身(chunks_fts の再作成・
+        backfill)は成功するが、同じ keyword_topk 呼び出し内で直後に実行される
+        実クエリ(MATCH)がユーザー由来の不正な構文で失敗するケース。この失敗を
+        「直前まで健全だった」と誤認して再アームしないことを検証する。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+        store._conn.execute("DROP TABLE chunks_fts")
+        assert store.keyword_topk("physics", "quantum", limit=10) == []  # 初回失敗、リトライ予算がアーム
+        assert store.fts_enabled is False
+
+        # 次回呼び出し: リトライ自体(chunks_fts 再作成+backfill)は成功するが、
+        # 渡されたクエリが不正な MATCH 構文のため直後の実クエリが失敗する。
+        assert store.keyword_topk("physics", '"unterminated', limit=10) == []
+
+        # リトライが成功していた証拠として chunks_fts テーブル自体は再作成されている。
+        recreated = store._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+        ).fetchone()
+        assert recreated is not None
+        assert store.fts_enabled is False  # 直後の実クエリ失敗で再度無効化される
+
+        # 再アームされていないため、以後の呼び出しでは接続へ再クエリしない。
+        from unittest.mock import MagicMock
+
+        fake_conn = MagicMock()
+        monkeypatch.setattr(store, "_conn", fake_conn)
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        fake_conn.execute.assert_not_called()
+
+    class _OneShotMatchFailureProxy:
+        """最初に MATCH を含む SQL が実行された時だけ sqlite3.OperationalError を
+        送出し、以後は実接続へそのまま委譲するプロキシ。chunks_fts を DROP せずに
+        一過性の読み取り失敗だけを模すために使う(sqlite3.Connection は C拡張型で
+        メソッドの直接差し替えができないため、既存の _CountingConnProxy と同様の
+        流儀で Store._conn 自体を差し替える)。
+        """
+
+        def __init__(self, real_conn):
+            self._real = real_conn
+            self._triggered = False
+
+        def execute(self, sql, *args, **kwargs):
+            if not self._triggered and "MATCH" in sql:
+                self._triggered = True
+                raise sqlite3.OperationalError("simulated: transient MATCH read failure")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def test_recovers_via_forced_rebuild_and_finds_rows_written_while_disabled(
+        self, store, monkeypatch
+    ):
+        """コードレビュー指摘(must-2b): chunks_fts の DROP を伴わない一過性失敗
+        (MATCH 自体の読み取り失敗等)では、修正前は already_existed=True と
+        誤判定されリトライ時に backfill がスキップされていた。そのため
+        fts_enabled=False の間に upsert された行が chunks_fts に同期されず、
+        復旧後も永久に検索から漏れていた(サイレント劣化)。リトライ時は
+        already_existed に関わらず強制的に DROP+全件 rebuild することで、
+        劣化中に書き込まれた行も復旧後にヒットすることを検証する。
+        """
+        _make_notebook(store, name="physics")
+        _make_document(store, id_="doc1", notebook="physics")
+        store.upsert_chunks([_chunk_row(id_="doc1#0", text="quantum entanglement")])
+
+        proxy = self._OneShotMatchFailureProxy(store._conn)
+        monkeypatch.setattr(store, "_conn", proxy)
+
+        # 1回目: chunks_fts は DROP されず残存したまま、MATCH の読み取りだけが
+        # 一過性障害で失敗する。
+        assert store.keyword_topk("physics", "quantum", limit=10) == []
+        assert store.fts_enabled is False
+
+        # 劣化中に新しいチャンクを upsert する。_fts_capture_rows/_fts_insert_rows
+        # は fts_enabled=False のため早期リターンし、chunks_fts への同期をスキップ
+        # する(=このチャンクは chunks_fts に存在しないまま)。
+        store.upsert_chunks([_chunk_row(id_="doc1#1", seq=1, text="written while degraded")])
+
+        # 2回目: 次回検索で1回だけリトライ。already_existed の値に関わらず強制的に
+        # DROP+全件 rebuild するため、劣化中に書かれた行も backfill される。
+        hits = store.keyword_topk("physics", "written", limit=10)
+
+        assert store.fts_enabled is True
+        assert [chunk_id for chunk_id, _score in hits] == ["doc1#1"]
 
     def test_keyword_topk_hits_japanese_natural_sentence_via_build_fts_query(self, store):
         # コードレビュー指摘#1の再現/回帰テスト: build_fts_query が空白分割のままだと
@@ -2065,15 +2355,93 @@ class TestPathNormalization:
         finally:
             store3.close()
 
-    def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(self, tmp_path):
-        """POSIX 環境ではバックスラッシュが正当なファイル名として保留される"""
+    def test_migrate_normalize_write_failure_on_readonly_db_is_fail_soft(self, tmp_path):
+        """実バグの回帰テスト（実測: Windows CI で
+        sqlite3.OperationalError: attempt to write a readonly database が
+        Store.__init__ から漏れてクラッシュ）。_enable_wal は既に fail-soft だが、
+        Windows ホストでのみ実行される _migrate_normalize_path_separators は
+        無条件に UPDATE を発行しており、読み取り専用 DB を開くと同じ失敗モードで
+        __init__ がクラッシュしていた。POSIX ホストでは _force_windows=True で
+        Windows 分岐を明示的に有効化し、chmod で書込み不能な状態を作ることで、
+        ホストに依らず再現・検証する。
+        """
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        os.chmod(db_path, 0o444)
+        try:
+            store2 = Store(db_path)  # os.name != "nt" のため修正前でもここは通る
+            try:
+                store2._migrate_normalize_path_separators(
+                    _force_windows=True
+                )  # 修正前はここで例外が伝播していた
+                chunk = store2.get_chunk("doc1#0")
+                # 書込めないため正規化されず、旧 `\` のまま残る（フェイルソフト）
+                assert chunk["source_path"] == "physics\\a.md"
+            finally:
+                store2.close()
+        finally:
+            os.chmod(db_path, 0o644)  # tmp_path の後片付けに支障が出ないよう戻す
+
+    def test_migrate_normalize_write_failure_on_lock_contention_is_fail_soft(
+        self, tmp_path, monkeypatch
+    ):
+        """実バグの回帰テスト（実測: Windows CI で sqlite3.OperationalError:
+        database is locked が Store.__init__ から漏れてクラッシュ）。別接続
+        （別プロセスを模す）が BEGIN IMMEDIATE で書き込みロックを保持している間に
+        _migrate_normalize_path_separators を実行すると、上記と同じ未捕捉の
+        UPDATE が "database is locked" で失敗しクラッシュしていた。
+        """
+        monkeypatch.setattr(Store, "_BUSY_TIMEOUT_MS", 50)  # busy_timeout の待ちでテストが遅くならないようにする
+        db_path = tmp_path / "legacy.db"
+        store1 = Store(db_path)
+        self._insert_legacy_chunk(store1, source_path="physics\\a.md")
+        store1.close()
+
+        blocker = sqlite3.connect(str(db_path))
+        blocker.execute("BEGIN IMMEDIATE")
+        blocker.execute("INSERT INTO meta (key, value) VALUES ('probe', '1')")
+        try:
+            store2 = Store(db_path)
+            try:
+                store2._migrate_normalize_path_separators(
+                    _force_windows=True
+                )  # 修正前はここで例外が伝播していた
+                chunk = store2.get_chunk("doc1#0")
+                # ロック競合で書込めず正規化されない（フェイルソフト）
+                assert chunk["source_path"] == "physics\\a.md"
+            finally:
+                store2.close()
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="monkeypatch.setattr(os, 'name', 'posix') は pathlib のクラス選択"
+        "（posixpath/ntpath どちらの実装で Path() を構築するか）にも波及するため、"
+        "Windows ホストではこの偽装自体が Store.__init__ 内の Path(db_path) 生成で"
+        "NotImplementedError: cannot instantiate 'PosixPath' となり検証が破綻する"
+        "（実測: Windows CI）。os.name の偽装は pathlib を壊すため使えず、この分岐"
+        "（POSIX でのみバックスラッシュ保護）は POSIX ホストでのみ検証できる",
+    )
+    def test_init_skips_normalization_on_posix_preserving_backslash_in_filenames(
+        self, tmp_path
+    ):
+        """POSIX 環境ではバックスラッシュが正当なファイル名として保留される
+
+        Store.__init__ は os.name の実値で分岐を決める。POSIX ホストでは
+        os.name が元々 "posix" のため monkeypatch による偽装は不要（かつ
+        Windows ホストでは pathlib を壊すため使えない。上記 skipif 参照）。
+        """
         db_path = tmp_path / "posix.db"
         store1 = Store(db_path)
         # POSIX では `\` はファイル名として合法的
         self._insert_legacy_chunk(store1, source_path="physics\\a.md")
         store1.close()
 
-        # POSIX 環境（os.name != "nt"）では正規化されないことを確認
         store2 = Store(db_path)
         try:
             chunk = store2.get_chunk("doc1#0")
@@ -2091,5 +2459,249 @@ class TestBusyTimeout:
         row = store._conn.execute("PRAGMA busy_timeout").fetchone()
         assert row[0] == Store._BUSY_TIMEOUT_MS
         assert row[0] != 0
+
+
+class TestJournalModeWAL:
+    """WAL 化: 長命 MCP サーバ(shelf serve)と別プロセス CLI(shelf index/digest)が
+    同一 DB ファイルに同時アクセスする構成では、rollback-journal だと CLI の
+    書き込みがサーバの読み取りをブロックする(WAL は reader/writer が互いを
+    ブロックしない)。
+    """
+
+    def test_store_enables_wal_on_file_db(self, tmp_path):
+        db_path = tmp_path / "shelf.db"
+        store = Store(str(db_path))
+        try:
+            row = store._conn.execute("PRAGMA journal_mode").fetchone()
+            assert row[0] == "wal"
+        finally:
+            store.close()
+
+    def test_store_sets_synchronous_normal_on_file_db(self, tmp_path):
+        # WAL では NORMAL でも(FULL ほど厳密でなくとも)整合性が保たれる一方、
+        # fsync 頻度を減らせる。SQLite の内部表現で NORMAL は 1。
+        db_path = tmp_path / "shelf.db"
+        store = Store(str(db_path))
+        try:
+            row = store._conn.execute("PRAGMA synchronous").fetchone()
+            assert row[0] == 1
+        finally:
+            store.close()
+
+    def test_memory_db_skips_wal_and_stays_functional(self, store):
+        # store フィクスチャは ":memory:" で構築済み。WAL は共有メモリを要求する
+        # ため :memory: では機能せず journal_mode は "memory" のままで正常動作する。
+        row = store._conn.execute("PRAGMA journal_mode").fetchone()
+        assert row[0] == "memory"
+        store.create_notebook("physics", description="物理の論文", backend="codex")
+        assert store.get_notebook("physics")["name"] == "physics"
+
+    def test_wal_failure_is_fail_soft_and_logs_warning(self, tmp_path, monkeypatch, caplog):
+        # 読み取り専用ファイルシステムやネットワーク共有等、journal_mode=WAL の
+        # 要求が無視される環境(戻り値が "wal" 以外)を模す。既存の FTS 劣化と
+        # 同じ流儀で、例外にせず warning ログに留めて構築が成功することを検証する。
+        db_path = tmp_path / "shelf.db"
+        original = Store._read_pragma_value
+
+        def fake_read_pragma_value(self, sql):
+            if sql == "PRAGMA journal_mode=WAL":
+                return "delete"
+            return original(self, sql)
+
+        monkeypatch.setattr(Store, "_read_pragma_value", fake_read_pragma_value)
+
+        with caplog.at_level("WARNING"):
+            store = Store(str(db_path))
+        try:
+            assert len(caplog.records) == 1
+        finally:
+            store.close()
+
+    def test_reopening_existing_db_upgrades_to_wal(self, tmp_path):
+        # journal_mode は DB ファイルに永続する属性なので、旧コードで delete
+        # モードのまま作られた既存 DB も新コードで開くだけで自動的に WAL 化
+        # される(migration スクリプト不要)。
+        db_path = tmp_path / "shelf.db"
+        store1 = Store(str(db_path))
+        store1._conn.execute("PRAGMA journal_mode=DELETE")
+        store1.close()
+
+        store2 = Store(str(db_path))
+        try:
+            row = store2._conn.execute("PRAGMA journal_mode").fetchone()
+            assert row[0] == "wal"
+        finally:
+            store2.close()
+
+    def test_readonly_db_file_does_not_crash_init(self, tmp_path):
+        """コードレビュー指摘(must-1a): 読み取り専用ファイル(chmod)を開くと、
+        journal_mode を delete から wal へ書き換えようとする PRAGMA が実際に
+        sqlite3.OperationalError("attempt to write a readonly database")を送出する。
+        この修正前は __init__ にこの例外がそのまま伝播しクラッシュしていた(退行)。
+        既存の test_wal_failure_is_fail_soft_and_logs_warning は「例外を投げず
+        別文字列を返す」monkeypatch のみで、try/except の実在は裏付けていなかった。
+        """
+        db_path = tmp_path / "shelf.db"
+        store0 = Store(str(db_path))
+        store0._conn.execute("PRAGMA journal_mode=DELETE")  # WAL 化前の状態を人工的に作る
+        store0.close()
+
+        os.chmod(db_path, 0o444)
+        try:
+            store1 = Store(str(db_path))  # 修正前はここで例外が伝播していた
+            try:
+                row = store1._conn.execute("PRAGMA journal_mode").fetchone()
+                # 書き込めないため wal へ昇格できず、rollback-journal のまま
+                assert row[0] == "delete"
+            finally:
+                store1.close()
+        finally:
+            os.chmod(db_path, 0o644)  # tmp_path の後片付けに支障が出ないよう戻す
+
+    def test_wal_upgrade_lock_contention_does_not_crash_init(self, tmp_path, monkeypatch):
+        """コードレビュー指摘(must-1b): 別接続(別プロセスを模す)が BEGIN IMMEDIATE
+        で書き込みロックを保持している間に Store を開くと、journal_mode=WAL への
+        昇格が "database is locked" で失敗しうる。この修正前は _enable_wal が
+        busy_timeout の設定より前に呼ばれていたため busy_timeout の恩恵を受けられず、
+        かつ例外を捕捉していなかったため __init__ がクラッシュしていた(退行)。
+        busy_timeout を _enable_wal より前に設定した上で例外を捕捉し、
+        rollback-journal のまま fail-soft することを検証する。
+        """
+        monkeypatch.setattr(Store, "_BUSY_TIMEOUT_MS", 50)  # busy_timeout の待ちでテストが遅くならないようにする
+        db_path = tmp_path / "shelf.db"
+        store0 = Store(str(db_path))  # スキーマ作成
+        store0._conn.execute("PRAGMA journal_mode=DELETE")  # WAL 化前の状態を人工的に作る
+        store0.close()
+
+        blocker = sqlite3.connect(str(db_path))
+        blocker.execute("BEGIN IMMEDIATE")
+        # BEGIN IMMEDIATE 単独では RESERVED ロックが実際の書き込みまで確定しない
+        # ことがあるため、実データを書いて別プロセスが書き込みロックを保持して
+        # いる状況を確実に再現する(コミットは finally で rollback するまで
+        # 保留し続ける)。
+        blocker.execute("INSERT INTO meta (key, value) VALUES ('probe', '1')")
+        try:
+            store = Store(str(db_path))  # 修正前はここで例外が伝播していた
+            try:
+                row = store._conn.execute("PRAGMA journal_mode").fetchone()
+                # ロック競合で昇格に失敗しても rollback-journal のまま動作継続する
+                assert row[0] == "delete"
+            finally:
+                store.close()
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+
+class TestThreadSafety:
+    """後続タスクで MCP ツールを async def + anyio.to_thread 化する際、複数
+    ワーカースレッドが同一 Store を叩く。単一 sqlite3 接続 + check_same_thread=False +
+    RLock でメソッド全体を保護する設計（タスク A2）の検証。"""
+
+    def test_store_usable_from_other_thread(self, store):
+        """check_same_thread=True のままだと別スレッドからの呼び出しは
+        sqlite3.ProgrammingError になる。まずこれが起きないことを確認する。"""
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                store.list_notebooks()
+            except BaseException as exc:  # noqa: BLE001 - 何が起きても記録して検証する
+                errors.append(exc)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert errors == []
+
+    def test_concurrent_upsert_chunks_and_load_vectors_stay_consistent(self, store):
+        """一方のスレッドが upsert_chunks を連打し、もう一方が load_vectors を
+        連打しても例外なく完走し、最終状態（件数・次元）が整合すること。"""
+        _make_notebook(store, name="physics")
+        n = 20
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            for i in range(n):
+                try:
+                    store.upsert_chunks([_chunk_row(id_=f"doc1#{i}", seq=i)])
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+        def reader() -> None:
+            for _ in range(n):
+                try:
+                    store.load_vectors("physics")
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+
+        t_writer = threading.Thread(target=writer)
+        t_reader = threading.Thread(target=reader)
+        t_writer.start()
+        t_reader.start()
+        t_writer.join(timeout=10)
+        t_reader.join(timeout=10)
+
+        assert errors == []
+        ids, matrix = store.load_vectors("physics")
+        assert len(ids) == n
+        assert matrix.shape == (n, 4)
+
+    def test_mutator_holds_lock_for_entire_method_not_only_final_commit(
+        self, store, monkeypatch
+    ):
+        """upsert_document は INSERT → _bump_generation（内部 commit を含む）→
+        最終 commit という複数ステップの mutator。ロック粒度がメソッド全体でなければ、
+        _bump_generation の途中で別スレッドの get_notebook 呼び出しが割り込める。
+        _bump_generation を意図的に遅くし、その間 get_notebook が完了しない
+        （ロック待ちでブロックされる）ことを確認する。"""
+        _make_notebook(store, name="physics")
+        entered_bump = threading.Event()
+        release_bump = threading.Event()
+        original_bump = store._bump_generation
+
+        def slow_bump() -> None:
+            entered_bump.set()
+            release_bump.wait(timeout=5)
+            original_bump()
+
+        monkeypatch.setattr(store, "_bump_generation", slow_bump)
+
+        def writer() -> None:
+            store.upsert_document(
+                id="doc1",
+                notebook="physics",
+                origin="a.pdf",
+                origin_type="pdf",
+                normalized_path="corpus/physics/a.md",
+                converter="pymupdf4llm",
+                added_at="2026-01-01T00:00:00Z",
+            )
+
+        t_writer = threading.Thread(target=writer)
+        t_writer.start()
+        assert entered_bump.wait(timeout=5), "writer が _bump_generation に到達しなかった"
+
+        reader_done = threading.Event()
+
+        def reader() -> None:
+            store.get_notebook("physics")  # writer と別の公開メソッド
+            reader_done.set()
+
+        t_reader = threading.Thread(target=reader)
+        t_reader.start()
+
+        # writer がロックを保持中なら、reader は release_bump まで完了しないはず。
+        assert not reader_done.wait(timeout=0.2), (
+            "reader が writer の完了前に終了した = ロックがメソッド全体を"
+            "保護できていない"
+        )
+
+        release_bump.set()
+        t_writer.join(timeout=5)
+        t_reader.join(timeout=5)
+        assert reader_done.is_set()
 
 

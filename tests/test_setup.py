@@ -201,6 +201,69 @@ class TestDetectOllama:
         assert setup.detect_ollama("http://127.0.0.1:11434") is False
 
 
+class TestPromptInt:
+    """数値専用プロンプトヘルパー。非数値・範囲外入力で生の ValueError を利用者に
+    露出させず（cli.py:440-442 の「例外を握りつぶさずメッセージ化する」流儀）、
+    日本語メッセージを表示して再プロンプトする。
+    """
+
+    def test_valid_numeric_input_is_returned_as_int(self):
+        scripted = iter(["7"])
+        value = setup._prompt_int(
+            input_func=lambda _prompt: next(scripted),
+            print_func=lambda *a, **k: None,
+            prompt="学びノート数",
+            default=20,
+        )
+        assert value == 7
+
+    def test_empty_input_falls_back_to_default(self):
+        scripted = iter([""])
+        value = setup._prompt_int(
+            input_func=lambda _prompt: next(scripted),
+            print_func=lambda *a, **k: None,
+            prompt="学びノート数",
+            default=20,
+        )
+        assert value == 20
+
+    def test_non_numeric_input_reprompts_with_japanese_message_until_valid(self):
+        scripted = iter(["abc", "12"])
+        messages = []
+        value = setup._prompt_int(
+            input_func=lambda _prompt: next(scripted),
+            print_func=lambda msg="", *a, **k: messages.append(msg),
+            prompt="学びノート数",
+            default=20,
+        )
+        assert value == 12
+        assert any("数値" in m for m in messages)
+
+    def test_zero_is_rejected_and_reprompts_until_valid(self):
+        scripted = iter(["0", "5"])
+        messages = []
+        value = setup._prompt_int(
+            input_func=lambda _prompt: next(scripted),
+            print_func=lambda msg="", *a, **k: messages.append(msg),
+            prompt="top_k",
+            default=10,
+        )
+        assert value == 5
+        assert any("1" in m for m in messages)
+
+    def test_negative_number_is_rejected_and_reprompts_until_valid(self):
+        scripted = iter(["-3", "8"])
+        messages = []
+        value = setup._prompt_int(
+            input_func=lambda _prompt: next(scripted),
+            print_func=lambda msg="", *a, **k: messages.append(msg),
+            prompt="top_k",
+            default=10,
+        )
+        assert value == 8
+        assert any("1" in m for m in messages)
+
+
 class TestCollectAnswersInteractively:
     """input_func に決め打ちの回答列を注入し、実 stdin には触れずに検証する。"""
 
@@ -237,3 +300,63 @@ class TestCollectAnswersInteractively:
         assert answers["granularity"] == "fine"
         assert answers["corpus_dir"] == "/tmp/mycorpus"
         assert answers["db_path"] == "/tmp/my.db"
+
+    def test_non_preset_granularity_prompts_for_numeric_custom_values(self, monkeypatch):
+        """「カスタムは数値で個別指定」の案内どおり、プリセット名以外を入力したら
+        digest_max_notes/top_k を個別の数値プロンプトで確定させる。
+        """
+        monkeypatch.setattr(setup, "is_reachable", lambda url, timeout=1.0: True)
+        monkeypatch.setattr(setup, "is_command_available", lambda name: True)
+        scripted = iter(
+            [
+                "",  # ollama を使うか -> 既定(yes)
+                "",  # ollama URL
+                "",  # ollama モデル
+                "",  # provider
+                "",  # router_backend
+                "custom",  # granularity -> プリセット外
+                "7",  # digest_max_notes
+                "15",  # top_k
+                "",  # corpus_dir
+                "",  # db_path
+            ]
+        )
+        answers = setup.collect_answers_interactively(
+            input_func=lambda _prompt: next(scripted), print_func=lambda *a, **k: None
+        )
+
+        assert answers["granularity"] == "custom"
+        assert answers["digest_max_notes"] == 7
+        assert answers["top_k"] == 15
+
+    def test_custom_granularity_rejects_non_numeric_and_zero_before_accepting_valid(
+        self, monkeypatch
+    ):
+        """digest_max_notes/top_k の個別入力は、対話フロー全体に組み込まれた状態でも
+        非数値・0 を拒否して再プロンプトすることを確認する(_prompt_int 単体テストとは
+        別に、collect_answers_interactively への配線自体を検証する)。
+        """
+        monkeypatch.setattr(setup, "is_reachable", lambda url, timeout=1.0: True)
+        monkeypatch.setattr(setup, "is_command_available", lambda name: True)
+        scripted = iter(
+            [
+                "",  # ollama を使うか -> 既定(yes)
+                "",  # ollama URL
+                "",  # ollama モデル
+                "",  # provider
+                "",  # router_backend
+                "custom",  # granularity -> プリセット外
+                "not-a-number",  # digest_max_notes（不正・再プロンプト）
+                "7",  # digest_max_notes（再入力）
+                "0",  # top_k（範囲外・再プロンプト）
+                "15",  # top_k（再入力）
+                "",  # corpus_dir
+                "",  # db_path
+            ]
+        )
+        answers = setup.collect_answers_interactively(
+            input_func=lambda _prompt: next(scripted), print_func=lambda *a, **k: None
+        )
+
+        assert answers["digest_max_notes"] == 7
+        assert answers["top_k"] == 15

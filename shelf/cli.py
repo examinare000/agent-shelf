@@ -15,9 +15,10 @@ import argparse
 import json
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-from shelf import config, emit_mcp, setup
+from shelf import config, doctor, emit_mcp, setup
 from shelf.server import build_transport_security, create_server
 from shelf.service import ShelfService
 from shelf.store import Store, UnknownNotebookError
@@ -35,24 +36,51 @@ def _reconfigure_stdio_utf8() -> None:
             stream.reconfigure(encoding="utf-8")
 
 
+_ALL_INTERFACES_HOSTS = frozenset({"0.0.0.0", "::"})
+
+
+def _bind_warning(host: str) -> str | None:
+    """--host が全インターフェース bind を意味する値なら警告文を返す(純関数)。
+
+    0.0.0.0 / :: は VPN 境界を越えて LAN 全体・場合によっては外部からも
+    到達可能になり得るため、意図しない公開に気付けるよう警告する。
+    """
+    if host not in _ALL_INTERFACES_HOSTS:
+        return None
+    return (
+        "警告: 全インターフェースに bind します。VPN インターフェースの IP または "
+        "127.0.0.1 (IPv6 の場合は ::1) を推奨します"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="shelf", description="書籍・資料コーパスへの委譲QA")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve_parser = sub.add_parser("serve", help="MCP サーバを起動する(既定 stdio)")
+    # host/port/http/allowed_host は全て default=None のサンチネル(=「CLI指定なし」)。
+    # 実際の既定値解決(フラグ > env(SHELF_HTTP_*/SHELF_ALLOWED_HOSTS) > ハードコード
+    # 既定)は resolve_serve_settings が担うため、argparse 自体はここでは既定値を
+    # 持たない(優先順位: フラグ > env > 既定)。
     serve_parser.add_argument(
         "--http",
         action="store_true",
-        help="streamable-http トランスポートで起動する(既定は stdio)",
+        default=None,
+        help="streamable-http トランスポートで起動する"
+        "(既定は stdio。優先順位: フラグ > env(SHELF_HTTP_ENABLED) > 既定)",
     )
     serve_parser.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="--http 指定時の bind ホスト(既定 127.0.0.1。Tailscale 内 bind 前提・"
-        "認証は VPN 境界に委ねる)",
+        default=None,
+        help="--http 指定時の bind ホスト(Tailscale 内 bind 前提・認証は VPN 境界に委ねる。"
+        "優先順位: フラグ > env(SHELF_HTTP_HOST) > 既定 127.0.0.1)",
     )
     serve_parser.add_argument(
-        "--port", type=int, default=8765, help="--http 指定時の bind ポート(既定 8765)"
+        "--port",
+        type=int,
+        default=None,
+        help="--http 指定時の bind ポート"
+        "(優先順位: フラグ > env(SHELF_HTTP_PORT) > 既定 8765)",
     )
     serve_parser.add_argument(
         "--allowed-host",
@@ -61,7 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="DNS リバインディング保護の許可 Host を追加指定する(繰り返し指定可)。"
         "既定では bind 先(host:port と host)のみ許可される。Tailscale MagicDNS 名"
-        "(例 avalon.tailXXXX.ts.net:8765)経由でアクセスする場合に指定する",
+        "(例 avalon.tailXXXX.ts.net:8765)経由でアクセスする場合に指定する"
+        "(優先順位: フラグ > env(SHELF_ALLOWED_HOSTS、カンマ区切り) > 既定なし)",
+    )
+    serve_parser.add_argument(
+        "--stdio",
+        action="store_true",
+        help="stdio トランスポートを明示的に強制する(SHELF_HTTP_ENABLED=true が環境に"
+        "立っていても無視して stdio で起動する。MCP クライアント登録は裸の "
+        "`shelf serve`(暗黙 stdio 前提)に依存するため、env による無言のすり替えへの"
+        "脱出口として使う。優先順位: --stdio > --http > env(SHELF_HTTP_ENABLED) > 既定)",
     )
 
     ls_parser = sub.add_parser("ls", help="notebook 一覧、または指定時は document 一覧")
@@ -190,6 +227,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--clear", action="store_true", help="ペルソナをクリアする(None に設定)"
     )
 
+    sub.add_parser(
+        "doctor", help="環境のプリフライト診断を行う(エンジンCLI/ollama/DB/corpus等)"
+    )
+
     return parser
 
 
@@ -232,6 +273,7 @@ def _build_service() -> ShelfService:
         digest_map_window_chars=config.DIGEST_MAP_WINDOW_CHARS,
         digest_backend=config.DIGEST_BACKEND,
         shelve_backend=config.SHELVE_BACKEND,
+        max_file_mb=config.MAX_FILE_MB,
     )
 
 
@@ -429,6 +471,25 @@ def _cmd_setup(args: argparse.Namespace) -> None:
     print(text)
 
 
+def _cmd_doctor(args: argparse.Namespace) -> None:
+    """診断結果を ✓/✗ 付きで日本語表示し、1件でも失敗があれば exit code 1 で終える。
+
+    Task Scheduler 等の無人運用でも「起動前に環境が壊れている」ことを終了コードで
+    機械的に検知できるようにするのが目的。診断ロジック自体は一切ここに持たず
+    doctor.run_checks() へ委譲する(cli.py は配線だけの薄さを保つ既存方針、
+    cli.py 冒頭 docstring 参照)。
+    """
+    results = doctor.run_checks()
+    all_ok = True
+    for result in results:
+        mark = "✓" if result.ok else "✗"
+        print(f"{mark} {result.name}: {result.detail}")
+        if not result.ok:
+            all_ok = False
+    if not all_ok:
+        sys.exit(1)
+
+
 def _cmd_rm(args: argparse.Namespace) -> None:
     store = _build_store()
 
@@ -469,27 +530,81 @@ def _cmd_rm(args: argparse.Namespace) -> None:
     print(f"削除しました: notebook '{args.notebook}'")
 
 
+@dataclass(frozen=True)
+class ServeSettings:
+    """serve コマンドの起動設定(優先順位解決後)。"""
+
+    http: bool
+    host: str
+    port: int
+    allowed_hosts: list[str]
+
+
+def resolve_serve_settings(
+    args: argparse.Namespace,
+    *,
+    env_http_enabled: bool,
+    env_host: str,
+    env_port: int,
+    env_allowed_hosts: list[str],
+) -> ServeSettings:
+    """serve の起動設定を「--stdio > --http フラグ > env」の優先順位で解決する純関数。
+
+    build_parser() の --http/--host/--port/--allowed-host は全て default=None の
+    サンチネル(CLI 未指定を表す)。ここでは env 解決済みの値(呼び出し元が
+    config.HTTP_ENABLED 等から渡す)を「未指定時のフォールバック」として使うだけで、
+    config モジュールを直接読まない(build_transport_security と同じ「呼び出し元が
+    値を明示的に渡す」流儀にすることで、reload 不要・副作用ゼロでテストできる)。
+    ハードコード既定値自体(127.0.0.1/8765/[])は config.py が既に解決済みの前提。
+
+    --stdio は他の何より優先される最終脱出口: MCP クライアント登録が裸の
+    `shelf serve`(暗黙 stdio 前提)に依存しているため、SHELF_HTTP_ENABLED=true が
+    環境に立っていても(たとえ --http も同時指定されていても)stdio へ強制できる
+    必要がある(レビュー指摘: env による無言のすり替えへの脱出口)。
+    """
+    http = False if args.stdio else (args.http if args.http is not None else env_http_enabled)
+    return ServeSettings(
+        http=http,
+        host=args.host if args.host is not None else env_host,
+        port=args.port if args.port is not None else env_port,
+        allowed_hosts=list(args.allowed_host) if args.allowed_host else list(env_allowed_hosts),
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     _reconfigure_stdio_utf8()
     args = build_parser().parse_args(argv)
 
     if args.command == "serve":
+        settings = resolve_serve_settings(
+            args,
+            env_http_enabled=config.HTTP_ENABLED,
+            env_host=config.HTTP_HOST,
+            env_port=config.HTTP_PORT,
+            env_allowed_hosts=config.ALLOWED_HOSTS,
+        )
         server = create_server(_build_service())
-        if args.http:
+        if settings.http:
             # Tailscale VPN 内での bind を前提とし、認証は VPN 境界に委ねる
             # (design doc §1)。エンドポイントは mcp SDK の既定 "/mcp"。
-            server.settings.host = args.host
-            server.settings.port = args.port
+            server.settings.host = settings.host
+            server.settings.port = settings.port
             # mcp SDK の DNS リバインディング保護は既定で localhost 系 Host しか
             # 許可しないため、bind 先が非 localhost だと「Invalid Host header」で
             # initialize が弾かれる(実機検証で確認)。bind 先自身(host:port と host)
-            # を既定の許可リストとし、--allowed-host で Tailscale MagicDNS 名等を
-            # 追加できるようにする。保護自体は無効化しない(build_transport_security
-            # の docstring参照)。
-            allowed_hosts = [f"{args.host}:{args.port}", args.host]
-            if args.allowed_host:
-                allowed_hosts.extend(args.allowed_host)
+            # を既定の許可リストとし、--allowed-host/SHELF_ALLOWED_HOSTS で
+            # Tailscale MagicDNS 名等を追加できるようにする。保護自体は無効化しない
+            # (build_transport_security の docstring参照)。
+            allowed_hosts = [f"{settings.host}:{settings.port}", settings.host]
+            allowed_hosts.extend(settings.allowed_hosts)
             server.settings.transport_security = build_transport_security(allowed_hosts)
+            # env(SHELF_HTTP_HOST)経由で 0.0.0.0/:: に bind するケースでも警告が
+            # 出るよう、args.host ではなく解決後の settings.host を渡す(args.host は
+            # CLI 未指定時 None サンチネルのままで、env 由来の全インターフェース bind
+            # を素通ししてしまうため)。
+            warning = _bind_warning(settings.host)
+            if warning is not None:
+                print(warning, file=sys.stderr)
             server.run(transport="streamable-http")
         else:
             server.run()
@@ -519,6 +634,8 @@ def main(argv: list[str] | None = None) -> None:
         _cmd_setup(args)
     elif args.command == "rm":
         _cmd_rm(args)
+    elif args.command == "doctor":
+        _cmd_doctor(args)
     elif args.command == "index":
         stats = _build_service().index(args.notebook, full=args.all)
         _print_index_stats(stats)
@@ -535,8 +652,8 @@ def main(argv: list[str] | None = None) -> None:
         result = _build_service().shelve(args.directory, dry_run=args.dry_run)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.command == "persona":
-        service = _build_service()
         if args.set_persona is not None:
+            service = _build_service()
             try:
                 service.set_persona(args.notebook, args.set_persona)
                 print(f"ペルソナを設定しました: {args.notebook}")
@@ -545,6 +662,7 @@ def main(argv: list[str] | None = None) -> None:
             except ValueError as e:
                 print(f"エラー: {e}")
         elif args.clear:
+            service = _build_service()
             try:
                 service.set_persona(args.notebook, None)
                 print(f"ペルソナをクリアしました: {args.notebook}")

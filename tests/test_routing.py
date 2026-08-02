@@ -115,6 +115,20 @@ class TestBuildRoutingPrompt:
 
         assert "タグ:" not in prompt
 
+    def test_includes_titles_when_present(self):
+        card = _card(titles=("量子力学入門", "スピンとは何か"))
+
+        prompt = build_routing_prompt("質問", [card])
+
+        assert "代表資料: 量子力学入門, スピンとは何か" in prompt
+
+    def test_omits_titles_line_when_empty(self):
+        card = _card(titles=())
+
+        prompt = build_routing_prompt("質問", [card])
+
+        assert "代表資料:" not in prompt
+
 
 class TestRoutingSchema:
     def test_declares_answerable_and_targets(self):

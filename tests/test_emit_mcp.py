@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tomllib
+from pathlib import Path
 
 import pytest
 
@@ -35,6 +37,13 @@ class TestBuildClaudeShText:
         assert "claude mcp add --transport http shelf" in text
         assert "http://127.0.0.1:8765/mcp" in text
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="windows-latest ランナーでは無引数の `bash` が実 POSIX シェルではなく"
+        "System32\\bash.exe（WSL 未導入時の案内スタブ）に解決され、`wsl --install` "
+        "案内メッセージを出して非ゼロ終了する（実測: CI ログ、生成スクリプト自体は"
+        "健全）。POSIX ホストでのみ実 bash 構文検証として意味を持つ",
+    )
     def test_stdio_script_is_valid_bash_syntax(self, tmp_path):
         text = emit_mcp.build_claude_sh_text(transport="stdio", url=None, repo_root=tmp_path)
         script = tmp_path / "claude.sh"
@@ -42,6 +51,13 @@ class TestBuildClaudeShText:
         result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="windows-latest ランナーでは無引数の `bash` が実 POSIX シェルではなく"
+        "System32\\bash.exe（WSL 未導入時の案内スタブ）に解決され、`wsl --install` "
+        "案内メッセージを出して非ゼロ終了する（実測: CI ログ、生成スクリプト自体は"
+        "健全）。POSIX ホストでのみ実 bash 構文検証として意味を持つ",
+    )
     def test_http_script_is_valid_bash_syntax(self, tmp_path):
         text = emit_mcp.build_claude_sh_text(
             transport="http", url="http://127.0.0.1:8765/mcp", repo_root=tmp_path
@@ -67,6 +83,22 @@ class TestBuildCodexTomlText:
         data = tomllib.loads(text)
         assert data["mcp_servers"]["shelf"]["url"] == "http://127.0.0.1:8765/mcp"
 
+    def test_stdio_escapes_windows_backslash_path(self):
+        """実バグの回帰テスト（実測: Windows CI で tomllib.TOMLDecodeError:
+        Invalid hex value）。Windows の repo_root は `str()` がバックスラッシュ
+        区切りになるため、TOML basic string へ無エスケープで埋め込むと
+        `\\U`・`\\u` 等が不正な Unicode エスケープと解釈される。POSIX ホストでも
+        `Path("C:\\Users\\x")` は文字列としてバックスラッシュをそのまま保持する
+        ため（`\\` は POSIX の区切り文字ではない）、ホストに依らず再現できる。
+        """
+        windows_repo_root = Path("C:\\Users\\runneradmin\\shelf")
+        text = emit_mcp.build_codex_toml_text(
+            transport="stdio", url=None, repo_root=windows_repo_root
+        )
+        data = tomllib.loads(text)  # 修正前はここで TOMLDecodeError
+        server = data["mcp_servers"]["shelf"]
+        assert server["args"][2] == str(windows_repo_root)
+
 
 class TestBuildGeminiJsonText:
     def test_stdio_produces_command_and_args(self, tmp_path):
@@ -76,12 +108,16 @@ class TestBuildGeminiJsonText:
         assert server["command"] == "uv"
         assert server["args"] == ["run", "--directory", str(tmp_path), "shelf", "serve"]
 
-    def test_http_produces_url_form(self, tmp_path):
+    def test_http_produces_http_url_form(self, tmp_path):
+        # Gemini CLI は "url" キーを SSE transport とみなすため、streamable-http
+        # では "httpUrl" キーでないと接続できない。
         text = emit_mcp.build_gemini_json_text(
             transport="http", url="http://127.0.0.1:8765/mcp", repo_root=tmp_path
         )
         data = json.loads(text)
-        assert data["mcpServers"]["shelf"]["url"] == "http://127.0.0.1:8765/mcp"
+        server = data["mcpServers"]["shelf"]
+        assert server["httpUrl"] == "http://127.0.0.1:8765/mcp"
+        assert "url" not in server
 
 
 class TestBuildReadmeText:
@@ -135,8 +171,6 @@ class TestEmit:
         assert (tmp_path / "README.md").exists()
 
     def test_claude_sh_is_made_executable(self, tmp_path):
-        import os
-
         emit_mcp.emit(
             hosts=["claude"],
             transport="stdio",

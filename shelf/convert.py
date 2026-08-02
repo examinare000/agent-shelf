@@ -25,7 +25,7 @@ class ConvertResult:
     """テキスト変換結果。"""
 
     markdown: str
-    converter: str  # 'pymupdf4llm' | 'markitdown' | 'raw'
+    converter: str  # 'pymupdf4llm' | 'pymupdf4llm-reflow' | 'markitdown' | 'raw'
     title: str | None
     # 利用者への明示的な通知（例: OCRスキップ）。空タプルが既定で、全構築箇所が
     # キーワード引数呼び出しのため末尾追加でも非破壊(design doc/計画で grep 確認済み)。
@@ -51,7 +51,7 @@ def pick_converter(origin: str) -> str:
         origin: ファイルパスまたは URL。
 
     Returns:
-        'pymupdf4llm' | 'markitdown' | 'raw'
+        'pymupdf4llm' | 'pymupdf4llm-reflow' | 'markitdown' | 'raw'
 
     Raises:
         ConversionError: 未対応形式の場合。
@@ -74,6 +74,12 @@ def pick_converter(origin: str) -> str:
     # PDF: pymupdf4llm
     if ext == ".pdf":
         return "pymupdf4llm"
+
+    # リフロー形式(EPUB/FB2/XPS): pymupdf4llm を使うが、PDF の "pymupdf4llm" とは
+    # 別の converter 名にする。これらのページ番号は再レイアウトの副産物であり
+    # 読者の版と一致しないため、由来を documents.converter で区別できるようにする。
+    if ext in (".epub", ".fb2", ".xps"):
+        return "pymupdf4llm-reflow"
 
     # Office/HTML: markitdown
     if ext in (".docx", ".xlsx", ".xls", ".pptx", ".html", ".htm"):
@@ -98,6 +104,7 @@ def pick_converter(origin: str) -> str:
     # 未対応
     supported = [
         ".pdf (PDF)",
+        ".epub, .fb2, .xps (リフロー)",
         ".docx, .xlsx, .xls, .pptx, .html, .htm (Office/HTML)",
         ".md, .txt, .rst, .py, .js, .ts, .sh, .toml, .yaml, .yml, .json (Code/Text)",
         "http://, https:// (URL)",
@@ -162,6 +169,8 @@ def convert_file(path: Path) -> ConvertResult:
     # 形式ごとに変換
     if converter_name == "pymupdf4llm":
         return _convert_pdf(path)
+    elif converter_name == "pymupdf4llm-reflow":
+        return _convert_reflow(path)
     elif converter_name == "markitdown":
         return _convert_markitdown(path)
     else:  # "raw"
@@ -240,14 +249,66 @@ def _convert_pdf(path: Path) -> ConvertResult:
     chunks = pymupdf4llm.to_markdown(str(path), page_chunks=True, **kwargs)
     markdown = _insert_page_markers(chunks)
 
-    # 100 字未満チェック
+    # 100 字未満チェック。OCR は同梱していないため、スキャン PDF の場合の
+    # 代替手段（事前 OCR）を案内する。
     if len(markdown) < 100:
         raise ConversionError(
-            "テキストを抽出できませんでした（スキャン PDF の可能性があります）"
+            "テキストを抽出できませんでした（スキャン PDF の可能性があります）。"
+            "OCR は同梱していません。事前に OCR 済み PDF を用意してください"
+            "（例: ocrmypdf）"
         )
 
     notes = (_OCR_SKIP_NOTE,) if skip_ocr else ()
     return ConvertResult(markdown=markdown, converter="pymupdf4llm", title=None, notes=notes)
+
+
+def _convert_reflow(path: Path) -> ConvertResult:
+    """pymupdf4llm を使用した EPUB/FB2/XPS 等リフロー形式の変換。
+
+    WHY page_chunks=False（ページマーカーを挿入しない）: リフロー形式の
+    「ページ番号」は pymupdf-layout が page_width=612 で再レイアウトした際の
+    副産物であり、章立てやレイアウト条件次第でページ数自体が変動するため、
+    読者が実際に手にする版のページ番号とは一致しない虚構である。ページベース
+    の引用は蔵書の「正確な出典」目標に反するため、<!-- page: N --> マーカーは
+    挿入せず、引用の位置情報は既存の見出しパンくず（chunker.py の
+    _split_into_segments）に委ねる。
+    """
+    import pymupdf4llm
+
+    safe_error: ConversionError | None = None
+    try:
+        markdown = pymupdf4llm.to_markdown(str(path), page_chunks=False)
+    except Exception:
+        # pymupdf.FileDataError 等の例外メッセージは絶対パスを含む
+        # （実測: "Failed to open file '<絶対パス>' as type epub."）。
+        # そのまま利用者へ見せず、DRM/破損の可能性のみを伝える安全な文言に丸める。
+        #
+        # WHY ここで raise せず except ブロックの外側で raise する: `raise ... from e`
+        # や無印の `raise`（暗黙の __context__ 連鎖）は、message には出ない絶対パス等の
+        # 生情報をトレースバック経由で保持したまま呼び出し元へ伝播させてしまい、
+        # 「そのまま利用者に見せない」という上記の意図をログ出力・MCP エラーサーフェス
+        # 経由で裏切りうる。加えて Windows では、この生例外のトレースバックが
+        # フレームローカル経由で pymupdf.open() 失敗時に残る未解放ファイルハンドルを
+        # 延命させ、呼び出し元がこの例外を保持している間（テストの
+        # tempfile.TemporaryDirectory クリーンアップ等）に WinError 32
+        # （PermissionError）を誘発しうる（実測: CI ログで cleanup 時に検出）。
+        # except ブロックを抜けて sys.exc_info() がクリアされた後に raise すれば
+        # __context__ は自動的に None のままになり、元例外は即座に GC 対象になる。
+        safe_error = ConversionError(
+            "ファイルを読み込めませんでした（DRM 保護や破損の可能性があります）"
+        )
+
+    if safe_error is not None:
+        raise safe_error
+
+    # 100 字未満チェック。「スキャン PDF」という文言は _convert_pdf 専用の
+    # 原因説明であり、リフロー形式には無関係（DRM/破損の可能性を案内する）。
+    if len(markdown) < 100:
+        raise ConversionError(
+            "テキストを抽出できませんでした（DRM 保護や破損の可能性があります）"
+        )
+
+    return ConvertResult(markdown=markdown, converter="pymupdf4llm-reflow", title=None)
 
 
 def _convert_markitdown(path: Path) -> ConvertResult:

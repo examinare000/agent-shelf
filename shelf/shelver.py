@@ -83,6 +83,8 @@ class Shelver:
             step = classify_step(decision, summary, working_catalog, self._notebook_backend)
 
             result.assignments.append(step.assignment)
+            if step.note is not None:
+                result.notes.append(step.note)
             if step.new_notebook is not None:
                 result.created.append(step.new_notebook)
                 working_catalog.append(

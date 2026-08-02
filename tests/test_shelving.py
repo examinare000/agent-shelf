@@ -401,6 +401,53 @@ class TestClassifyStepNewNotebook:
         assert result.new_notebook.backend == "codex"
 
 
+class TestClassifyStepSilentRemapNote:
+    """タスク B7-3: LLM が「英小文字・数字・-/_ のみ」の指示を無視し、全角/記号のみの
+    notebook 名を提案した場合、normalize_notebook_name が既定名 "notebook" へ
+    サイレントにリマップする経路を StepResult.note で可視化する。"""
+
+    def test_all_non_ascii_proposal_produces_note(self):
+        decision = _decision(action="new", notebook="物理学", description="物理", reason="r")
+
+        result = classify_step(decision, _summary(), [], backend="ollama")
+
+        assert result.new_notebook.name == "notebook"
+        assert result.note is not None
+        assert "notebook" in result.note
+
+    def test_partially_valid_proposal_produces_no_note(self):
+        """一部でも有効な文字が残れば default "notebook" へのフォールバックは
+        発生しないため note は None のまま（既存の正規化のみ・警告不要）。"""
+        decision = _decision(
+            action="new", notebook="Cooking Recipes!!", description="料理", reason="r"
+        )
+
+        result = classify_step(decision, _summary(), [], backend="ollama")
+
+        assert result.new_notebook.name == "cooking-recipes"
+        assert result.note is None
+
+    def test_parse_failure_produces_no_note(self):
+        """parse_ok=False（raw_name=""）の既定フォールバックは LLM が指示を無視した
+        経路ではない（そもそも名前を提案できていない）ため対象外。"""
+        decision = ClassificationDecision(
+            action="", notebook="", reason="", parse_ok=False, description=None
+        )
+
+        result = classify_step(decision, _summary(), [], backend="ollama")
+
+        assert result.new_notebook.name == "notebook"
+        assert result.note is None
+
+    def test_assign_to_existing_notebook_produces_no_note(self):
+        decision = _decision(action="assign", notebook="physics", reason="主題が一致")
+        catalog = [_card(name="physics")]
+
+        result = classify_step(decision, _summary(), catalog, backend="ollama")
+
+        assert result.note is None
+
+
 class TestClassifyStepParseFailure:
     def test_parse_failure_is_reinterpreted_as_new_with_default_name(self):
         decision = ClassificationDecision(
