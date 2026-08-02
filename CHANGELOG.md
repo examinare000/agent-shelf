@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **要約/分類/digest プロンプトへの title 未 mask 露出を修正**: v0.5.0 のカタログ投影・永続化時 mask（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）は、取込時の要約生成プロンプト（`build_summary_prompt` の add/shelve 双方の呼び出し）・shelve 要約失敗時のフォールバック分類プロンプト（`build_classification_prompt`）・digest map/reduce プロンプトの title 引数には未適用で、converter 抽出直後の生 title・既存 DB 行の未 mask title がそれぞれ backend へ素通しになる経路が残っていた。プロンプト構築の直前で mask を適用する
+
 ## [0.5.0] - 2026-08-02
 
 Windows 実運用（ヘッドレス HTTP サーブ）へ向けたブラッシュアップリリース。
