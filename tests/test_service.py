@@ -1905,6 +1905,38 @@ def test_add_source_masks_auto_generated_summary(
     assert secret not in document["description"]
 
 
+def test_add_source_masks_title_before_building_summary_prompt(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """converter が抽出した title は markdown 本文と異なり mask を経由せずに
+    backend.answer へ渡っていた（build_summary_prompt(markdown, title=title) の
+    title 引数）。markdown 本文は _persist_converted 前に mask 済みだが、title は
+    生値のまま要約プロンプトへ流れ込むため、機密含み文書名がそのまま backend へ
+    送信される（personal 側還流の反証検証で発見）。"""
+    store.create_notebook("nb", backend="codex")
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("placeholder content, unused by fake converter", encoding="utf-8")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(
+        markdown="# Doc\n\nsome content about penguins.\n",
+        title=f"秘密資料 {secret}",
+    )
+    backend = FakeAnswerBackend(canned='{"summary": "ペンギンの生態資料"}')
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        converter=converter, mask=fake_mask,
+    )
+
+    service.add_source("nb", str(source_file))
+
+    assert len(backend.calls) == 1
+    assert secret not in backend.calls[0]["prompt"]
+
+
 def test_add_source_auto_summary_failure_keeps_add_successful_with_note(
     store: Store, embedder: FakeEmbedder, tmp_path: Path
 ) -> None:
@@ -3077,6 +3109,46 @@ def test_digest_uses_notebook_persona_and_document_title_in_map_and_reduce_promp
     assert "あなたは鯨類学者である。" in reduce_call["prompt"]
     assert reduce_call["schema"] == REDUCE_SCHEMA
     assert reduce_call["workdir"] == corpus_dir / "nb"
+
+
+def test_digest_masks_pre_existing_unmasked_title_in_map_and_reduce_prompts(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """digest の map/reduce プロンプトは doc.get("title")（DB由来）をそのまま使う。
+    cc78b8e 適用前に永続化された既存 DB 行の title は未 mask のままの場合があり
+    （カタログ投影と同様の「既存行には遡及しない」問題）、これが digest 実行のたびに
+    map/reduce プロンプトへ露出し続ける（personal 側還流の反証検証で発見）。
+    カタログ投影の既存修正（test_consult_catalog_masks_titles_from_pre_existing_unmasked_rows）
+    と同じ作法で、未 mask のまま DB へ直接投入した title が漏れないことを固定する。"""
+    store.create_notebook("nb", backend="codex")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+        title=f"秘密資料 {secret}",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}]),
+        ]
+    )
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir, mask=fake_mask)
+
+    service.digest("nb")
+
+    assert len(backend.calls) == 2
+    map_call, reduce_call = backend.calls
+    assert secret not in map_call["prompt"]
+    assert secret not in reduce_call["prompt"]
 
 
 def test_digest_multi_window_doc_merges_map_notes_via_reduce_with_chunk_id_union(
@@ -4452,6 +4524,76 @@ def test_shelve_apply_masks_title_before_persisting(
     assert document is not None
     assert secret not in document["title"]
     assert "<REDACTED>" in document["title"]
+
+
+def test_shelve_masks_title_before_building_summary_prompt(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """shelve() 経路（_summarize_for_shelve → build_summary_prompt）でも title は
+    プロンプト構築前に mask を通す。永続化直前の title mask（上のテスト）とは別に、
+    要約生成のために summarize_backend へ送るプロンプトそのものに未 mask の title が
+    紛れ込まないことを固定する。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(
+        markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n",
+        title=f"秘密資料 {secret}",
+    )
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    service.shelve(str(root), dry_run=False)
+
+    assert len(summarize_backend.calls) == 1
+    assert secret not in summarize_backend.calls[0]["prompt"]
+
+
+def test_shelve_masks_title_in_fallback_classification_text_when_summary_fails(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """要約生成失敗時、_shelve_fallback_classification_text は
+    classification_text（=FileSummary.summary）へ title をそのまま埋め込む。
+    この classification_text は build_classification_prompt を通じて
+    classify_backend のプロンプトへ渡るため、要約成功パス（上のテスト）とは
+    独立にこのフォールバック経路でも title の mask 漏れを固定する（掃引で発見）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(
+        markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n",
+        title=f"秘密資料 {secret}",
+    )
+    # ok=False で要約生成を失敗させ、_shelve_fallback_classification_text 経路へ倒す。
+    summarize_backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="要約失敗"))
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    service.shelve(str(root), dry_run=False)
+
+    assert len(classify_backend.calls) == 1
+    assert secret not in classify_backend.calls[0]["prompt"]
 
 
 def test_consult_reports_router_error_when_librarian_backend_fails(store, embedder, tmp_path):
