@@ -4618,6 +4618,42 @@ def test_shelve_masks_title_in_fallback_classification_text_when_summary_fails(
     assert secret not in classify_backend.calls[0]["prompt"]
 
 
+def test_shelve_raises_the_original_mask_error_instead_of_unbound_local_error(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """_summarize_for_shelve は title の mask を try の外側で行う。mask 自身が例外を
+    投げた場合、フォールバック return で masked_title が未束縛のまま参照される
+    UnboundLocalError（細い実穴）にすり替わらず、mask の例外がそのまま伝播する
+    ことを固定する（pyright reportPossiblyUnboundVariable の修正対応）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    title = "秘密資料"
+    converter = _FakeConverter(
+        markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n",
+        title=title,
+    )
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+
+    def broken_mask(text: str) -> str:
+        # markdown の mask（_prepare_shelve_candidates 側）は正常に通し、
+        # _summarize_for_shelve 内の title mask だけを失敗させて的を絞る。
+        if text == title:
+            raise RuntimeError("mask failure for testing")
+        return text
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=broken_mask,
+    )
+
+    with pytest.raises(RuntimeError, match="mask failure for testing"):
+        service.shelve(str(root), dry_run=False)
+
+
 def test_consult_reports_router_error_when_librarian_backend_fails(store, embedder, tmp_path):
     """【6】司書(Librarian)の backend 呼び出し失敗時、warning に router_error が含まれる"""
     router_backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="librarian backend timeout"))

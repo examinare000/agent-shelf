@@ -32,8 +32,12 @@ def _reconfigure_stdio_utf8() -> None:
     reconfigure を持たないストリーム(テストの capture 等)は黙って無視する。
     """
     for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8")
+        # WHY getattr: typing.TextIO は reconfigure を宣言しないため hasattr の
+        # narrowing が効かない(pyright: reportAttributeAccessIssue)。挙動は従来と
+        # 同じ「持っていれば呼ぶ・無ければ何もしない」。
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8")
 
 
 _ALL_INTERFACES_HOSTS = frozenset({"0.0.0.0", "::"})

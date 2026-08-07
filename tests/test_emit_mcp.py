@@ -67,6 +67,17 @@ class TestBuildClaudeShText:
         result = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
 
+    @pytest.mark.parametrize("empty_url", [None, ""])
+    def test_http_without_url_raises_clear_value_error(self, tmp_path, empty_url):
+        """build_codex_toml_text/build_gemini_json_text と同型のガードを追加する
+        回帰テスト。従来はガードが無く、url=None/"" のまま素の f-string 補間で
+        `claude mcp add --transport http shelf "None"` のような壊れたコマンド列を
+        無例外で出力していた（出力先が実行ビット付き claude.sh のため3ビルダー中
+        最も影響が大きい実穴だった）。
+        """
+        with pytest.raises(ValueError, match="url が必須"):
+            emit_mcp.build_claude_sh_text(transport="http", url=empty_url, repo_root=tmp_path)
+
 
 class TestBuildCodexTomlText:
     def test_stdio_produces_command_and_args(self, tmp_path):
@@ -99,6 +110,19 @@ class TestBuildCodexTomlText:
         server = data["mcp_servers"]["shelf"]
         assert server["args"][2] == str(windows_repo_root)
 
+    @pytest.mark.parametrize("empty_url", [None, ""])
+    def test_http_without_url_raises_clear_value_error(self, tmp_path, empty_url):
+        """emit() を経由せず直接呼ばれ transport="http" なのに url が未指定（None）
+        または空文字列の場合、_toml_basic_string(None) の AttributeError という
+        診断しにくい形や、壊れた `url = ""` を無例外で書き出す形ではなく、
+        明示的な ValueError で失敗する（pyright reportArgumentType 修正の回帰固定。
+        emit() のバリデーション条件 `not url` と同一契約にする——空文字列は
+        argparse で `--url ""` として普通に通り得るため None だけの判定では
+        不十分だった）。
+        """
+        with pytest.raises(ValueError, match="url が必須"):
+            emit_mcp.build_codex_toml_text(transport="http", url=empty_url, repo_root=tmp_path)
+
 
 class TestBuildGeminiJsonText:
     def test_stdio_produces_command_and_args(self, tmp_path):
@@ -118,6 +142,15 @@ class TestBuildGeminiJsonText:
         server = data["mcpServers"]["shelf"]
         assert server["httpUrl"] == "http://127.0.0.1:8765/mcp"
         assert "url" not in server
+
+    @pytest.mark.parametrize("empty_url", [None, ""])
+    def test_http_without_url_raises_clear_value_error(self, tmp_path, empty_url):
+        """build_codex_toml_text と同型のガードを追加する回帰テスト。従来は
+        url=None でも url="" でもガードが無く、壊れた `httpUrl: null` /
+        `httpUrl: ""` を無例外で書き出していた。
+        """
+        with pytest.raises(ValueError, match="url が必須"):
+            emit_mcp.build_gemini_json_text(transport="http", url=empty_url, repo_root=tmp_path)
 
 
 class TestBuildReadmeText:
