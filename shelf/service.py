@@ -782,6 +782,7 @@ class ShelfService:
             if raw.ok:
                 summary = parse_summary(raw.text)
         except Exception:
+            _logger.debug("summary generation failed for doc_id=%s", doc_id, exc_info=True)
             summary = None
 
         if summary is not None:
@@ -1236,7 +1237,7 @@ class ShelfService:
                     masked = self._mask(summary) if self._mask is not None else summary
                     return masked, masked
         except Exception:
-            pass
+            _logger.debug("shelve summary generation failed", exc_info=True)
         # フォールバックの classification_text も build_classification_prompt
         # 経由で classify_backend へ渡るため、成功パスと同じく masked_title を使う
         # （掃引で発見: 従来はここだけ生 title を使っており、要約生成が失敗した

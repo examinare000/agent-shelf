@@ -41,6 +41,21 @@ def _bool_env(key: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true")
 
 
+def _log_level_env(key: str, default_level: int) -> int:
+    """文字列 env ("DEBUG"/"INFO" 等) を logging レベル int へ変換。
+
+    大文字小文字を許容し、不正値は既定値へフォールバック（他の *_env ヘルパと同じ方針）。
+    """
+    import logging
+
+    raw = os.environ.get(key)
+    if raw is None:
+        return default_level
+    level_name = raw.strip().upper()
+    level = logging.getLevelNamesMapping().get(level_name)
+    return level if level is not None else default_level
+
+
 # config.env（`shelf setup` が書き出す永続設定）の場所を上書きする env 変数名。
 CONFIG_ENV_VAR = "SHELF_CONFIG"
 

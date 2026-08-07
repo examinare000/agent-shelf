@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import urllib.error
 import urllib.request
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlparse
+
+_logger = logging.getLogger(__name__)
 
 
 class ConversionError(ValueError):
@@ -228,6 +231,7 @@ def _pdf_text_layer_lengths(path: Path) -> list[int]:
             # 引数省略時（既定 option="text"）は実行時は必ず str を返す。
             return [len(cast(str, doc[idx].get_text()).strip()) for idx in indices]
     except Exception:
+        _logger.debug("PDF text layer detection failed: %s", path, exc_info=True)
         return []
 
 
