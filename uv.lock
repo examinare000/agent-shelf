@@ -1920,8 +1920,8 @@ requires-dist = [
     { name = "markitdown", extras = ["docx", "xlsx", "xls", "pptx"] },
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "pymupdf" },
-    { name = "pymupdf4llm" },
+    { name = "pymupdf", specifier = ">=1.28.0" },
+    { name = "pymupdf4llm", specifier = ">=1.28.0" },
 ]
 
 [package.metadata.requires-dev]
