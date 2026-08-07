@@ -932,6 +932,28 @@ class TestPersonaDispatch:
         captured = capsys.readouterr().out
         assert "エラー" in captured
 
+    def test_displays_masked_persona_for_pre_existing_unmasked_row(self, monkeypatch, capsys):
+        """persona 表示は _build_store().get_notebook() 直読みで素通し表示していた。
+        既存 DB 行の未 mask persona がそのまま表示されないことを固定する
+        （ADR-0002 の残存 should）。_build_service（実モデル DL）は使わず、
+        shelf.masking.mask（軽量な importlib 経由の単一ソース）を直接使う。"""
+        secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+        store = Store(":memory:")
+        store.create_notebook("physics", description="物理")
+        store.set_persona("physics", f"物理学の専門家 {secret}")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+
+        def _fail_if_called():
+            raise AssertionError("_build_service は表示のみの分岐で呼ばれてはならない")
+
+        monkeypatch.setattr(cli, "_build_service", _fail_if_called)
+
+        cli.main(["persona", "physics"])
+
+        captured = capsys.readouterr().out
+        assert secret not in captured
+        assert "<REDACTED-KEY>" in captured
+
     def test_display_only_path_does_not_build_service(self, monkeypatch, capsys):
         """表示のみの分岐(--set/--clear なし)は store だけで完結すべきで、
         実 FastEmbedEmbedder を構築する _build_service を呼んではいけない

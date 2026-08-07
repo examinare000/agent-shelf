@@ -753,6 +753,28 @@ def test_list_notebooks_reports_backend_sources_and_chunks(
     ]
 
 
+def test_list_notebooks_masks_pre_existing_unmasked_description(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """list_notebooks() は row["description"] を素通しで返しており、MCP の
+    list_notebooks ツール出力は AI エージェントの文脈へ直接流れる。既存 DB 行の
+    未 mask description が露出しないことを固定する（ADR-0002 の残存 should）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    store.create_notebook("physics", description=f"物理の資料 {secret}", backend="codex")
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, mask=fake_mask
+    )
+
+    result = service.list_notebooks()
+
+    assert secret not in result[0]["description"]
+    assert "<REDACTED>" in result[0]["description"]
+
+
 # -- create_notebook ------------------------------------------------------------
 
 
@@ -4619,3 +4641,365 @@ def test_consult_reports_router_error_when_librarian_backend_fails(store, embedd
     assert result["answered"] is False
     assert "librarian backend timeout" in result["warning"]
     assert "司書ルーティングの backend 呼び出しに失敗" in result["warning"]
+
+
+# -- ADR-0002 残存違反修正: description/persona の永続化時 mask ---------------------
+
+
+def test_create_notebook_masks_description_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """create_notebook() は description を永続化前に mask する。title の既存修正
+    （_persist_converted）と対称の不変条件（ADR-0002）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: FakeAnswerBackend(), tmp_path, mask=fake_mask,
+    )
+
+    service.create_notebook("nb", description=f"秘密の資料 {secret}")
+
+    notebook = store.get_notebook("nb")
+    assert notebook is not None
+    assert secret not in notebook["description"]
+    assert "<REDACTED>" in notebook["description"]
+
+
+def test_shelve_masks_created_notebook_description_before_persisting(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """shelve() の新規 notebook 作成経路（plan.created）でも description を永続化前に
+    mask する。classify backend が返す description（LLM 生成テキスト）にも secret が
+    混入しうるため、create_notebook 経路と対称に mask を適用する。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned=(
+            '{"action": "new", "notebook": "quantum-notes", '
+            f'"description": "秘密の講義ノート {secret}", "reason": "既存に合致なし"}}'
+        )
+    )
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    service.shelve(str(root), dry_run=False)
+
+    notebook = store.get_notebook("quantum-notes")
+    assert notebook is not None
+    assert secret not in notebook["description"]
+    assert "<REDACTED>" in notebook["description"]
+
+
+def test_shelve_dry_run_masks_created_notebook_description_in_json_output(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """dry_run=True の JSON 出力 created_notebooks[*].description は plan.created
+    （意図的に生 description を保持する shelver.py の設計）をそのまま素通しで
+    CLI stdout へ返す。非 dry-run 側は永続化時に mask するのに dry-run 側は
+    未 mask のまま漏れる（adversarial-verifier が実証した must#1）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned=(
+            '{"action": "new", "notebook": "quantum-notes", '
+            f'"description": "秘密の講義ノート {secret}", "reason": "既存に合致なし"}}'
+        )
+    )
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    result = service.shelve(str(root), dry_run=True)
+
+    description = result["created_notebooks"][0]["description"]
+    assert secret not in description
+    assert "<REDACTED>" in description
+
+
+def test_shelve_dry_run_masks_assignment_reason_in_json_output(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """dry_run=True の JSON 出力 plan[*].reason は分類 LLM の自由記述（decision.reason）
+    をそのまま素通しする。mask 正本の既知の残存制限がある以上、LLM 出力に secret が
+    混入しうるという脅威モデルは reason にも及ぶ（adversarial-verifier 指摘 must#2）。"""
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(
+        canned=(
+            '{"action": "new", "notebook": "quantum-notes", '
+            f'"description": "量子力学の講義ノート集", "reason": "秘密の理由 {secret}"}}'
+        )
+    )
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    result = service.shelve(str(root), dry_run=True)
+
+    reason = result["plan"][0]["reason"]
+    assert secret not in reason
+    assert "<REDACTED>" in reason
+
+
+def test_consult_catalog_masks_pre_existing_unmasked_description_and_persona(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """_build_catalog() 自体でも description/persona に self._mask を適用し、本修正
+    以前に永続化された未 mask の既存 DB 行もカバーする（titles の既存二重防御
+    （_project_notebook_titles）と対称）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    store.create_notebook("nb", description=f"概要 {secret}")
+    store.set_persona("nb", f"ペルソナ {secret}")
+    fake_librarian = FakeLibrarian([])
+    backend = FakeAnswerBackend()
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        librarian=fake_librarian, mask=fake_mask,
+    )
+
+    service.consult(_QUERY_TEXT)
+
+    catalog = fake_librarian.calls[0]["catalog"]
+    assert secret not in catalog[0].description
+    assert "<REDACTED>" in catalog[0].description
+    assert secret not in catalog[0].persona
+    assert "<REDACTED>" in catalog[0].persona
+
+
+def test_shelve_classification_prompt_masks_pre_existing_unmasked_description(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """既存 notebook の description が(本修正前に永続化されて)未 mask のままの場合でも、
+    shelve() の分類プロンプト（_build_catalog 経由で shelving._format_card が組み立てる）
+    に生の description が漏れない。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    store.create_notebook("physics", description=f"物理の資料 {secret}")
+    root = tmp_path / "docs"
+    root.mkdir()
+    (root / "note.md").write_text("# Note\n\n" + "content " * 20, encoding="utf-8")
+    corpus_dir = tmp_path / "corpus"
+    converter = _FakeConverter(markdown="# 量子力学入門\n\n量子力学の基礎を解説する資料です。\n")
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "量子力学の基礎資料"}')
+    classify_backend = FakeAnswerBackend(canned=_NEW_NOTEBOOK_CLASSIFICATION)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder,
+        _shelve_backend_factory(summarize_backend, classify_backend),
+        corpus_dir, converter=converter, mask=fake_mask,
+    )
+
+    service.shelve(str(root), dry_run=False)
+
+    assert len(classify_backend.calls) == 1
+    assert secret not in classify_backend.calls[0]["prompt"]
+
+
+def test_ask_masks_pre_existing_unmasked_persona_in_prompt(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """ask() は nb["persona"]（DB由来）をそのまま build_ask_prompt へ渡す。永続化時
+    mask 適用前の既存行は未 mask のままの場合があり、ask() のたびにプロンプトへ露出し
+    続ける（digest の title 対称修正と同型の穴）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    store.create_notebook("nb", backend="codex", persona=f"鯨の専門家 {secret}")
+    nb_dir = tmp_path / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text(f"# Doc\n\n{_CHUNK_TEXT}\n", encoding="utf-8")
+    index_notebook(tmp_path, "nb", store, embedder)
+    answer_json = _grounded_raw_answer([1]).text
+    backend = FakeAnswerBackend(canned=answer_json)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(store, embedder, lambda name: backend, tmp_path, mask=fake_mask)
+
+    service.ask("nb", _QUERY_TEXT)
+
+    assert len(backend.calls) == 1
+    assert secret not in backend.calls[0]["prompt"]
+
+
+def test_consult_expert_prompt_masks_pre_existing_unmasked_persona(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """_consult_target() が組み立てる専門家プロンプトへ渡す persona も、既存 DB 行が
+    未 mask のままの場合に露出しうる。consult() 戻り値の routed[].persona も mask 済み
+    であることをあわせて固定する（_consult_target の戻り dict 経由の意図した副次効果）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    _seed_notebook(store, embedder, tmp_path, notebook="nb")
+    store.set_persona("nb", f"鯨の専門家 {secret}")
+    targets = [RouteTarget(notebook="nb", score=0.9, subquery=_QUERY_TEXT, reason="鯨の話題")]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+    backend = FakeAnswerBackend(canned=answer_json)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        librarian=fake_librarian, mask=fake_mask,
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    assert len(backend.calls) == 1
+    assert secret not in backend.calls[0]["prompt"]
+    routed = result["routed"][0]
+    assert secret not in routed["persona"]
+    assert "<REDACTED>" in routed["persona"]
+
+
+def test_consult_masks_target_reason_in_routed_output(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """consult() 戻り値 routed[].reason は司書ルーティングの自由記述（RouteTarget.reason・
+    LLM 出力）をそのまま素通しする。MCP consult の戻り値に載り、shelf を使うエージェント
+    の文脈へ直接流れるため、mask 正本の既知の残存制限を踏まえると分類/ルーティング応答
+    でも secret 混入があり得る（adversarial-verifier 指摘 must#2）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    _seed_notebook(store, embedder, tmp_path, notebook="nb")
+    targets = [
+        RouteTarget(
+            notebook="nb", score=0.9, subquery=_QUERY_TEXT, reason=f"秘密の理由 {secret}"
+        )
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+    backend = FakeAnswerBackend(canned=answer_json)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        librarian=fake_librarian, mask=fake_mask,
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    routed = result["routed"][0]
+    assert secret not in routed["reason"]
+    assert "<REDACTED>" in routed["reason"]
+
+
+def test_consult_masks_target_subquery_in_routed_output_and_expert_prompt(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """consult() 戻り値 routed[].subquery は司書ルーティング応答の同一 JSON から
+    reason と一緒に取り出される兄弟フィールド（RouteTarget.subquery）だが、reason
+    と異なり未 mask のままクライアント出力へ返るだけでなく _answer_with_expert 経由で
+    backend の専門家プロンプトへも投入されるため、reason より露出が広い
+    （adversarial-verifier 再検証の実証済み must）。読み出し点1箇所（_consult_target）で
+    mask した値をクライアント出力・専門家プロンプトの両方に使うことを固定する
+    （digest の persona 修正と対称の設計）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    _seed_notebook(store, embedder, tmp_path, notebook="nb")
+    targets = [
+        RouteTarget(
+            notebook="nb", score=0.9, subquery=f"秘密のクエリ {secret}", reason="鯨の話題"
+        )
+    ]
+    fake_librarian = FakeLibrarian(targets)
+    answer_json = _grounded_raw_answer([1]).text
+    backend = FakeAnswerBackend(canned=answer_json)
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(
+        store, embedder, lambda name: backend, tmp_path,
+        librarian=fake_librarian, mask=fake_mask,
+    )
+
+    result = service.consult(_QUERY_TEXT)
+
+    routed = result["routed"][0]
+    assert secret not in routed["subquery"]
+    assert "<REDACTED>" in routed["subquery"]
+    assert len(backend.calls) == 1
+    assert secret not in backend.calls[0]["prompt"]
+    assert "<REDACTED>" in backend.calls[0]["prompt"]
+
+
+def test_digest_masks_pre_existing_unmasked_persona_in_map_and_reduce_prompts(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    """digest の map/reduce プロンプトは persona（DB由来）をそのまま _digest_one へ
+    渡す。永続化時 mask 適用前の既存 DB 行の persona は未 mask のままの場合があり、
+    title と同型の穴として digest 実行のたびにプロンプトへ露出し続ける
+    （test_digest_masks_pre_existing_unmasked_title_in_map_and_reduce_prompts と対称）。"""
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    store.create_notebook("nb", backend="codex", persona=f"鯨類学者 {secret}")
+    corpus_dir = tmp_path / "corpus"
+    nb_dir = corpus_dir / "nb"
+    nb_dir.mkdir(parents=True)
+    (nb_dir / "doc.md").write_text("# Doc\n\nwhale content here.\n", encoding="utf-8")
+    store.upsert_document(
+        id="doc", notebook="nb", origin="doc.md", origin_type="md",
+        normalized_path="nb/doc.md", converter="raw", added_at="2024-01-01T00:00:00+00:00",
+        title="鯨の資料",
+    )
+    backend = FakeAnswerBackend(
+        canned=[
+            _map_answer([{"text": "学び", "chunks": [1]}]),
+            _reduce_answer([{"text": "学び", "sources": [1]}]),
+        ]
+    )
+
+    def fake_mask(text: str) -> str:
+        return text.replace(secret, "<REDACTED>")
+
+    service = ShelfService(store, embedder, lambda name: backend, corpus_dir, mask=fake_mask)
+
+    service.digest("nb")
+
+    assert len(backend.calls) == 2
+    map_call, reduce_call = backend.calls
+    assert secret not in map_call["prompt"]
+    assert secret not in reduce_call["prompt"]
