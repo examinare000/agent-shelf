@@ -213,3 +213,186 @@ test_boundaries.py の意図的な履歴コメント・CHANGELOG.md の移行事
 
 棚卸し: テストダブルの実シグネチャ結合（と mcp>=2.0.0 の上限なし維持の判断）を
 docs/adr/0003-bind-test-doubles-to-real-sdk-signatures.md へ昇格した。
+
+## fix/mask-description-persona: ADR-0002 残存違反（description/persona）の修正（2026-08-07）
+
+title は fix/prompt-title-mask で既に永続化時＋投影時＋プロンプト構築直前の三重の
+悉皆修正が完了していたが、notebook description と persona には同型の穴が残っていた。
+ブリーフが指定した6箇所（create_notebook・shelve 新規 notebook 作成の永続化時2箇所、
+_build_catalog の投影時1箇所、ask・_consult_target・digest の読み出し直前3箇所）に
+`_masked` ヘルパを適用し、Red→Green を2段階（永続化時→投影時→読み出し時の3ラウンド、
+テストは brief 指定の7本）で実施。全て「正しい理由」（secret がプロンプト/DB値に
+残っていること）で Red になったことを確認済み。
+
+- routing.py/shelving.py/store.py は無変更（ブリーフの境界制約どおり、shelf/service.py
+  と tests/test_service.py のみ変更）。
+- `_masked` は既存の `self._mask(x) if self._mask is not None else x` パターンの
+  一括置換ではなく、今回変更した6箇所限定で使用（ブリーフの明示的なスコープ制約）。
+- 検証: `uv run pytest -q`（1290 passed = 既存1283 + 新規7）・
+  `uv run ruff check --no-cache .`（All checks passed）。
+- 文書更新: SECURITY.md 脅威モデル節（title→title・description・persona へ拡張、
+  ask/consult の専門家プロンプト構築も列挙に追加）・CHANGELOG.md [Unreleased] Security
+  （description は title と異なり更新 API が無く notebook 再作成でのみ更新される旨を
+  明記）・docs/adr/0002-masked-invariant-for-backend-text.md へ「追記（2026-08-07）」節。
+- **棄却した案**: なし（ブリーフの実施順・対象箇所がそのまま実装可能で、代替案の
+  検討を要する判断分岐は発生しなかった）。
+
+### フレッシュレビュー追修正（must 1・should 1、2026-08-07）
+
+上の修正完了後のフレッシュレビューで、悉皆性の見落としが2種類検出された。
+
+- **must（shelver.py の working_catalog 経由の未 mask 流出）**: 上の修正ブリーフは
+  対象を「全て shelf/service.py」に明示限定していたため、shelve() が委譲する
+  `Shelver.plan()`（shelver.py・別モジュール）の working_catalog 経由の流出経路が
+  検討対象から外れていた。分類 LLM 応答（`decision.description`）は取込資料の
+  title/description と異なり「LLM が生成したテキスト」であり mask を一度も通って
+  いない生データである点が、service.py 側の「DB 由来の既存行」ケースとは異なる
+  新しい流出源だった。fix/prompt-title-mask の「関数名の grep だけでは不十分」
+  教訓と同型で、今回は「モジュール境界（service.py 限定）で切った探索範囲」が
+  見落としの原因だった。教訓: mask 不変条件のレビューはモジュール単位ではなく
+  「LLM 出力・DB 由来テキストが次の呼び出しへ渡る全経路」を有向グラフとして
+  追跡する必要がある。
+  修正: `Shelver.__init__` に `mask: Callable[[str], str] | None = None` を追加し、
+  working_catalog へ積む NotebookCard.description にのみ適用（`result.created`
+  ＝永続化用の生データは無変更のまま維持し、永続化前 mask は service.py 側の
+  既存責務を壊さない）。shelving.py（純粋関数層）は無変更。
+- **should（読み出し系の残り2経路）**: `list_notebooks()`（MCP ツール出力）と
+  CLI `shelf persona` 表示（人間向け出力）は、backend へのプロンプト構築点では
+  ないため最初の修正の「backend へ送出されるテキスト」という文言の字面では
+  対象外に見えたが、レビューは「AI エージェントの文脈へ直接流れる／人間の目に
+  触れる」という実質的な露出面で捉えて指摘した。CLI persona 表示は
+  fix/persona-lazy-service（`_build_service` を表示のみの分岐で呼ぶと実モデル DL
+  で恒久ハングする既知の回帰）の制約と両立させる必要があり、`shelf.masking.mask`
+  を関数内 import で直接使う軽量経路（`_build_service` 内の `from shelf.masking
+  import mask` と同じ形）で解いた。既存の `test_display_only_path_does_not_build_service`
+  ガードテストは無変更のまま green を維持。
+- 検証: `uv run pytest -q`（1293 passed = 1290 + 新規3）・
+  `uv run ruff check --no-cache .`（All checks passed）。routing.py/shelving.py/
+  store.py は無変更（shelver.py・service.py・cli.py のみ変更）。
+- 文書更新: SECURITY.md（shelve の増分カタログ・MCP list_notebooks・CLI persona
+  表示を対象に追記）・CHANGELOG.md [Unreleased] Security に新エントリ追加・
+  docs/adr/0002-masked-invariant-for-backend-text.md の追記節に、今回の見落とし
+  原因（モジュール境界で切った探索範囲）と「backend へ送出される全テキスト」の
+  解釈範囲（MCP ツール戻り値・CLI 表示を含む）の明確化を追加。
+- **棄却した案**: なし。
+
+### adversarial-verifier REJECT からの最終ラウンド追修正（2026-08-07）
+
+上のフレッシュレビュー追修正の完了宣言を adversarial-verifier が REJECT した。
+実証付きの穴1件（dry_run の JSON 出力）と、文書の過大宣言（不変条件の対象を
+2項目の列挙で閉じてしまい実態を過小に見せていた）が指摘された。
+
+- **見落としの原因**: dry_run 分岐（`shelve(dry_run=True)`）はこれまでのどの
+  ラウンドのテストも通していなかった。`test_shelve_masks_created_notebook_description_before_persisting`
+  等は全て `dry_run=False` の非 dry-run 経路のみを検証しており、`plan.created`
+  （shelver.py が永続化用に意図的に保持する生 description）を dry_run=True の
+  JSON レスポンスへそのまま積む分岐が、mask 適用漏れに気づけないまま素通しで
+  残っていた。「永続化前に mask する」という直感が強すぎて、「永続化せずに
+  そのままクライアントへ返す」経路（dry-run は非破壊なので副作用が無い＝
+  安全、という誤った連想）を見落としたのが根本原因。reason フィールド
+  （分類/ルーティング LLM の自由記述）も、description/persona/title が
+  「DB 由来の既存データ」という同じカテゴリで扱われ続けたのに対し、reason は
+  「LLM が都度生成する自由記述」という異なるカテゴリのデータであり、
+  「DB 由来テキストの mask 漏れ」という探索フレームでは最初から検討対象に
+  入っていなかった。
+- **検証者の残存リスク指摘（4点）**: (1) dry_run の description/reason 未 mask
+  （今回修正）、(2) consult 戻り値 routed[].reason 未 mask（今回修正）、
+  (3) CLI persona 表示の `from shelf.masking import mask` は wheel 配布時に
+  `distill/` ディレクトリを含まない場合に ImportError となりうる — これは
+  本 ADR の修正群固有の問題ではなく `shelf/masking.py` の importlib 読み込み
+  方式自体が持つ既存の系統的問題（pyproject.toml のパッケージデータ配布設定に
+  依存）であり、本ラウンドのスコープ外として現状維持（後続課題）、
+  (4) mask() の冪等性（二重適用しても安全という前提）は 50 万件規模のランダム
+  文字列ファズテストで反例ゼロと別途確認済み — 二重防御設計の安全性根拠として
+  有効。
+- **教訓**: mask 不変条件の悉皆確認は「backend へのプロンプト」だけでなく
+  「クライアントへ返る LLM 生成フィールド（description/reason）」も同一の
+  データ追跡グラフに含める必要がある。「DB 由来の既存データ」と「LLM が
+  都度生成する自由記述」は生成元が異なるため、片方のカテゴリでの探索完了を
+  もう片方の完了と混同しないこと。
+- 修正: `shelve()` の dry_run 分岐で `created_notebooks[*].description` と
+  `plan[*].reason` に `self._masked` を適用、`_consult_target()` の `reason` に
+  `self._masked` を適用。
+- 検証: `uv run pytest -q`（1296 passed = 1293 + 新規3）・
+  `uv run ruff check --no-cache .`（All checks passed）。
+- 文書更新: SECURITY.md（不変条件の対象を「クライアント向け読み取り出力全般」
+  という開いた書き方へ変更し、dry-run JSON・consult reason を明記。加えて
+  「既知の制限」節にスコープ外事項2点を開示: ①索引時の要約チャンク経由の
+  露出は投影時二重防御の対象外、②`ShelfService(shelver=...)` 直接注入は
+  mask 配線をバイパスする死んだ注入口）・CHANGELOG.md [Unreleased] Security・
+  docs/adr/0002-masked-invariant-for-backend-text.md 追記節を同様に更新。
+- **棄却した案**: なし。
+
+### adversarial-verifier 再検証 REJECT からの3度目の追修正（2026-08-07・収束方向）
+
+再検証は「収束方向」としつつ、実装の穴1件（`routed[*].subquery` 未 mask）と
+文書の過大宣言・事実誤りを指摘した。
+
+- **見落としの原因（3度目の再発）**: `reason` を mask した際、同一のルーティング
+  応答 JSON（routing.py:126-136）から一緒に取り出す兄弟フィールド `subquery` の
+  掃引を行わなかった。fix/prompt-title-mask で確立した「関数名の grep ではなく
+  同一データの全流出先を追跡する」教訓が、今回は「同一 JSON 応答内の兄弟
+  フィールド」という単位で3度目の再発をした（1度目: title のプロンプト直渡し
+  経路、2度目: shelver.py のモジュール境界、3度目: 同一 JSON の兄弟フィールド）。
+  `subquery` はクライアント出力に加えて専門家プロンプトへも投入されるため
+  `reason` より実害が大きい。教訓: LLM 応答の1フィールドを mask 修正する際は、
+  同じパース結果オブジェクトが持つ他のフィールドも同時に洗い出す。
+- **文書の過大宣言（過小の反動）**: 前々回のレビューで「列挙で閉じる過小」を
+  指摘されたことへの反動で、前回の追記が「クライアントへ返る全ての LLM 生成
+  フィールドは mask 済み」という実装を超える過大宣言になっていた（answer/
+  insights/citations は mask していない）。過小と過大の両方を避けるため、対象を
+  「ルーティング/分類のメタ情報フィールド」という性質で区切り、回答本文は
+  「索引時の入力チャンク mask を根拠とした明示的除外」として書く方式に変更した。
+- **事実誤りの訂正**: 前回追記した「再 add または再 index で自然に mask 済み値へ
+  更新される」が虚偽だった。indexer は `documents.description` を書き換えない
+  （upsert/update 呼び出しがない）ため、単純な再 index では更新されない。実際に
+  更新されるのは `shelf add --desc` 明示指定時、または `auto_summary=True`
+  （既定）での再投入時のみで、`shelf ingest` は `auto_summary=False` のため
+  更新されない。SECURITY.md・ADR-0002 の該当箇所を訂正した。
+- **packaging 制約の新規開示**: `shelf persona` 表示を含む masking 依存機能は
+  `distill/extract.py`（`<リポジトリルート>/distill/`）の実在に依存するが、
+  `pyproject.toml` の `packages = ["shelf"]` は wheel に `distill/` を含めない。
+  リポジトリ直接 checkout・`SHELF_EXTRACT_PY` 指定以外の配布形態（pip 経由の
+  wheel インストール等）では masking 依存機能が動作しないという既存の系統的
+  制約を SECURITY.md 既知の制限へ新規開示した。
+- **検証者が誤検知として棄却した項目**: shelve notes の `raw_name`（フォールバック
+  notebook 名）は SECRET_RES 系正規表現（`sk-`/`ghp_`/`AKIA` 等）が要求する文字
+  パターンと `validate_notebook_name` が許可する文字集合（英小文字・数字・-/_
+  のみ）が構造的に排他であるため、secret を含み得ないと判定され false positive
+  として棄却された。
+- 修正: `_consult_target()` で `target.subquery` を読み出し点1箇所で
+  `self._masked` に通し、クライアント出力（`routed[*].subquery`）・専門家
+  プロンプト（`_answer_with_expert` の question 引数）の両方に使う。
+- 検証: `uv run pytest -q`（1297 passed = 1296 + 新規1）・
+  `uv run ruff check --no-cache .`（All checks passed）。
+- 文書更新: SECURITY.md（不変条件をメタ情報フィールドへ絞り回答本文を明示的
+  除外・事実誤りの訂正・packaging 制約の新規開示）・CHANGELOG.md
+  [Unreleased] Security・docs/adr/0002-masked-invariant-for-backend-text.md
+  「追記2」節を同様に更新。
+- **棄却した案**: なし。
+
+## Track S 完了: adversarial-verifier 最終判定 ACCEPT（2026-08-07）
+
+3 ラウンドの反証検証で実証された穴 3 件（dry-run description / dry-run reason・
+consult reason / consult subquery）が全て塞がれ、文書の宣言範囲（メタ情報
+フィールドに限定・回答本文は根拠付き明示的除外）が実装と一致したことを検証者が
+過大・過小の両方向からの悉皆列挙で確認し ACCEPT。最終状態: 1297 passed・
+ruff clean・追加テスト 14 本・テスト削除 0 行。新テストの非空虚性は `_masked`
+恒等化プラグインで failed になることを検証者が独立確認済み。
+
+検証者の最終ラウンド指摘（後続課題として記録、本トラックのスコープ外）:
+- **engines の stderr 素通し（新規指摘）**: `ask()` の `{"error": f"backend
+  failed: {expert.error}"}`（service.py:394）と `consult()` の `warning`
+  （service.py:1571）は `RawAnswer.error` を素通しする。コードコメントは
+  「engines 側で安全な文言に整形済み」とするが、実際は `summarize_stderr` が
+  サブプロセス stderr の先頭行をそのまま連結しており「整形済み」は過大表現。
+  ADR-0002 の現行スコープ外だが後続課題に値する。
+- **pyright 既存エラーの実数**: CI への pyright 導入（Track B）のスコープは
+  「2 件」ではなく実質 11 件超（convert.py 4・doctor.py 1・emit_mcp.py 1・
+  service.py 3・store.py 1 ほか。`"UTC" is unknown import symbol` 2 件は
+  検証環境の Python 解決による artifact でコード欠陥ではない）。
+- **`_masked` の戻り型**: `str | None -> str | None` のため service.py:1550
+  （subquery を `_answer_with_expert(question: str)` へ渡す箇所）で pyright
+  エラーが 1 件新規発生。実行時は routing.py の isinstance 検証 + フォール
+  バック構成（subquery=question）で str が保証される。@overload 追加または
+  当該箇所のインライン条件式で解消可能（Track B で扱う）。
