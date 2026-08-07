@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **fail-soft 箇所への debug ログと SHELF_LOG_LEVEL 環境変数**: 例外を握り潰して無音の箇所（summary 生成失敗・shelve 分類失敗・PDF テキスト層検出失敗）へ logger.debug() を追加。`SHELF_LOG_LEVEL` 環境変数（"DEBUG"/"INFO"/"WARNING" 等、大文字小文字許容）で logging レベルを制御可能にし、問題診断を容易にした。未設定時は現状と同一の無音状態。制御フロー変更なし。
+- **pymupdf・pymupdf4llm の下限バージョン指定**: uv.lock の実解決値（1.28.0）に合わせて `pyproject.toml` に `>=1.28.0` 下限を明示し、予期しない解決変動を防止。
+- **[tool.pytest.ini_options] 新設**: pytest テスト対象を `tests/` に限定し、SWIG 由来（pymupdf）の DeprecationWarning のみを ignore するフィルタを追加。これにより無駄な警告を除外しつつプロジェクト側の警告は検出可能に。
 - **ruff の lint ルールを拡大（I: isort・B: flake8-bugbear）**: 従来固定していた
   `["E4", "E7", "E9", "F"]` に `"I"`/`"B"` を追加。import 順の自動整形（I001、
   6ファイル）に加え、無意味化していた `# noqa: BLE001`（BLE ルールを select

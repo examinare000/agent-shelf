@@ -602,3 +602,67 @@ chmod +x する）のため、3者中最も影響が大きい実穴だった。
 - 検証: `uv run pytest -q`（1307 passed = 1305 + 新規2: claude 側
   parametrize 2ケース）・`uv run ruff check --no-cache .`（All checks
   passed）・`uv run pyright shelf/`（0 errors）。git commit は行っていない。
+
+## ci/lint-typecheck-hardening: Track C 衛生系（未コミット差分）の AI アンチパターンレビュー（2026-08-07・WARNING）
+
+review-ai-antipattern による未コミット差分（15e4f90 起点、CHANGELOG.md /
+pyproject.toml / shelf/convert.py / shelf/service.py / uv.lock）の read-only
+レビュー。filterwarnings パターンの精度実測（`.venv` で `import pymupdf` し
+実際の DeprecationWarning 文言 `builtin type SwigPyPacked/SwigPyObject/
+swigvarlink has no __module__ attribute` を確認、ignore 正規表現が過不足なく
+一致）・pymupdf/pymupdf4llm 下限 `>=1.28.0` が uv.lock 解決値 1.28.0 と一致・
+`testpaths = ["tests"]` が唯一のテストディレクトリと一致し CI の
+`uv run pytest -q` へ影響なし、はいずれも CLEAR。
+
+- **[should] logger.debug 3箇所（convert.py:234, service.py:785,1240）が
+  現状ランタイムでは常に no-op**: リポジトリ全体（tests/ 除く）に
+  `logging.basicConfig`/`setLevel`/`addHandler` が一切存在しないことを grep
+  で確認し、実際に `logger.isEnabledFor(logging.DEBUG)` が `False`（実効
+  レベル 30=WARNING、ハンドラなし）であることを実測。stdlib
+  `Logger.debug()` は `isEnabledFor` が False だと `sys.exc_info()` すら
+  呼ばずに即 return するため、これら3箇所は誰も明示的に logging を設定しない
+  限り一切出力されない。CHANGELOG.md:11 の「問題診断を容易にした」という
+  効能主張は、エントリポイント（server.py/cli.py）にログレベル設定手段が
+  存在しない現状では過大。ライブラリ側で自前に basicConfig すべきでない
+  （呼び出し側の責務）という一般則は妥当なので、対処は CHANGELOG の主張を
+  「今後 logging 設定を追加すれば診断できる下地」程度に弱めるか、
+  server.py/cli.py 側に `-v`/env var での DEBUG 有効化手段を追加するかの
+  いずれか。
+- **[should] CHANGELOG.md が4項目中1項目しか記述していない**: 実際の変更は
+  (1) pymupdf/pymupdf4llm 下限 >=1.28.0 化、(2) [tool.pytest.ini_options]
+  新設（testpaths + filterwarnings）、(3) fail-soft 3箇所への debug ログ、
+  (4) 本 CHANGELOG 追記自体、の4点だが Unreleased セクションには (3) のみ
+  記載。(1)(2) は grep で CHANGELOG.md 全体を検索しても言及ゼロ。他の
+  Unreleased エントリ（CI マトリクス拡張・CONTRIBUTING 整合など同程度の
+  「内部/開発者向け」変更）は個別記載されており、粒度の一貫性を欠く。
+- **確認して問題なしとした点**: exc_info=True によるトレースバック保持が
+  PR#13 で発見された Windows WinError32（pymupdf 生例外の `__context__`
+  連鎖がファイルハンドル延命に寄与した疑い、上記「実バグ4件」の3件目参照）
+  を再燃させないか検討したが、上記の no-op 実測（isEnabledFor gate で
+  `sys.exc_info()` 自体が呼ばれない）により実効上リスクなしと判断。仮に
+  将来 DEBUG を有効化しても、この関数は except 節内で return するのみで
+  raise による伝播を伴わないため、trial-log 記載のケース（raise が
+  except の外まで `__context__` を連鎖させた経路）とは異なる。
+  logger.debug へ path・exc_info を出す設計自体は「ユーザーへは汎用
+  メッセージ、詳細は内部ログ」という agent-rules 12番の方針と整合し、
+  ConversionError docstring の「安全なメッセージのみ」はユーザーへの
+  例外伝播チャネルの話であり内部ログチャネルとは別軸のため矛盾しない。
+  format 文字列引数（%s の個数と渡す引数）も3箇所とも一致（メイン側修正済み
+  の指摘通り）。
+
+## Track C: 衛生系(下限指定・pytest 設定・fail-soft ログ)の経緯（2026-08-07）
+
+- pymupdf/pymupdf4llm へ >=1.28.0(uv.lock 実解決値)、[tool.pytest.ini_options]
+  新設(testpaths + SWIG 由来 DeprecationWarning のみ ignore、パターン精度は
+  レビュアーが実測検証)、無音 fail-soft 3 箇所へ logger.debug 追加。
+- **実装エージェントの初版に 2 種の欠陥をメイン/レビューで検出・修正**:
+  (1) logger.debug の format 引数不整合 2 件(%s の数と引数の不一致。debug 有効時
+  に Logging error になる — pytest/ruff/pyright のいずれも検出しない盲点。
+  メイン側で修正しスモークで実挙動確認)。(2) ログレベル制御手段が皆無で
+  debug ログが恒久 no-op(アンチパターン審査 WARNING)→ SHELF_LOG_LEVEL env
+  による basicConfig 制御を追加(不正値は既定へフォールバック、stderr 出力、
+  未設定時は完全に従来挙動)。
+- 追加修正の追加修正: coder の _log_level_env が私有 API logging._nameToLevel を
+  使用 → 公開 API logging.getLevelNamesMapping()(3.11+)へ差し替え(メイン)。
+- 教訓: ログ呼び出しの format 引数は静的チェック(現行 ruff ルールセット)の
+  盲点。G ルール(flake8-logging-format)採用が将来の検討候補。
