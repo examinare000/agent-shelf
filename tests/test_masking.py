@@ -2,12 +2,12 @@
 
 drift ガード（import 経路の健全性）に加えて、distill/extract.py の mask()
 が持つ 5 つの regex（sk-/ghp_系/AKIA/汎用 password 等/JWT）の実挙動を
-positive/negative ケースで固定する。extract.py は agent-recall と共有される
-改変禁止の既存資産なので、ここではパターンの追加・修正は行わず、現行の
-挙動をそのままテストとして記録する（=仕様のスナップショット）。
+positive/negative ケースで固定する。extract.py は agent-recall 由来の共有
+資産であり、ここではパターンの追加・修正は行わず、現行の挙動をそのまま
+テストとして記録する（=仕様のスナップショット）。
 
 PII（メール・電話・住所）はマスク対象外（蔵書コーパスでは誤マスクの害が
-大きい）。パターン追加は agent-recall との同期方針決定が必要。
+大きい）。パターン追加や規則変更時は agent-recall 側との同期を検討してください。
 """
 from __future__ import annotations
 
