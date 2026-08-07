@@ -102,7 +102,7 @@ def index_notebook(
             chunks = chunk_markdown(
                 md, notebook=notebook, doc_id=doc_id, source_path=source_path, mask=mask
             )
-        except Exception as exc:  # noqa: BLE001 - 1ファイルのチャンク失敗で全体を止めない
+        except Exception as exc:  # 1ファイルのチャンク失敗で全体を止めない
             existing_source_files.add(source_path)
             errors.append(f"{source_path}: {exc}")
             continue

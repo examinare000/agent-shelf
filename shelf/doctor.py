@@ -130,7 +130,7 @@ def check_db_open(
         )
     try:
         store = store_factory(db_path)
-    except Exception as e:  # noqa: BLE001 - 想定外の失敗も安全に要約して返す診断のため
+    except Exception as e:  # 想定外の失敗も安全に要約して返す診断のため
         return CheckResult(
             name="db_open", ok=False, detail=f"DB を開けませんでした: {type(e).__name__}"
         )

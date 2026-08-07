@@ -18,7 +18,6 @@ import pytest
 
 from shelf.convert import ConversionError, ConvertResult, convert_file, convert_url, pick_converter
 
-
 _CHAPTER_BODY_TEMPLATE = (
     "This is the body content of chapter {i}. It contains enough text to exceed "
     "the minimum character threshold used by the pipeline to distinguish "

@@ -28,17 +28,26 @@ line-length = 100
 target-version = "py311"
 
 # ruff 0.16.0 でデフォルトの有効ルールが拡大されたため、従来のデフォルトを明示して固定する。
-# 新ルール群の採用（59件の指摘対応）はバージョンアップとは別タスクで判断する。
+# I（isort）/B（bugbear）は CI/lint 強化タスクで採用済み。他の新ルール群の採用は別タスクで判断する。
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+# distill/extract.py は agent-recall 由来の共有資産のため、整形のみの diff が
+# 上流との同期ノイズになる import 並べ替え（I）を適用しない。
+[tool.ruff.lint.per-file-ignores]
+"distill/extract.py" = ["I"]
 
 # エディタ(Pyright)が shelf/.venv を解決できるようにする（実行系は uv が解決）
+# include を shelf/ に絞る: tests/ は FakeLibrarian 等 Protocol の構造的型付けに
+# 由来する既知のノイズが多く、CI の型チェック対象は本体コードに限定する。
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+include = ["shelf"]
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.411",
     "pytest>=8.0",
     "ruff>=0.16.0",
 ]

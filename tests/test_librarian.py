@@ -11,7 +11,6 @@ from pathlib import Path
 from shelf.librarian import Librarian
 from shelf.ports import NotebookCard, RawAnswer, RouteTarget
 from shelf.routing import ROUTING_SCHEMA
-
 from tests.fakes import FakeAnswerBackend
 
 

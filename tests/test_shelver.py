@@ -14,7 +14,6 @@ from pathlib import Path
 from shelf.ports import FileSummary, NotebookCard, RawAnswer
 from shelf.shelver import Shelver
 from shelf.shelving import CLASSIFY_SCHEMA
-
 from tests.fakes import FakeAnswerBackend
 
 
