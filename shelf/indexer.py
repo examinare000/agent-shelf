@@ -182,7 +182,11 @@ def index_notebook(
 
         if rows:
             embeddings = embedder.embed_documents([r["text"] for r in rows])
-            for row, embedding in zip(rows, embeddings):
+            # Embedder.embed_documents の契約（embedder.py の Protocol docstring
+            # 参照: texts と同数・同順の embedding 列を返す）を前提にしている。
+            # rows 側も直前で同じ texts から生成しているため長さは構造的に一致する
+            # はずで、食い違いは実装欠陥を示すので strict=True で早期に検知する。
+            for row, embedding in zip(rows, embeddings, strict=True):
                 row["embedding"] = embedding
             store.upsert_chunks(rows)
         store.set_file_state(

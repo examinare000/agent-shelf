@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlparse
 
 
@@ -222,7 +223,10 @@ def _pdf_text_layer_lengths(path: Path) -> list[int]:
             if doc.needs_pass or doc.page_count == 0:
                 return []
             indices = _sample_page_indices(doc.page_count)
-            return [len(doc[idx].get_text().strip()) for idx in indices]
+            # WHY cast: pymupdf に型スタブが無く、get_text() は option 引数の値に
+            # よって str/list/dict のいずれも返しうる汎用シグネチャとして推論される。
+            # 引数省略時（既定 option="text"）は実行時は必ず str を返す。
+            return [len(cast(str, doc[idx].get_text()).strip()) for idx in indices]
     except Exception:
         return []
 
@@ -246,7 +250,13 @@ def _convert_pdf(path: Path) -> ConvertResult:
     kwargs = {"use_ocr": False} if skip_ocr else {}
 
     # page_chunks=True で各ページを分割
-    chunks = pymupdf4llm.to_markdown(str(path), page_chunks=True, **kwargs)
+    # WHY cast: pymupdf4llm.to_markdown に型スタブが無く、page_chunks の値で
+    # str/list[dict] のどちらを返すかが決まる（page_chunks=True では list[dict]
+    # を返す実装）。pyright は両方の可能性を推論した合併型しか持てないため、
+    # 呼び出し時の実引数から確定する形へ明示する。
+    chunks = cast(
+        "list[dict]", pymupdf4llm.to_markdown(str(path), page_chunks=True, **kwargs)
+    )
     markdown = _insert_page_markers(chunks)
 
     # 100 字未満チェック。OCR は同梱していないため、スキャン PDF の場合の
@@ -276,8 +286,16 @@ def _convert_reflow(path: Path) -> ConvertResult:
     import pymupdf4llm
 
     safe_error: ConversionError | None = None
+    # WHY 空文字初期化: try が例外を投げた場合、この行の代入は実行されず markdown は
+    # 未束縛のままになる（pyright: reportPossiblyUnboundVariable）。except は必ず
+    # safe_error を設定し、直後の `if safe_error is not None: raise` で必ず抜けるため
+    # 実行時にこの初期値が使われることはないが、pyright は例外パスと safe_error の
+    # 対応関係まで追跡できないため、型上は常に束縛済みにしておく。
+    markdown = ""
     try:
-        markdown = pymupdf4llm.to_markdown(str(path), page_chunks=False)
+        # WHY cast: pymupdf4llm.to_markdown に型スタブが無く、page_chunks=False では
+        # 実装上必ず str を返す（True の場合の list[dict] 分岐は _convert_pdf 側）。
+        markdown = cast(str, pymupdf4llm.to_markdown(str(path), page_chunks=False))
     except Exception:
         # pymupdf.FileDataError 等の例外メッセージは絶対パスを含む
         # （実測: "Failed to open file '<絶対パス>' as type epub."）。
@@ -384,7 +402,11 @@ def convert_url(url: str, timeout: int = 30) -> ConvertResult:
         if len(data) > MAX_SIZE:
             raise ConversionError("ファイルサイズが 20MB を超えています")
     except urllib.error.URLError as e:
-        raise ConversionError(f"URL の取得に失敗しました: {e}")
+        # WHY from e: ここは _convert_reflow のような「メッセージには出さず生例外を
+        # 隠す」設計ではなく、str(e) を ConversionError のメッセージへ既に埋め込んで
+        # いる（安全な要約は完了済み）。よって from e でトレースバック連鎖を明示しても
+        # 新たな情報漏洩は生まない。連鎖を明示すること自体が診断性を保つ。
+        raise ConversionError(f"URL の取得に失敗しました: {e}") from e
 
     # 一時ファイルに書き込み→ markitdown で変換
     with tempfile.NamedTemporaryFile(
