@@ -10,7 +10,7 @@ subprocess・config を一切知らないことで、FakeAnswerBackend だけで
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from shelf.ports import AnswerBackend, FileSummary, NotebookCard, ShelvePlan
@@ -41,10 +41,15 @@ class Shelver:
         *,
         workdir: Path,
         notebook_backend: str,
+        mask: Callable[[str], str] | None = None,
     ) -> None:
         self._backend = backend
         self._workdir = workdir
         self._notebook_backend = notebook_backend
+        # working_catalog へ積む新規 notebook の description（分類 LLM 応答由来。
+        # mask 未適用）が次ファイルの分類プロンプトへ生で流出しないための防御
+        # （ADR-0002。shelving.py 側は純粋関数のまま変更しない）。
+        self._mask = mask
 
     def plan(
         self, summaries: Sequence[FileSummary], catalog: Sequence[NotebookCard]
@@ -86,11 +91,17 @@ class Shelver:
             if step.note is not None:
                 result.notes.append(step.note)
             if step.new_notebook is not None:
+                # result.created（永続化用）は生の description を保持する。
+                # 永続化前の mask は呼び出し元（service.py の shelve()）の責務であり、
+                # ここで mask してしまうと二重適用の帳尻合わせが呼び出し元に漏れる。
                 result.created.append(step.new_notebook)
+                description = step.new_notebook.description
+                if self._mask is not None:
+                    description = self._mask(description)
                 working_catalog.append(
                     NotebookCard(
                         name=step.new_notebook.name,
-                        description=step.new_notebook.description,
+                        description=description,
                         persona=None,
                         doc_count=0,
                     )

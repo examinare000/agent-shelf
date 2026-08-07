@@ -360,6 +360,18 @@ class ShelfService:
         available = [row["name"] for row in self._store.list_notebooks()]
         return {"error": f"unknown notebook: {notebook}. available: {available}"}
 
+    def _masked(self, text: str | None) -> str | None:
+        """ADR-0002 の残存違反修正（description/persona/reason）専用の mask ヘルパ。
+
+        既存箇所は `self._mask(x) if self._mask is not None else x` を都度書く流儀
+        だが、その一括置換は本 ADR の修正対象箇所（description/persona/reason の
+        永続化時・投影時・クライアント向け読み取り出力）に限定し、無関係な既存箇所
+        の書き換えはスコープ外とする。
+        """
+        if text is None or self._mask is None:
+            return text
+        return self._mask(text)
+
     # -- ask -----------------------------------------------------------------
 
     def ask(self, notebook: str, question: str) -> dict:
@@ -372,7 +384,7 @@ class ShelfService:
             return self._unknown_notebook_error(notebook)
 
         backend_name = nb["backend"] or self._default_backend
-        persona = nb["persona"]
+        persona = self._masked(nb["persona"])
 
         expert = self._answer_with_expert(notebook, question, persona, backend_name)
         if not expert.ok:
@@ -682,7 +694,7 @@ class ShelfService:
         return [
             {
                 "notebook": row["name"],
-                "description": row["description"],
+                "description": self._masked(row["description"]),
                 "backend": row["backend"],
                 "sources": row["documents"],
                 "chunks": row["chunks"],
@@ -700,7 +712,7 @@ class ShelfService:
         validate_notebook_name(name)
         if backend is not None:
             self._backend_factory(backend)
-        self._store.create_notebook(name, description=description, backend=backend)
+        self._store.create_notebook(name, description=self._masked(description), backend=backend)
 
     # -- description（要約）自動生成 -----------------------------------------
 
@@ -1137,7 +1149,10 @@ class ShelfService:
                 if self._shelver is None:
                     backend = self._backend_factory(self._shelve_backend)
                     self._shelver = Shelver(
-                        backend, workdir=self._corpus_dir, notebook_backend=self._shelve_backend
+                        backend,
+                        workdir=self._corpus_dir,
+                        notebook_backend=self._shelve_backend,
+                        mask=self._mask,
                     )
         return self._shelver
 
@@ -1267,12 +1282,16 @@ class ShelfService:
                         "notebook": a.notebook,
                         "new_notebook": a.new_notebook,
                         "summary": a.summary,
-                        "reason": a.reason,
+                        "reason": self._masked(a.reason),
                     }
                     for a in plan.assignments
                 ],
                 "created_notebooks": [
-                    {"notebook": c.name, "description": c.description, "backend": c.backend}
+                    {
+                        "notebook": c.name,
+                        "description": self._masked(c.description),
+                        "backend": c.backend,
+                    }
                     for c in plan.created
                 ],
                 "skipped": skipped,
@@ -1282,7 +1301,7 @@ class ShelfService:
 
         for spec in plan.created:
             self._store.create_notebook(
-                spec.name, description=spec.description, backend=spec.backend
+                spec.name, description=self._masked(spec.description), backend=spec.backend
             )
 
         converted_by_origin = {c.origin: c for c in converted}
@@ -1368,8 +1387,8 @@ class ShelfService:
         return [
             NotebookCard(
                 name=row["name"],
-                description=row["description"],
-                persona=row["persona"],
+                description=self._masked(row["description"]),
+                persona=self._masked(row["persona"]),
                 doc_count=row["documents"],
                 tags=tuple(tags_by_notebook.get(row["name"], ())),
                 titles=(
@@ -1519,13 +1538,20 @@ class ShelfService:
         """
         nb = self._store.get_notebook(target.notebook) or {}
         backend_name = nb.get("backend") or self._default_backend
-        persona = nb.get("persona")
+        persona = self._masked(nb.get("persona"))
+        # subquery は reason と同一のルーティング LLM 応答 JSON から取り出す兄弟
+        # フィールドで、mask を一度も通っていない自由記述である点は同じだが、
+        # クライアント出力に加えて専門家プロンプト（_answer_with_expert の
+        # question 引数）へも投入されるぶん reason より露出が広い。読み出し点
+        # 1箇所で mask した値をクライアント出力・専門家プロンプトの両方に使う
+        # （digest の persona 修正と対称の設計）。
+        subquery = self._masked(target.subquery)
 
-        expert = self._answer_with_expert(target.notebook, target.subquery, persona, backend_name)
+        expert = self._answer_with_expert(target.notebook, subquery, persona, backend_name)
         return {
             "notebook": target.notebook,
-            "reason": target.reason,
-            "subquery": target.subquery,
+            "reason": self._masked(target.reason),
+            "subquery": subquery,
             "score": target.score,
             "backend": backend_name,
             "persona": persona,
@@ -1564,7 +1590,7 @@ class ShelfService:
         # 空なら notebook 自体の backend（さらに空ならサービス全体既定）へフォールバック
         # する（router_backend と同じ「空=呼び出し側でフォールバック」流儀）。
         backend_name = self._digest_backend or nb["backend"] or self._default_backend
-        persona = nb["persona"]
+        persona = self._masked(nb["persona"])
 
         if doc_id is not None:
             doc = self._store.get_document(doc_id)

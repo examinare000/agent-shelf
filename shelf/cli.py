@@ -685,7 +685,13 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 persona = nb.get("persona")
                 if persona:
-                    print(f"ペルソナ ({args.notebook}): {persona}")
+                    # _build_service()（実 FastEmbedEmbedder 等の重い依存構築）は
+                    # 表示のみの分岐で呼んではならない（fix/persona-lazy-service）。
+                    # 既存 DB 行の未 mask persona がそのまま表示されないよう、
+                    # 軽量な shelf.masking.mask を表示直前にだけ通す（ADR-0002）。
+                    from shelf.masking import mask
+
+                    print(f"ペルソナ ({args.notebook}): {mask(persona)}")
                 else:
                     print(f"ペルソナ ({args.notebook}): (未設定)")
 
