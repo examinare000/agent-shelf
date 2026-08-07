@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **ruff の lint ルールを拡大（I: isort・B: flake8-bugbear）**: 従来固定していた
+  `["E4", "E7", "E9", "F"]` に `"I"`/`"B"` を追加。import 順の自動整形（I001、
+  6ファイル）に加え、無意味化していた `# noqa: BLE001`（BLE ルールを select
+  していないため常に無効だった、shelf/ 配下5箇所）を削除した。`distill/extract.py`
+  は agent-recall と共有する上流資産のため、整形による同期 diff ノイズを避ける
+  目的で `[tool.ruff.lint.per-file-ignores]` により I ルールを除外し対象外とした。
+- **CI に Python 3.11/3.13 のマトリクスと pyright 型チェックを追加**: 既存の
+  ubuntu/windows × 単一 Python 版から ubuntu/windows × (3.11, 3.13) の4組合せへ拡大
+  （`requires-python = ">=3.11"` の下限・上位版の両方を CI で検証）。pyright は
+  静的解析のため実行時 Python 差では結果が変わらないので ubuntu×3.11 の1点のみで
+  実行（`uv run pyright shelf/`。tests/ は Protocol の構造的型付けに由来する既知
+  ノイズが多いため対象外）。dev 依存に `pyright` を追加。
+- **CONTRIBUTING.md を実態へ整合**: 「linting and formatting checks」の記載を
+  「linting checks（ruff format は本プロジェクトでは不採用）」へ修正し、
+  新規導入した型チェック（pyright）の実行方法を追記。
 - **mcp SDK を 2.0 系へ更新**: Dependabot 更新（1.28.1→2.0.0）が `mcp.server.fastmcp`
   モジュール削除により CI を破壊していたため、`mcp>=1.0.0` から `mcp>=2.0.0` へ最低要求を
   引き上げ、v2 の破壊的変更に追従した。`FastMCP` クラスは `mcp.server.mcpserver.MCPServer`
@@ -19,6 +34,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport_security=...)` のキーワード引数として渡す方式に変更。
 
 ### Fixed
+- **lint/型チェック強化（ruff B905・pyright）に伴う細い実穴を2件修正**:
+  `indexer.py` の chunk 埋め込み対応付け `zip(rows, embeddings)` に `strict=True`
+  を付けたところ、Embedder が契約（入力 texts と同数・同順の embedding を返す。
+  `embedder.py` の Protocol docstring に明文化）に違反した場合に静かな取り違えで
+  はなく即座に検知するようになった（過不足どちらの方向も検知することをテストで
+  固定）。`service.py` の `_summarize_for_shelve` は、title の mask 呼び出しが
+  try ブロック内にあったため mask 自身が例外を投げるとフォールバック return で
+  `masked_title` が未束縛のまま参照される `UnboundLocalError` になる実穴があった
+  （pyright: reportPossiblyUnboundVariable で検出）。mask 呼び出しを try の外側へ
+  移し、常に束縛済みにした。この結果 title の mask 失敗は fail-closed（例外が
+  そのまま伝播）になる。これは同ファイル内 `_resolve_description`（summary 生成
+  失敗として fail-open に扱う既存設計）とは意図的に異なる選択で、「分類プロンプト
+  へ必ず使われる title を mask できないまま処理を続けるより安全側」という判断
+  （docstring に明記）。伝播粒度も明記した: `shelve()` のディレクトリ一括投入
+  では、この fail-closed により1ファイルの title mask 失敗がバッチ全体を中断させ
+  全ファイル未投入で終わる（`ConversionError` 等の1ファイル固有エラーが per-file
+  収集されループ継続するのとは対照的）。mask 関数自体の破損はファイル個別ではなく
+  バッチ内全ファイルに及ぶ系統的障害であるため、部分投入より全体停止を安全側として
+  選んでいる。
+- **emit_mcp: url 未指定/空文字列 + transport=http の直接呼び出しで診断しにくい
+  クラッシュ・壊れた設定出力を修正**: `build_codex_toml_text(transport="http",
+  url=None, ...)` を `emit()` を経由せず直接呼んだ場合、従来は
+  `_toml_basic_string` 内で `AttributeError: 'NoneType' object has no attribute
+  'replace'` という原因の分かりにくい形で落ちていた。さらに `url=""`（argparse
+  で `--url ""` として普通に渡り得る）は `url is None` 判定をすり抜け、壊れた
+  `url = ""` を無例外で書き出していた。`emit()` の検証条件 `not url` と同一の
+  ガードへ修正し、`ValueError` で明確に失敗するようにした（pyright:
+  reportArgumentType の指摘を機に発見）。`emit()` の `builders` dict が持つ
+  3 ビルダー（claude/codex/gemini）全てに同じガードを適用した:
+  `build_gemini_json_text`（同型シグネチャだがガード自体が無く
+  `httpUrl: null`/`""` を書き出していた）と `build_claude_sh_text`（素の
+  f-string 補間で `claude mcp add --transport http shelf "None"` を無例外で
+  出力し、出力先が実行ビット付き claude.sh のため3者中最も影響が大きかった）
+  の両方に同じガードを追加した。
 - **クォート付き複数語の secret 値の過少マスク修正**: 汎用の password/secret/token regex が
   クォート文字列内の複数語を先頭 1 トークンのみマスクしていた問題を修正。値パターンを
   クォート全体優先（ダブル/シングルクォート、内部エスケープ許容、改行をまたいで飲み込まない）へ

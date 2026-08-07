@@ -396,3 +396,209 @@ ruff clean・追加テスト 14 本・テスト削除 0 行。新テストの非
   エラーが 1 件新規発生。実行時は routing.py の isinstance 検証 + フォール
   バック構成（subquery=question）で str が保証される。@overload 追加または
   当該箇所のインライン条件式で解消可能（Track B で扱う）。
+
+## Track B: ruff I/B 採用 + pyright 導入 + CI 強化（2026-08-07）
+
+docs/stale-references ブランチ上で実施。事前情報（ブリーフの実測値）と実際の
+差分は無く、I001 x7・B905 x2・B904 x1・BLE001 noqa x5（shelf/ 配下）は grep/ruff
+の実測と一致した。
+
+- **B905 の判断（zip strict= の使い分け）**:
+  - `indexer.py:185`（chunk 埋め込み対応付け）: `strict=True` を採用。
+    `[r["text"] for r in rows]` を直接 embedder へ渡しているため、rows と
+    embeddings の長さは Embedder.embed_documents の契約（texts と1対1対応する
+    embedding 列を返す Protocol 定義）上、構造的に一致するはずであり、食い違いは
+    実装欠陥のシグナル。挙動が変わる（従来は zip の暗黙切り詰めで欠陥を見逃し、
+    最後の行が `KeyError: 'embedding'` という無関係なエラーで壊れていた）ため、
+    `BrokenEmbedder`（契約違反で1件少ない embedding を返す）で Red→Green を固定
+    （`test_embedder_returning_wrong_length_raises_instead_of_silently_misaligning`）。
+    Red 確認は strict=True を一時的に外して実際に `KeyError` が出ることを実測して
+    行った（$TMPDIR 経由でファイルを一時退避・復元。/tmp への直書きはサンドボックス
+    で権限エラーになる既知の制約）。
+  - `tests/test_chunker.py:149`（隣接ペアの走査 `zip(chunks, chunks[1:])`）:
+    `strict=False` を採用（コメント追記のみ）。意図的なスライディングウィンドウで
+    長さが1違うのが正常設計のため。
+- **B904 の判断（convert.py:387、URL 取得失敗時の raise）**: `from e` を採用。
+  ブリーフが警告した「shelf/convert.py には except ブロックの外で raise して
+  `__context__` を意図的に断つ設計が実在する」のは `_convert_reflow`
+  （pymupdf のファイルパスを含む生例外メッセージをユーザーに見せない設計）の
+  話であり、今回の URLError サイトは事情が異なる: `ConversionError` の
+  メッセージに既に `str(e)` を埋め込んで安全な要約を終えているため、`from e`
+  でトレースバック連鎖を明示しても新たな情報漏洩は生まない。挙動が変わる
+  （`__cause__` が None→e になる）ため、`.__cause__ is original` を固定する
+  Red→Green テストを追加（`test_convert_url_network_failure_chains_original_urlerror`）。
+- **noqa: BLE001 削除**: grep で shelf/ 配下 5 箇所（doctor.py:133・indexer.py:105・
+  service.py 2箇所・shelver.py:77、行番号はブリーフの想定と近似だがズレていた）を
+  確認し、BLE001 を select していないため無意味な noqa を削除（WHY コメント本文は
+  維持）。tests/ 配下にも同名 noqa が計7箇所あるがブリーフのスコープ外（対象は
+  shelf/ のみ）のため無変更。
+- **pyright 導入**: `uv add --dev pyright` → `[tool.pyright] include = ["shelf"]`
+  を追加 → `uv run pyright shelf/` で実測すると、ブリーフの想定どおり "UTC" is
+  unknown import symbol の2件は再現せず（`uv run` 経由で正しい .venv が解決
+  されるため artifact 通り）、実欠陥 11 件を確認（brief の暫定トリアージと
+  ほぼ一致、ただし cli.py:36 は brief の列挙に無かった新規発見）。
+  - **cli.py:36**（`stream.reconfigure`）: `hasattr` では TextIO の型を narrowing
+    できない typeshed の制約。`getattr(stream, "reconfigure", None)` + None チェック
+    へ書き換え（挙動は完全に同一のため無テスト）。
+  - **convert.py 4件**: pymupdf/pymupdf4llm に型スタブが無く、`get_text()`・
+    `to_markdown()` の戻り値が実行時の引数（option/page_chunks）に応じて
+    str/list/dict のいずれにもなりうる union として推論されていた。呼び出し側の
+    実引数から確定する戻り値型へ `cast()` （無テスト、cast は実行時 no-op）。
+    `_convert_reflow` の "markdown possibly unbound" は service.py の
+    masked_title と同型のパターン（except で safe_error を設定→raise で必ず
+    抜けるが pyright はその対応関係を追跡できない）。ここは except 内で
+    エラーを握りつぶす複雑な分岐が無いため、`markdown = ""` の空文字初期化のみ
+    で解消（safe_error 経由で必ず raise してから使われるため実際に使われることは
+    ない、no-op な安全策）。
+  - **doctor.py:137**（`store.close()`）: `store_factory: Callable[[str | Path],
+    object]` という広すぎる戻り型契約が原因。`_ClosableStore`（`close() -> None`
+    のみを要求する Protocol）を新設して置き換え。boundaries（sqlite3 直接
+    import は store.py のみ）に抵触しないことを確認（Store クラス自体の import は
+    既存どおり、Protocol は shelf.store を import しない）。
+  - **emit_mcp.py:73**（`_toml_basic_string(url: str | None)`）: 実際には
+    `emit()` が呼び出し前に `transport=="http" and not url` を検証済みのため
+    実害は無いが、`build_codex_toml_text` を直接呼ぶ経路（テスト等）では
+    `url=None` が `_toml_basic_string` へ渡り `AttributeError` で診断しにくく
+    落ちていた（実測: Red 確認で確認済み）。関数内に同じ検証を追加し
+    `ValueError` へ変換。挙動が変わるため Red→Green で固定
+    （`test_http_without_url_raises_clear_value_error`）。
+  - **service.py:1193**（masked_title possibly unbound）: ブリーフ指定どおり
+    title mask 代入を try の外側へ移動。ただし「代入を try の前に出す」の
+    帰結として、self._mask() 自身が例外を投げた場合の挙動が「except で無言
+    破棄→フォールバックで UnboundLocalError」から「mask の例外がそのまま
+    伝播」へ変わる（自明な bugfix ではなく設計判断）。
+    **[2026-08-07 訂正]** 当初この根拠を「`_masked()` 等コードベース他所の
+    mask 呼び出しはどこも mask 自身の例外を特別扱いしておらず、この
+    try/except はそもそも backend.answer() の失敗を保護する意図だった」と
+    書いたが、これは誤りだった。フレッシュレビューで反例を指摘された:
+    `_resolve_description`（service.py の add_source 側、同型の
+    `masked_title = self._mask(title) if ...` パターン）は同じ mask 呼び出しを
+    意図的に try の内側に置き、直前のコメントで「これは意図的な設計であり
+    隠蔽ではない: 要約生成は best-effort」と明言している。つまり
+    「try/except は backend 呼び出しの失敗だけを保護する」という一般化は
+    偽で、既存コードには mask 失敗も一緒に fail-open で吸収する設計が実在した。
+    採用理由を訂正する: title の mask 失敗は「分類プロンプトへ必ず使われる
+    値を mask できないまま処理を続けるより、大きな音で止まる方が
+    ADR-0002（backend へ送る全テキストは mask 済み、という不変条件）に
+    整合する」という fail-closed の判断として維持する（_resolve_description
+    の fail-open とは意図的に異なる選択であり、コードベース全体の一貫パターン
+    ではないことを認める）。この非対称性は `_summarize_for_shelve` の
+    docstring・該当コメントへ明記した。挙動が変わるため Red→Green で固定
+    （`test_shelve_raises_the_original_mask_error_instead_of_unbound_local_error`。
+    markdown 側の mask 呼び出しは正常に通し title 側だけ raise する fake mask で
+    的を絞った）。Red 確認では実際に `UnboundLocalError` が出ることを実測。
+  - **service.py:1550→1557**（`_masked` の戻り型 `str|None` を
+    `_answer_with_expert(question: str)` へ渡す不整合）: ブリーフ提案どおり
+    `@overload`（`text: str -> str` / `text: None -> None`）を追加。
+    `RouteTarget.subquery: str`（非 Optional）という呼び出し元の型情報を
+    `_masked()` の戻り値へ伝播させる型注釈のみの変更（無テスト、実行時
+    分岐ロジックは無変更）。
+- **棄却した案**: `distill/extract.py` の I001 差分（整形する/`per-file-ignores`
+  で I ルールを除外する、の二択）で「整形する」案を棄却した。この時点では
+  agent-recall との共有資産であることを認識しつつも I001 の自動整形を素直に
+  適用したが、レビューで「上流との同期時に無意味な diff ノイズを生む」指摘を受け
+  再考。`[tool.ruff.lint.per-file-ignores]` で `distill/extract.py` の I を除外する
+  案を採用し、整形を差し戻した（後述の R1 修正）。この1件を除き、他の判断は
+  単一の結論に収束し代替案の比較検討を要する分岐は発生しなかった。
+- 検証: `uv run pytest -q`（1301 passed = 1297 + 新規4）・
+  `uv run ruff check --no-cache .`（All checks passed、I/B 込み）・
+  `uv run pyright shelf/`（0 errors、11→0）。CI ワークフロー（Python 3.11/3.13
+  マトリクス追加・pyright ubuntu×3.11限定ステップ追加）は `uv run python3 -c
+  "import yaml; yaml.safe_load(...)"` で構文のみ確認、**実際の GitHub Actions
+  実走は未確認**（push 後の判断はユーザー/git-composer 側）。`uv lock --check`
+  は成功（3.11/3.13 いずれも requires-python の範囲内で解決可能）。
+
+## Track B 追修正: adversarial-verifier REJECT からの対応（2026-08-07）
+
+完了報告後、adversarial-verifier が REJECT（実証済み穴1件・根拠の誤り1件・
+残存リスク軽微2件）。メイン側で先に3件の nit 修正（distill/extract.py の I001
+差し戻し+per-file-ignores新設・CONTRIBUTING言語統一・CHANGELOG見出し修正）が
+入っていたため、まずそれを文書へ反映してから実質的な穴を塞いだ。
+
+- **R1（文書齟齬）**: CHANGELOG の「I001、7箇所」を「6ファイル」へ訂正し
+  per-file-ignores の判断根拠を1文追記。trial-log の「棄却した案: なし」を
+  訂正し distill/extract.py の整形/除外の二択を記録（上記に反映済み）。
+- **R2（emit_mcp の url="" 素通し、実証済みの穴）**: `build_codex_toml_text` の
+  ガード `if url is None` は `url=""`（argparse で `--url ""` は普通に通る）を
+  素通しし、壊れた `url = ""` を無例外で書き出していた。emit() の検証条件は
+  `not url` であり docstring の「同じ契約」という記述が偽になっていた。さらに
+  兄弟関数 `build_gemini_json_text`（同型シグネチャ）にはガード自体が無く
+  `httpUrl: null`/`""` を書き出していた。修正: 両関数とも `if not url:` へ統一。
+  Red 確認は3ケース（codex×url=""、gemini×url=None、gemini×url=""）全てで
+  `DID NOT RAISE ValueError` を実測してから修正した。
+- **R3（masked_title 修正の根拠訂正）**: `_resolve_description`
+  （add_source 側、同型の mask 呼び出しパターン）が同じ mask 呼び出しを
+  意図的に try の内側に置き「意図的な設計であり隠蔽ではない: 要約生成は
+  best-effort」と明言している反例により、「コードベース他所は mask 例外を
+  特別扱いしていない」という当初の根拠が偽と判明。挙動（fail-closed）自体は
+  「title は分類プロンプトへ必ず使われる値なので、mask できないまま処理を
+  続けるより大きな音で止まる方が ADR-0002 に整合する」という独立した理由で
+  維持し、trial-log の根拠記述を訂正（上記 service.py:1193 節に反映済み）。
+  あわせて `_summarize_for_shelve` の docstring と該当コメントへ、title
+  （fail-closed）と summary（fail-open、try 内のまま無変更）の非対称性を
+  明記した。コード挙動そのものは変更していない（ドキュメントのみ）。
+- **残存リスク対応（軽微2件）**:
+  1. `embedder.py` の `Embedder.embed_documents` Protocol docstring に
+     「texts と同数・同順の embedding 列を返す」という長さ契約を明文化し、
+     `indexer.py` 側のコメントをその docstring を参照する形へ書き換えた
+     （従来は根拠不在のまま「Protocol 定義」とだけ書いていた）。
+  2. 新規テストの `match="shorter"` は CPython の zip() 実装メッセージに
+     依存するため削除（`pytest.raises(ValueError)` のみに緩和）。加えて
+     embedding が rows より「多い」逆方向のケース
+     （`test_embedder_returning_more_embeddings_than_texts_raises`）を追加。
+     Red 確認は strict=True を一時的に外して実際に「無エラーで通ってしまう」
+     （余剰1件が静かに zip で捨てられる）ことを実測してから行った。
+- **棄却した案**: なし（各修正は反例・実証済みの穴の指摘に対する単一の妥当な
+  対応で、代替案の比較を要する分岐は発生しなかった）。
+- 検証: `uv run pytest -q`（1305 passed = 1301 + 新規4: emit_mcp の
+  parametrize 化2件+1・indexer の逆方向テスト追加1）・
+  `uv run ruff check --no-cache .`（All checks passed）・
+  `uv run pyright shelf/`（0 errors）。git commit は行っていない
+  （delegate-git-to-composer によりブロックされるため未実施、実施もしていない）。
+
+## Track B 再追修正: adversarial-verifier 再REJECT — R2 掃引の3分の2止まり（2026-08-07）
+
+再判定で REJECT 1件。R2（emit_mcp の url 検証統一）の掃引が `emit()` の
+`builders` dict（claude/codex/gemini の3エントリ）のうち2つ（codex・gemini）
+までしか及ばず、`build_claude_sh_text` にガードが未追加のまま残っていた。
+検証者の実測: `build_claude_sh_text(transport="http", url=None)` が無例外で
+`claude mcp add --transport http shelf "None"` を出力。この関数は素の
+f-string 補間（エスケープ無し）+ 出力先が実行ビット付き claude.sh（emit() が
+chmod +x する）のため、3者中最も影響が大きい実穴だった。
+
+- **同一データ追跡教訓の4度目の同型再発**: fix/prompt-title-mask で確立した
+  「関数名の grep ではなく同一データの全流出先を追跡する」教訓が、Track B の
+  中だけで2度目（前回 R2 で gemini を見つけたが claude を見落とした）、
+  ADR-0002 全体の履歴を通算すると4度目の同型再発になる（1度目:
+  title のプロンプト直渡し経路、2度目: shelver.py のモジュール境界、3度目:
+  同一 JSON の兄弟フィールド subquery、4度目: 今回の builders dict）。
+  今回の見落とし原因は明確: `emit()` の `builders = {"claude": ...,
+  "codex": ..., "gemini": ...}` を grep すれば3エントリだと機械的に検出できた
+  にもかかわらず、前回は「codex を直した流れで気づいた gemini」を直しただけで
+  dict 全体を悉皆確認しなかった。教訓: 同型のガード漏れを1箇所直したら、
+  その関数が属する dict/リスト/switch 相当の構造（本件なら `builders`）を
+  grep して全メンバーを機械的に洗い出す。「レビューで気づいた分だけ直す」は
+  悉皆性を保証しない。
+- 修正: `build_claude_sh_text` に `build_codex_toml_text`/
+  `build_gemini_json_text` と同一文言の `ValueError` ガードを追加。
+  `tests/test_emit_mcp.py::TestBuildClaudeShText` に既存の
+  `@pytest.mark.parametrize("empty_url", [None, ""])` パターンで2ケース追加。
+  Red 確認は両ケースで実際に `DID NOT RAISE ValueError` を実測してから修正。
+- `emit_mcp.py` の `build_gemini_json_text` docstring「兄弟関数（単数形）の
+  見落とし」を、実際には兄弟が2つ（claude・gemini）あり claude 側の掃引が
+  1ラウンド漏れていた実態へ訂正。CHANGELOG の R2 エントリも「兄弟関数
+  build_gemini_json_text にも」から3ビルダー全て（builders dict の悉皆）に
+  適用した記述へ修正。
+- **残存リスク対応（fail-closed の粒度、文書のみ）**: title mask 失敗が
+  `_prepare_shelve_candidates` のディレクトリ一括走査ループを try/except で
+  保護されずに突き抜けるため、1ファイルの mask 失敗が `shelve()` 呼び出し
+  全体を中断させバッチ全ファイル未投入になる。同ループ内の
+  `ConversionError`/`OSError`（1ファイル固有）が per-file 収集・継続する
+  のとは対照的な粒度。理由（mask 関数自体の破損はファイル個別ではなくバッチ
+  内全ファイルに及ぶ系統的障害であるため、部分投入より全体停止を安全側として
+  選ぶ）を `_summarize_for_shelve` の docstring と CHANGELOG へ追記した。
+  コード挙動は変更していない。
+- **棄却した案**: なし。
+- 検証: `uv run pytest -q`（1307 passed = 1305 + 新規2: claude 側
+  parametrize 2ケース）・`uv run ruff check --no-cache .`（All checks
+  passed）・`uv run pyright shelf/`（0 errors）。git commit は行っていない。
