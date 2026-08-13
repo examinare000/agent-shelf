@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tomllib
 from pathlib import Path
@@ -36,6 +37,33 @@ class TestBuildClaudeShText:
         )
         assert "claude mcp add --transport http shelf" in text
         assert "http://127.0.0.1:8765/mcp" in text
+
+    def test_http_quotes_url_as_single_literal_argument(self, tmp_path):
+        dangerous_url = "http://127.0.0.1/$(touch should-not-exist)"
+        text = emit_mcp.build_claude_sh_text(
+            transport="http", url=dangerous_url, repo_root=tmp_path
+        )
+
+        expected_argv = [
+            "claude",
+            "mcp",
+            "add",
+            "--transport",
+            "http",
+            "shelf",
+            dangerous_url,
+        ]
+        assert text.splitlines()[-1] == shlex.join(expected_argv)
+
+    def test_stdio_quotes_every_argument_from_argv(self, tmp_path):
+        repo_root = tmp_path / "repo root;$(touch should-not-exist)"
+        text = emit_mcp.build_claude_sh_text(
+            transport="stdio", url=None, repo_root=repo_root
+        )
+
+        expected_argv = ["claude", "mcp", "add", "shelf", "--"]
+        expected_argv.extend(emit_mcp.build_stdio_argv(repo_root))
+        assert text.splitlines()[-1] == shlex.join(expected_argv)
 
     @pytest.mark.skipif(
         os.name == "nt",
