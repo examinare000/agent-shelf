@@ -38,12 +38,16 @@ select = ["E4", "E7", "E9", "F", "I", "B"]
 "distill/extract.py" = ["I"]
 
 # エディタ(Pyright)が shelf/.venv を解決できるようにする（実行系は uv が解決）
+# include を shelf/ に絞る: tests/ は FakeLibrarian 等 Protocol の構造的型付けに
+# 由来する既知のノイズが多く、CI の型チェック対象は本体コードに限定する。
 [tool.pyright]
 venvPath = "."
 venv = ".venv"
+include = ["shelf"]
 
 [dependency-groups]
 dev = [
+    "pyright>=1.1.411",
     "pytest>=8.0",
     "ruff>=0.16.1",
 ]
