@@ -146,7 +146,9 @@ class TestSizeBasedSplittingAndOverlap:
         assert len(chunks) > 1
         for c in chunks:
             assert len(c.text) <= 25
-        for prev, nxt in zip(chunks, chunks[1:]):
+        # 隣接ペアを走査する意図的なスライディングウィンドウ（chunks[1:] は
+        # chunks より要素数が1少ない）のため strict=False が正しい。
+        for prev, nxt in zip(chunks, chunks[1:], strict=False):
             overlap_chars = round(20 * 0.15)
             assert nxt.text.startswith(prev.text[-overlap_chars:])
 

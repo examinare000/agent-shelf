@@ -11,15 +11,14 @@ import json
 
 import pytest
 
-
-from shelf.engines import create_backend
 from shelf.engines import agy as agy_module
 from shelf.engines import codex as codex_module
+from shelf.engines import create_backend
 from shelf.engines import gemini_cli as gemini_cli_module
+from shelf.engines import ollama as ollama_module
 from shelf.engines.agy import build_agy_cmd
 from shelf.engines.codex import build_codex_cmd
 from shelf.engines.gemini_cli import build_gemini_cmd
-from shelf.engines import ollama as ollama_module
 from shelf.engines.ollama import build_payload
 from shelf.engines.runner import RunResult
 

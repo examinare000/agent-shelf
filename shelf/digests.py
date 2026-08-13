@@ -13,7 +13,6 @@ from collections.abc import Callable
 from shelf.jsonutil import parse_json_object
 from shelf.ports import StudyNote
 
-
 # map-reduce 学び抽出パイプラインでの 1 ウィンドウ（1 回の map LLM 呼び出し入力）の
 # 既定文字数上限（設計書「先頭4000字を1回のLLM呼び出しで要約」からの置き換え・
 # §7-B 拡張）。文書全体を複数ウィンドウに分割して map する前提のため、

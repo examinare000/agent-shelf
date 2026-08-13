@@ -69,7 +69,7 @@ class Shelver:
             prompt = build_classification_prompt(summary, working_catalog)
             try:
                 raw = self._backend.answer(prompt, workdir=self._workdir, schema=CLASSIFY_SCHEMA)
-            except Exception as exc:  # noqa: BLE001 - backend 境界の例外を継続可能なエラーへ変換する
+            except Exception as exc:  # backend 境界の例外を継続可能なエラーへ変換する
                 result.errors.append({"origin": summary.origin, "error": str(exc)})
                 continue
 
