@@ -1154,6 +1154,8 @@ class ShelfService:
         None（既存 best-effort と同じ・source も None）」・分類はフォールバック
         テキストで継続しファイルを失わない）。
         """
+        # mask 自体が失敗した場合は生 title を再利用せず、本文だけで分類を継続する。
+        masked_title: str | None = None
         try:
             # title は converter が抽出した生値のまま渡ってくる。add_source 側
             # （_resolve_description）と同じ流儀で、プロンプト構築の直前に mask を
