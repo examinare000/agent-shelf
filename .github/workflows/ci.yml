@@ -14,17 +14,26 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
       - run: uv sync
       - run: uv run pytest -q
       - run: uv run ruff check .
+      # pyright は静的型チェックのため実行時の Python バージョン差では結果が
+      # 変わらない。4組合せ全てで走らせるのは実行コストの無駄なので、
+      # requires-python の下限（3.11）× ubuntu の1点だけに絞る。
+      - name: pyright（型チェック）
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        run: uv run pyright shelf/
 
   # ruleset の必須チェックは context 名 "test" を要求するが、matrix 化により
-  # 実チェック名は "test-matrix (os)" になり永久に報告されなくなる（PR #13 で
-  # BLOCKED を実測）。matrix 全体の成否を単一 context "test" へ集約して報告する。
+  # 実チェック名は "test-matrix (os, python-version)" になり永久に報告されなくなる
+  # （PR #13 で BLOCKED を実測）。matrix 全体の成否を単一 context "test" へ集約して報告する。
   test:
     needs: test-matrix
     if: always()
