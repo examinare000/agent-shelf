@@ -402,7 +402,11 @@ def convert_url(url: str, timeout: int = 30) -> ConvertResult:
         if len(data) > MAX_SIZE:
             raise ConversionError("ファイルサイズが 20MB を超えています")
     except urllib.error.URLError as e:
-        raise ConversionError(f"URL の取得に失敗しました: {e}")
+        # WHY from e: ここは _convert_reflow のような「メッセージには出さず生例外を
+        # 隠す」設計ではなく、str(e) を ConversionError のメッセージへ既に埋め込んで
+        # いる（安全な要約は完了済み）。よって from e でトレースバック連鎖を明示しても
+        # 新たな情報漏洩は生まない。連鎖を明示すること自体が診断性を保つ。
+        raise ConversionError(f"URL の取得に失敗しました: {e}") from e
 
     # 一時ファイルに書き込み→ markitdown で変換
     with tempfile.NamedTemporaryFile(
