@@ -4596,6 +4596,36 @@ def test_shelve_masks_title_in_fallback_classification_text_when_summary_fails(
     assert secret not in classify_backend.calls[0]["prompt"]
 
 
+def test_summarize_for_shelve_omits_title_when_title_masking_fails(
+    store: Store, embedder: FakeEmbedder, tmp_path: Path
+) -> None:
+    secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+    markdown = "# Safe masked body\n\nClassification context"
+    summarize_backend = FakeAnswerBackend(canned='{"summary": "unused"}')
+
+    def failing_mask(text: str) -> str:
+        if secret in text:
+            raise RuntimeError("mask failed")
+        return text
+
+    service = ShelfService(
+        store,
+        embedder,
+        lambda _name: summarize_backend,
+        tmp_path,
+        mask=failing_mask,
+    )
+
+    classification_text, description = service._summarize_for_shelve(
+        markdown, f"Sensitive title {secret}", summarize_backend
+    )
+
+    assert classification_text == markdown
+    assert secret not in classification_text
+    assert description is None
+    assert summarize_backend.calls == []
+
+
 def test_consult_reports_router_error_when_librarian_backend_fails(store, embedder, tmp_path):
     """【6】司書(Librarian)の backend 呼び出し失敗時、warning に router_error が含まれる"""
     router_backend = FakeAnswerBackend(canned=RawAnswer(text="", ok=False, error="librarian backend timeout"))
