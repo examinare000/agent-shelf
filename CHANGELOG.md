@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **lint・型チェックを強化**: Ruff の有効ルールへ I（isort）と B
+  （flake8-bugbear）を追加し、`distill/extract.py` は共有資産との同期ノイズを
+  避けるため I の対象外とした。Ruff は Dependabot #18 で更新された 0.16.1
+  以上を維持する。Pyright を開発依存へ追加し、CI は Ubuntu/Windows ×
+  Python 3.11/3.13 の4組合せを検証する。型チェックは Ubuntu × Python 3.11
+  の1点で `shelf/` を対象に実行する。
+- **コントリビューション手順をCIへ整合**: Ruff format は採用していないことを
+  明記し、Pyright の実行方法を追加した。
 - **mcp SDK を 2.0 系へ更新**: Dependabot 更新（1.28.1→2.0.0）が `mcp.server.fastmcp`
   モジュール削除により CI を破壊していたため、`mcp>=1.0.0` から `mcp>=2.0.0` へ最低要求を
   引き上げ、v2 の破壊的変更に追従した。`FastMCP` クラスは `mcp.server.mcpserver.MCPServer`
@@ -19,6 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport_security=...)` のキーワード引数として渡す方式に変更。
 
 ### Fixed
+- **埋め込み件数不一致を安全に検出**: Embedder が入力テキストと異なる件数の
+  embedding を返した場合、`zip(..., strict=True)` で契約違反を即座に検出する。
+  再索引時は検証が完了してから旧チャンクを置換するため、失敗後も既存索引を
+  保持して再試行できる。
+- **MCP設定生成を堅牢化**: HTTP transport で URL が未指定または空の場合は、
+  Claude/Codex/Gemini の全ビルダーが明示的な `ValueError` を返す。Claude 用の
+  実行可能スクリプトは URL と stdio 引数をシェルの単一リテラル引数として引用し、
+  コマンド置換などの意図しない解釈を防ぐ。
+- **型・lint指摘箇所を修正**: PyMuPDF の戻り値型を呼び出し契約に沿って明示し、
+  URL取得失敗時の例外連鎖、標準出力の `reconfigure` 呼び出し、診断用Storeの
+  `close()` 契約を静的解析で検証できる形にした。
 - **クォート付き複数語の secret 値の過少マスク修正**: 汎用の password/secret/token regex が
   クォート文字列内の複数語を先頭 1 トークンのみマスクしていた問題を修正。値パターンを
   クォート全体優先（ダブル/シングルクォート、内部エスケープ許容、改行をまたいで飲み込まない）へ
