@@ -108,7 +108,6 @@ def index_notebook(
             continue
 
         existing_source_files.add(source_path)
-        store.delete_by_source_file(source_path)
 
         rows = [
             {
@@ -188,6 +187,10 @@ def index_notebook(
             # はずで、食い違いは実装欠陥を示すので strict=True で早期に検知する。
             for row, embedding in zip(rows, embeddings, strict=True):
                 row["embedding"] = embedding
+
+        # 埋め込み契約の検証に失敗しても、再試行可能な旧索引を失わないようにする。
+        store.delete_by_source_file(source_path)
+        if rows:
             store.upsert_chunks(rows)
         store.set_file_state(
             source_path, mtime=stat.st_mtime, size=stat.st_size, model=embedder.model_name
