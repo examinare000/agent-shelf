@@ -1154,6 +1154,8 @@ class ShelfService:
         None（既存 best-effort と同じ・source も None）」・分類はフォールバック
         テキストで継続しファイルを失わない）。
         """
+        # mask 自体が失敗した場合は生 title を再利用せず、本文だけで分類を継続する。
+        masked_title: str | None = None
         try:
             # title は converter が抽出した生値のまま渡ってくる。add_source 側
             # （_resolve_description）と同じ流儀で、プロンプト構築の直前に mask を
@@ -1728,7 +1730,7 @@ class ShelfService:
             )
             try:
                 map_raw = backend.answer(map_prompt, workdir=workdir, schema=MAP_SCHEMA)
-            except Exception as exc:  # noqa: BLE001 - 1ウィンドウの例外で他ウィンドウを止めない
+            except Exception as exc:  # 1ウィンドウの例外で他ウィンドウを止めない
                 # コードレビュー指摘#9: これまで無言で continue しており、map フェーズの
                 # 例外は観測不能だった。observability のため warning ログを残す。
                 _logger.warning(
@@ -1783,7 +1785,7 @@ class ShelfService:
         )
         try:
             reduce_raw = backend.answer(reduce_prompt, workdir=workdir, schema=REDUCE_SCHEMA)
-        except Exception as exc:  # noqa: BLE001 - reduce 失敗は doc 単位のエラーとして
+        except Exception as exc:  # reduce 失敗は doc 単位のエラーとして
             # 呼び出し元へ返し、何も永続化しない（コードレビュー指摘#1: 以前は劣化継続
             # として map ノートを現在の content_hash+pipeline=2 で保存するフォールバック
             # を持っていたが、これにより次回の skip 判定 (source_hash+pipeline 一致) が

@@ -12,6 +12,7 @@ claude.sh は `claude mcp add` コマンド列（実行権限付き）、codex.t
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 HOST_CHOICES: tuple[str, ...] = ("claude", "codex", "gemini")
@@ -37,12 +38,20 @@ def build_stdio_argv(repo_root: Path) -> list[str]:
 
 
 def build_claude_sh_text(*, transport: str, url: str | None, repo_root: Path) -> str:
-    """`claude mcp add` コマンド列を含む実行可能スクリプトのテキストを組み立てる。"""
+    """`claude mcp add` コマンド列を含む実行可能スクリプトのテキストを組み立てる。
+
+    transport="http" の場合 url は必須（build_codex_toml_text/
+    build_gemini_json_text と同じ契約・同じ `not url` 判定）。実行可能ファイルへ
+    利用者由来の URL やパスを埋め込むため、コマンド全体を argv として構築し、
+    シェルが各値を必ず単一のリテラル引数として解釈する形へ変換する。
+    """
     if transport == "http":
-        command_line = f'claude mcp add --transport http shelf "{url}"'
+        if not url:
+            raise ValueError("--transport http の場合は url が必須です")
+        command_argv = ["claude", "mcp", "add", "--transport", "http", "shelf", url]
     else:
-        argv = " ".join(build_stdio_argv(repo_root))
-        command_line = f"claude mcp add shelf -- {argv}"
+        command_argv = ["claude", "mcp", "add", "shelf", "--", *build_stdio_argv(repo_root)]
+    command_line = shlex.join(command_argv)
     return (
         "#!/usr/bin/env bash\n"
         "# shelf MCP サーバを Claude Code に登録する(`shelf emit-mcp` が生成)。\n"
@@ -68,8 +77,20 @@ def _toml_basic_string(value: str) -> str:
 
 
 def build_codex_toml_text(*, transport: str, url: str | None, repo_root: Path) -> str:
-    """codex `[mcp_servers.shelf]` 設定断片を組み立てる。"""
+    """codex `[mcp_servers.shelf]` 設定断片を組み立てる。
+
+    transport="http" の場合 url は必須（呼び出し元 emit() の事前検証と同じ契約:
+    `transport == "http" and not url` で拒否する）。ここでも明示的に検証すること
+    で、emit() を経由せず直接呼ばれた場合に url=None/"" を黙って
+    `_toml_basic_string` へ渡し `AttributeError`（None の場合）や壊れた
+    `url = ""` の無例外書き出し（空文字列の場合）という診断しにくい形で壊れる
+    のを防ぐ（pyright: reportArgumentType の指摘を機に、既存の暗黙のクラッシュを
+    明示的なエラーへ）。`not url` を使う理由: `url is None` だけでは argparse で
+    `--url ""` のように空文字列が渡るケースを見逃す（emit() の判定式と揃える）。
+    """
     if transport == "http":
+        if not url:
+            raise ValueError("--transport http の場合は url が必須です")
         return f'[mcp_servers.shelf]\nurl = "{_toml_basic_string(url)}"\n'
     argv = build_stdio_argv(repo_root)
     args_toml = ", ".join(f'"{_toml_basic_string(a)}"' for a in argv[1:])
@@ -77,8 +98,20 @@ def build_codex_toml_text(*, transport: str, url: str | None, repo_root: Path) -
 
 
 def build_gemini_json_text(*, transport: str, url: str | None, repo_root: Path) -> str:
-    """gemini `mcpServers` 設定断片を組み立てる。"""
+    """gemini `mcpServers` 設定断片を組み立てる。
+
+    transport="http" の場合 url は必須（build_codex_toml_text/
+    build_claude_sh_text と同じ契約・同じ `not url` 判定）。従来はガードが無く、
+    url=None/"" を無例外で `httpUrl: null`/`httpUrl: ""` として書き出していた。
+    build_codex_toml_text の修正時のレビューで、`emit()` の `builders` dict
+    （claude/codex/gemini の3エントリ）を悉皆的に grep せず gemini だけを
+    見つけて直した結果、兄弟関数が2つ（claude・gemini）あるうち gemini しか
+    掃引できず claude 側の同型の穴を1ラウンド見落とした（build_claude_sh_text
+    のガードは別途追加）。
+    """
     if transport == "http":
+        if not url:
+            raise ValueError("--transport http の場合は url が必須です")
         # Gemini CLI 公式ドキュメント（settings.json の mcpServers 仕様）では、
         # streamable-http 接続は "httpUrl" キーで指定し、"url" キーは SSE
         # transport 用と区別されている。ただし実機（実 Gemini CLI 起動）では

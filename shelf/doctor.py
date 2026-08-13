@@ -30,12 +30,23 @@ import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 from shelf import config
 from shelf.engines.ollama import is_reachable
 from shelf.setup import is_command_available
 from shelf.store import Store
+
+
+class _ClosableStore(Protocol):
+    """store_factory が返すオブジェクトに要求する最小契約（close() のみ）。
+
+    boundaries の都合上ここでは shelf.store.Store を型として直接使わず、
+    「close() を持つ」という構造的部分のみを Protocol で表現する
+    （テストダブル _FakeStore もこの契約だけを満たせばよい）。
+    """
+
+    def close(self) -> None: ...
 
 
 class CheckResult(NamedTuple):
@@ -106,7 +117,7 @@ def check_db_parent_dir(db_path: str | Path) -> CheckResult:
 
 
 def check_db_open(
-    db_path: str | Path, *, store_factory: Callable[[str | Path], object] = Store
+    db_path: str | Path, *, store_factory: Callable[[str | Path], _ClosableStore] = Store
 ) -> CheckResult:
     """DB ファイルを実際に開いて閉じられるかを検査する。
 
@@ -130,7 +141,7 @@ def check_db_open(
         )
     try:
         store = store_factory(db_path)
-    except Exception as e:  # noqa: BLE001 - 想定外の失敗も安全に要約して返す診断のため
+    except Exception as e:  # 想定外の失敗も安全に要約して返す診断のため
         return CheckResult(
             name="db_open", ok=False, detail=f"DB を開けませんでした: {type(e).__name__}"
         )
@@ -215,7 +226,7 @@ def run_checks(
     ollama_url: str | None = None,
     reachable: Callable[[str], bool] = is_reachable,
     db_path: str | Path | None = None,
-    store_factory: Callable[[str | Path], object] = Store,
+    store_factory: Callable[[str | Path], _ClosableStore] = Store,
     corpus_dir: str | Path | None = None,
     config_path: str | Path | None = None,
     fastembed_cache_dir: str | Path | None = None,

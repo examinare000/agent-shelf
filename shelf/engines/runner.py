@@ -13,7 +13,6 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _STDERR_SUMMARY_MAX_LEN = 120
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from shelf.indexer import (
@@ -81,6 +82,67 @@ def test_index_new_notebook_indexes_all_files(tmp_path, store, embedder) -> None
     # チャンクが実際に store へ書き込まれている（id は notebook/doc_id#seq）。
     assert store.get_chunk("physics/a#0") is not None
     assert store.get_chunk("physics/b#0") is not None
+
+
+def test_embedder_returning_fewer_embeddings_than_texts_raises(tmp_path, store) -> None:
+    """embed_documents が texts より少ない embedding を返す実装違反を、部分的な
+    誤対応のまま静かに書き込むのではなく即座に検知する（zip(..., strict=True)
+    の回帰固定）。match 文字列は CPython の zip() エラーメッセージ実装に依存
+    するため固定しない（Exception 型のみを固定する）。
+    """
+
+    class BrokenEmbedder(FakeEmbedder):
+        def embed_documents(self, texts: list[str]):
+            # 契約違反: 入力より1件少ない embedding しか返さない。
+            return super().embed_documents(texts)[:-1]
+
+    _write(tmp_path, "physics", "a.md", "# A\n\nhello world\n")
+
+    with pytest.raises(ValueError):
+        index_notebook(tmp_path, "physics", store, BrokenEmbedder(dim=8))
+
+
+def test_embedder_returning_more_embeddings_than_texts_raises(tmp_path, store) -> None:
+    """embed_documents が texts より多い embedding を返す逆方向の契約違反も同様に
+    検知する（fewer 方向のみのテストでは strict=True の片方向しか固定できない）。
+    """
+
+    class BrokenEmbedder(FakeEmbedder):
+        def embed_documents(self, texts: list[str]):
+            # 契約違反: 入力より1件多い embedding を返す（余剰の1件を追加）。
+            vecs = super().embed_documents(texts)
+            extra = self._vec("__extra__")[np.newaxis, :]
+            return np.concatenate([vecs, extra], axis=0)
+
+    _write(tmp_path, "physics", "a.md", "# A\n\nhello world\n")
+
+    with pytest.raises(ValueError):
+        index_notebook(tmp_path, "physics", store, BrokenEmbedder(dim=8))
+
+
+@pytest.mark.parametrize("cardinality", ["fewer", "more"])
+def test_reindex_embedding_count_mismatch_preserves_existing_chunks(
+    tmp_path, store, embedder, cardinality
+) -> None:
+    class BrokenEmbedder(FakeEmbedder):
+        def embed_documents(self, texts: list[str]):
+            vecs = super().embed_documents(texts)
+            if cardinality == "fewer":
+                return vecs[:-1]
+            extra = self._vec("__extra__")[np.newaxis, :]
+            return np.concatenate([vecs, extra], axis=0)
+
+    path = _write(tmp_path, "physics", "a.md", "# A\n\noriginal text\n")
+    index_notebook(tmp_path, "physics", store, embedder)
+    existing_chunk = store.get_chunk("physics/a#0")
+    assert existing_chunk is not None
+
+    path.write_text("# A\n\nreplacement text is longer\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        index_notebook(tmp_path, "physics", store, BrokenEmbedder(dim=8))
+
+    assert store.get_chunk("physics/a#0") == existing_chunk
 
 
 def test_unchanged_file_is_skipped_on_second_run(tmp_path, store, embedder) -> None:

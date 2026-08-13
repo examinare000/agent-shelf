@@ -16,7 +16,14 @@ class Embedder(Protocol):
     model_name: str
     dim: int
 
-    def embed_documents(self, texts: list[str]) -> np.ndarray: ...
+    def embed_documents(self, texts: list[str]) -> np.ndarray:
+        """texts と同数・同順の embedding 列を返す（1対1対応、契約）。
+
+        呼び出し元（indexer.py 等）はこの戻り値を `zip(rows, embeddings,
+        strict=True)` のように入力側と対応付けて使うため、実装は入力の要素数と
+        異なる長さの配列を返してはならない。
+        """
+        ...
 
     def embed_query(self, text: str) -> np.ndarray: ...
 

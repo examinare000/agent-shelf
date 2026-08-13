@@ -13,9 +13,13 @@ Thank you for your interest in contributing! We welcome all contributions — bu
   ```bash
   uv run pytest
   ```
-- Code must pass linting and formatting checks:
+- Code must pass linting checks (ruff format is not adopted in this project):
   ```bash
   uv run ruff check .
+  ```
+- Code must pass type checks (pyright, scoped to `shelf/`):
+  ```bash
+  uv run pyright shelf/
   ```
 
 ### Commit Message Style

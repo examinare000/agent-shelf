@@ -102,13 +102,12 @@ def index_notebook(
             chunks = chunk_markdown(
                 md, notebook=notebook, doc_id=doc_id, source_path=source_path, mask=mask
             )
-        except Exception as exc:  # noqa: BLE001 - 1ファイルのチャンク失敗で全体を止めない
+        except Exception as exc:  # 1ファイルのチャンク失敗で全体を止めない
             existing_source_files.add(source_path)
             errors.append(f"{source_path}: {exc}")
             continue
 
         existing_source_files.add(source_path)
-        store.delete_by_source_file(source_path)
 
         rows = [
             {
@@ -182,8 +181,16 @@ def index_notebook(
 
         if rows:
             embeddings = embedder.embed_documents([r["text"] for r in rows])
-            for row, embedding in zip(rows, embeddings):
+            # Embedder.embed_documents の契約（embedder.py の Protocol docstring
+            # 参照: texts と同数・同順の embedding 列を返す）を前提にしている。
+            # rows 側も直前で同じ texts から生成しているため長さは構造的に一致する
+            # はずで、食い違いは実装欠陥を示すので strict=True で早期に検知する。
+            for row, embedding in zip(rows, embeddings, strict=True):
                 row["embedding"] = embedding
+
+        # 埋め込み契約の検証に失敗しても、再試行可能な旧索引を失わないようにする。
+        store.delete_by_source_file(source_path)
+        if rows:
             store.upsert_chunks(rows)
         store.set_file_state(
             source_path, mtime=stat.st_mtime, size=stat.st_size, model=embedder.model_name

@@ -8,6 +8,7 @@ PDF/markitdown の実変換はスモークのみ。
 from __future__ import annotations
 
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from collections import defaultdict
@@ -17,7 +18,6 @@ from unittest.mock import MagicMock, Mock, patch
 import pytest
 
 from shelf.convert import ConversionError, ConvertResult, convert_file, convert_url, pick_converter
-
 
 _CHAPTER_BODY_TEMPLATE = (
     "This is the body content of chapter {i}. It contains enough text to exceed "
@@ -818,6 +818,18 @@ class TestConvertUrl:
             with pytest.raises(ConversionError) as exc_info:
                 convert_url("http://example.com/large.bin")
             assert "20MB" in str(exc_info.value) or "サイズ" in str(exc_info.value)
+
+    def test_convert_url_network_failure_chains_original_urlerror(self):
+        """urlopen が URLError を送出した場合、ConversionError.__cause__ に元例外を
+        明示的に連鎖させる（B904: 例外処理内の裸の raise を禁止するルール対応）。
+        メッセージには既に str(e) を埋め込んでいる設計のため、from e で
+        トレースバック連鎖まで明示しても新たな情報漏洩は生じない。
+        """
+        original = urllib.error.URLError("接続できませんでした")
+        with patch("shelf.convert.urllib.request.urlopen", side_effect=original):
+            with pytest.raises(ConversionError) as exc_info:
+                convert_url("http://example.com/unreachable")
+        assert exc_info.value.__cause__ is original
 
     def test_convert_url_timeout_default(self):
         """timeout パラメータのデフォルトが 30 秒であることを確認。"""
