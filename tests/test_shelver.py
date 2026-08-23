@@ -150,6 +150,30 @@ class TestPlanIncrementalCatalogThreading:
         assert "cooking-recipes" not in first_prompt
         assert "cooking-recipes" in second_prompt
 
+    def test_second_file_prompt_masks_description_of_notebook_created_by_first_file(self):
+        """1ファイル目の分類応答(decision.description)は LLM 出力そのもので mask を
+        通っていない。working_catalog へ積んだ NotebookCard.description が2ファイル目の
+        分類プロンプトへ生で流出しないことを固定する（ADR-0002 の残存 must）。"""
+        secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+        new_cooking_with_secret = (
+            '{"action": "new", "notebook": "cooking-recipes", '
+            f'"description": "料理レシピ集 {secret}", "reason": "既存に合致なし"}}'
+        )
+        backend = FakeAnswerBackend(canned=[new_cooking_with_secret, _ASSIGN_PHYSICS])
+
+        def fake_mask(text: str) -> str:
+            return text.replace(secret, "<REDACTED>")
+
+        shelver = Shelver(
+            backend, workdir=Path("/corpus"), notebook_backend="ollama", mask=fake_mask
+        )
+
+        shelver.plan([_summary(origin="/a.md"), _summary(origin="/b.md")], [])
+
+        second_prompt = backend.calls[1]["prompt"]
+        assert secret not in second_prompt
+        assert "<REDACTED>" in second_prompt
+
     def test_second_file_can_assign_to_notebook_created_by_first_file(self):
         second_assign = (
             '{"action": "assign", "notebook": "cooking-recipes", "reason": "同一主題"}'

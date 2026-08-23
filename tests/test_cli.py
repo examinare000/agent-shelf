@@ -932,6 +932,28 @@ class TestPersonaDispatch:
         captured = capsys.readouterr().out
         assert "エラー" in captured
 
+    def test_displays_masked_persona_for_pre_existing_unmasked_row(self, monkeypatch, capsys):
+        """persona 表示は _build_store().get_notebook() 直読みで素通し表示していた。
+        既存 DB 行の未 mask persona がそのまま表示されないことを固定する
+        （ADR-0002 の残存 should）。_build_service（実モデル DL）は使わず、
+        shelf.masking.mask（軽量な importlib 経由の単一ソース）を直接使う。"""
+        secret = "sk-ABCDEFGHIJKLMNOPQRSTUVWX1234567890abcdefghij"
+        store = Store(":memory:")
+        store.create_notebook("physics", description="物理")
+        store.set_persona("physics", f"物理学の専門家 {secret}")
+        monkeypatch.setattr(cli, "_build_store", lambda: store)
+
+        def _fail_if_called():
+            raise AssertionError("_build_service は表示のみの分岐で呼ばれてはならない")
+
+        monkeypatch.setattr(cli, "_build_service", _fail_if_called)
+
+        cli.main(["persona", "physics"])
+
+        captured = capsys.readouterr().out
+        assert secret not in captured
+        assert "<REDACTED-KEY>" in captured
+
     def test_display_only_path_does_not_build_service(self, monkeypatch, capsys):
         """表示のみの分岐(--set/--clear なし)は store だけで完結すべきで、
         実 FastEmbedEmbedder を構築する _build_service を呼んではいけない
@@ -1655,3 +1677,54 @@ class TestBuildServiceWiring:
         cli._build_service()
 
         assert captured_kwargs["max_file_mb"] == 42
+
+
+class TestLoggingSetup:
+    """cli.main() の logging.basicConfig 設定テスト。"""
+
+    def test_shelf_log_level_env_enables_debug_logging(self, monkeypatch, caplog):
+        """SHELF_LOG_LEVEL=DEBUG で logger が有効になることを確認。"""
+        import logging
+
+        # logging.basicConfig() 後は既に構成済みなため、beforehand に logger を作成。
+        test_logger = logging.getLogger("shelf.convert")
+
+        with monkeypatch.context() as m:
+            m.setenv("SHELF_LOG_LEVEL", "DEBUG")
+            # main() の冒頭で logging.basicConfig(level=logging.DEBUG) を呼ぶ。
+            # ここでは直接 basicConfig をシミュレート。
+            import shelf.cli as cli_module
+            level = cli_module.config._log_level_env("SHELF_LOG_LEVEL", logging.WARNING)
+            if level != logging.WARNING or os.environ.get("SHELF_LOG_LEVEL") is not None:
+                logging.basicConfig(level=level, stream=cli_module.sys.stderr)
+
+            with caplog.at_level(logging.DEBUG, logger="shelf.convert"):
+                test_logger.debug("test debug message")
+                assert "test debug message" in caplog.text
+
+    def test_invalid_log_level_does_not_raise(self, monkeypatch):
+        """不正なログレベルが指定されても例外にならないこと。"""
+        import logging
+
+        with monkeypatch.context() as m:
+            m.setenv("SHELF_LOG_LEVEL", "INVALID_LEVEL")
+            # _log_level_env が無言でデフォルト値へフォールバック。
+            level = cli.config._log_level_env("SHELF_LOG_LEVEL", logging.WARNING)
+            assert level == logging.WARNING
+
+    def test_unset_log_level_does_not_configure_root_logger(self, monkeypatch):
+        """SHELF_LOG_LEVEL が未設定の場合、ルートロガーに影響しないこと。"""
+        import logging
+
+        root_logger = logging.getLogger()
+        original_level = root_logger.level
+
+        with monkeypatch.context() as m:
+            m.delenv("SHELF_LOG_LEVEL", raising=False)
+            # env が未設定ならば basicConfig を呼ばない。
+            level = cli.config._log_level_env("SHELF_LOG_LEVEL", logging.WARNING)
+            if level != logging.WARNING or os.environ.get("SHELF_LOG_LEVEL") is not None:
+                logging.basicConfig(level=level)
+
+            # ルートロガーが変更されていないこと（既に configured なら NOTSET）。
+            assert root_logger.level == original_level

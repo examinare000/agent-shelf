@@ -23,7 +23,7 @@ from pathlib import Path
 from shelf import config
 from shelf.engines.ollama import is_reachable
 
-# 学びの粒度プリセット（設計書タスク仕様 §1-3）。english キーはJSON/内部表現用、
+# 学びの粒度プリセット。english キーはJSON/内部表現用、
 # 画面表示は日本語ラベルで行う（GRANULARITY_LABELS）。
 #
 # digest_input_max_chars は旧単発生成パイプライン（digest 1資料を先頭4000字だけ
@@ -203,7 +203,7 @@ def collect_answers_interactively(
     input_func: Callable[[str], str] = input,
     print_func: Callable[..., None] = print,
 ) -> dict:
-    """4ステップの対話プロンプトで回答一式を集める（タスク仕様 §1-4）。
+    """4ステップの対話プロンプトで回答一式を集める。
 
     各ステップは Enter のみで既定値を採用できる。ollama/各 provider CLI の検出は
     ここで一度だけ行い、結果を選択肢の説明に併記する（利用者が実際の環境を見て

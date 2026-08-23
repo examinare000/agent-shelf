@@ -69,7 +69,7 @@ private リポジトリ `personalized-claude/shelf/`（Windows 実運用中）�
 
 還流作業に着手する前に、以下 3 点の判断が必要。
 
-- **(a) distill/extract.py の過少マスク欠陥**: 汎用 password/secret/token regex の値キャプチャが `\S+` のため、`password: "hunter 2 with spaces"` のようなクォート付き複数語の値は先頭 1 トークンのみマスクされ残りが漏れる（OSS 側は tests/test_masking.py の docstring に既知欠陥として記録済み、修正は未実施）。extract.py は **agent-recall と共有の正本**のため、単独修正すると分岐する。同期方針（正本をどちらに置くか・両方へ同時適用するか）の決定が必要。
+- **(a) distill/extract.py のクォート値マスク修正**: 汎用 password/secret/token regex の値キャプチャの過少マスク欠陥（`password: "hunter 2 with spaces"` のようなクォート付き複数語の値で先頭 1 トークンのみマスク）は **PR #15（fix/mask-quoted-values）で修正済み**です。extract.py は agent-recall と共有の正本のため、personal 側への還流時に同じ修正を extract.py へ同期する必要があります（agent-recall 側との同期は別途課題）。
 - **(b) personal のバージョン採番**: 本ガイドは personal 0.6.0 を推奨（OSS 0.5.0 と番号が衝突し由来が曖昧になるのを避ける）。personal の CHANGELOG に「OSS 0.5.0 からの還流」と明記すること。
 - **(c) 実 Windows 機での稼働確認手順**: 全単位適用後、(1) Windows 機で `shelf doctor` を実行し環境診断が green であること、(2) `serve-shelf.ps1`（または `SHELF_HTTP_ENABLED=1` で `shelf serve --http`）でサーブ起動、(3) Mac 側から `http://avalon.tail18a7d0.ts.net:8765/health` の疎通と MCP クライアント経由の `ask`/`consult` 実行、の順で確認する。手順の詳細化と実施タイミングはユーザー判断。
 

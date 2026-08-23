@@ -8,8 +8,8 @@ dependencies = [
     "anyio>=4.1",
     "fastembed>=0.4.0",
     "numpy>=1.26",
-    "pymupdf4llm",
-    "pymupdf",
+    "pymupdf4llm>=1.28.2",
+    "pymupdf>=1.28.2",
     "markitdown[docx,xlsx,xls,pptx]",
 ]
 
@@ -36,6 +36,14 @@ select = ["E4", "E7", "E9", "F", "I", "B"]
 # 上流との同期ノイズになる import 並べ替え（I）を適用しない。
 [tool.ruff.lint.per-file-ignores]
 "distill/extract.py" = ["I"]
+
+# pytest: SWIG 由来（pymupdf）の DeprecationWarning は外部ライブラリ由来で対処不能のため ignore。
+# それ以外の DeprecationWarning は検出・修正対象。
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore:builtin type .* has no __module__ attribute:DeprecationWarning",
+]
 
 # エディタ(Pyright)が shelf/.venv を解決できるようにする（実行系は uv が解決）
 # include を shelf/ に絞る: tests/ は FakeLibrarian 等 Protocol の構造的型付けに
