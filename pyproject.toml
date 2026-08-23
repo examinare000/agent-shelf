@@ -8,8 +8,8 @@ dependencies = [
     "anyio>=4.1",
     "fastembed>=0.4.0",
     "numpy>=1.26",
-    "pymupdf4llm>=1.28.0",
-    "pymupdf>=1.28.0",
+    "pymupdf4llm>=1.28.2",
+    "pymupdf>=1.28.2",
     "markitdown[docx,xlsx,xls,pptx]",
 ]
 
@@ -57,5 +57,5 @@ include = ["shelf"]
 dev = [
     "pyright>=1.1.411",
     "pytest>=8.0",
-    "ruff>=0.16.0",
+    "ruff>=0.16.2",
 ]
