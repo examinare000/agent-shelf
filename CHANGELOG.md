@@ -78,6 +78,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   直書き形式のみ。既知の制限: JSON キー形式（`"password": "..."`）は本修正の前後を通じて
   未対応のまま。また閉じクォート直後に `,` `)` `}` `;` 等の非空白が続く形（JSON5/YAML flow/Python kwarg）は
   早期閉じ誤認防止のため旧実装と同じ先頭トークンのみのマスクに留まる（露出増なし）。
+- **indexer: 再インデックス中の埋め込み契約違反で旧索引が失われる問題を修正**:
+  `index_notebook` は既存チャンクの `delete_by_source_file` を埋め込み生成・検証
+  （`zip(rows, embeddings, strict=True)`）より前に実行していたため、Embedder が
+  契約（入力 texts と同数の embedding を返す）に違反して `ValueError` になった
+  場合、新チャンクは未投入のまま旧チャンクだけが消え、該当ファイルの索引が
+  空になっていた。削除を検証成功後（upsert 直前）へ移動し、失敗時は旧索引が
+  無傷で残り再試行可能になった（embedding 過少/過多の両方向をテストで固定）。
 
 ### Security
 - **emit_mcp: claude.sh へのシェルエスケープ無し補間を修正**: `build_claude_sh_text`

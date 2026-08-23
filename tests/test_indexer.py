@@ -120,6 +120,31 @@ def test_embedder_returning_more_embeddings_than_texts_raises(tmp_path, store) -
         index_notebook(tmp_path, "physics", store, BrokenEmbedder(dim=8))
 
 
+@pytest.mark.parametrize("cardinality", ["fewer", "more"])
+def test_reindex_embedding_count_mismatch_preserves_existing_chunks(
+    tmp_path, store, embedder, cardinality
+) -> None:
+    class BrokenEmbedder(FakeEmbedder):
+        def embed_documents(self, texts: list[str]):
+            vecs = super().embed_documents(texts)
+            if cardinality == "fewer":
+                return vecs[:-1]
+            extra = self._vec("__extra__")[np.newaxis, :]
+            return np.concatenate([vecs, extra], axis=0)
+
+    path = _write(tmp_path, "physics", "a.md", "# A\n\noriginal text\n")
+    index_notebook(tmp_path, "physics", store, embedder)
+    existing_chunk = store.get_chunk("physics/a#0")
+    assert existing_chunk is not None
+
+    path.write_text("# A\n\nreplacement text is longer\n", encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        index_notebook(tmp_path, "physics", store, BrokenEmbedder(dim=8))
+
+    assert store.get_chunk("physics/a#0") == existing_chunk
+
+
 def test_unchanged_file_is_skipped_on_second_run(tmp_path, store, embedder) -> None:
     _write(tmp_path, "physics", "a.md", "# A\n\nhello world\n")
     index_notebook(tmp_path, "physics", store, embedder)
