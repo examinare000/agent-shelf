@@ -12,6 +12,7 @@ claude.sh は `claude mcp add` コマンド列（実行権限付き）、codex.t
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 HOST_CHOICES: tuple[str, ...] = ("claude", "codex", "gemini")
@@ -40,21 +41,17 @@ def build_claude_sh_text(*, transport: str, url: str | None, repo_root: Path) ->
     """`claude mcp add` コマンド列を含む実行可能スクリプトのテキストを組み立てる。
 
     transport="http" の場合 url は必須（build_codex_toml_text/
-    build_gemini_json_text と同じ契約・同じ `not url` 判定）。従来はガードが
-    無く、url=None/"" のまま素の f-string 補間（エスケープ無し）で
-    `claude mcp add --transport http shelf "None"` のような壊れたコマンド列を
-    無例外で出力していた。出力先が実行ビット付き claude.sh（emit() が chmod で
-    +x を付与）であるため、3 ビルダーの中で最も影響が大きい実穴だった。
-    なお url 内容のシェルエスケープ（`"` や `$(...)` の無害化）は本ガードでは
-    未対処のまま（shlex.quote 化は別タスク）。
+    build_gemini_json_text と同じ契約・同じ `not url` 判定）。実行可能ファイルへ
+    利用者由来の URL やパスを埋め込むため、コマンド全体を argv として構築し、
+    シェルが各値を必ず単一のリテラル引数として解釈する形へ変換する。
     """
     if transport == "http":
         if not url:
             raise ValueError("--transport http の場合は url が必須です")
-        command_line = f'claude mcp add --transport http shelf "{url}"'
+        command_argv = ["claude", "mcp", "add", "--transport", "http", "shelf", url]
     else:
-        argv = " ".join(build_stdio_argv(repo_root))
-        command_line = f"claude mcp add shelf -- {argv}"
+        command_argv = ["claude", "mcp", "add", "shelf", "--", *build_stdio_argv(repo_root)]
+    command_line = shlex.join(command_argv)
     return (
         "#!/usr/bin/env bash\n"
         "# shelf MCP サーバを Claude Code に登録する(`shelf emit-mcp` が生成)。\n"

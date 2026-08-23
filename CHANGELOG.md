@@ -80,6 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   早期閉じ誤認防止のため旧実装と同じ先頭トークンのみのマスクに留まる（露出増なし）。
 
 ### Security
+- **emit_mcp: claude.sh へのシェルエスケープ無し補間を修正**: `build_claude_sh_text`
+  は URL（`--url` で利用者が任意指定）と repo_root パスを素の f-string 補間で
+  実行ビット付き claude.sh へ埋め込んでいたため、`$(...)`・`"`・空白等を含む値が
+  コマンド実行時にシェル解釈される余地があった（url ガード修正時に「shlex.quote 化は
+  別タスク」として既知残課題化していたもの）。コマンド全体を argv として構築し
+  `shlex.join` で出力する形へ変更し、各値が必ず単一のリテラル引数として解釈される
+  ことをテストで固定した。
 - **要約/分類/digest プロンプトへの title 未 mask 露出を修正**: v0.5.0 のカタログ投影・永続化時 mask（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）は、取込時の要約生成プロンプト（`build_summary_prompt` の add/shelve 双方の呼び出し）・shelve 要約失敗時のフォールバック分類プロンプト（`build_classification_prompt`）・digest map/reduce プロンプトの title 引数には未適用で、converter 抽出直後の生 title・既存 DB 行の未 mask title がそれぞれ backend へ素通しになる経路が残っていた。プロンプト構築の直前で mask を適用する
 - **notebook description・persona の未 mask 露出を修正**: title と同型の穴が notebook description・persona にも残存していた。永続化時（`create_notebook` / shelve 新規 notebook 作成）は mask 未適用のまま store へ書き込まれ、投影時（`_build_catalog` のカタログ組み立て）・読み出し時（`ask`/`consult`/`digest` の専門家プロンプト構築直前）も既存 DB 行の未 mask 値をそのまま backend へ渡していた。永続化時 mask（新規行の恒久対処）と投影・読み出し時 mask（修正適用前の既存行への遡及対処）の二重防御を、title と同じ設計（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）で適用した。なお description には title の「再 add で自然更新」に相当する更新 API が無く、notebook 再作成でのみ更新される点に注意（既存の未 mask description を持つ notebook を浄化するには、投影/読み出し時 mask の二重防御が唯一の恒久対策となる）
 - **フレッシュレビュー指摘の残存露出経路を追加修正**: (must) `Shelver.plan()` が新規 notebook 作成時に working_catalog へ積む `NotebookCard.description` は分類 LLM 応答（`decision.description`）そのもので mask 未適用のまま、次ファイルの分類プロンプトへ生で流出していた。`Shelver` に mask callable を注入し working_catalog 構築時にのみ適用（永続化用の `result.created` は生のまま保持し、永続化前 mask は呼び出し元 service.py の責務のまま維持。shelving.py は無変更）。(should) `list_notebooks()` の `description`・CLI `shelf persona` 表示の `persona` も既存 DB 行を素通ししていたため、`list_notebooks()` は `self._masked` を、CLI 表示は `_build_service`（実モデル DL）を経由せず `shelf.masking.mask` を表示直前にのみ適用する形で塞いだ（fix/persona-lazy-service の「表示のみの分岐で `_build_service` を呼ばない」制約を維持）
