@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -577,6 +579,13 @@ def resolve_serve_settings(
 
 def main(argv: list[str] | None = None) -> None:
     _reconfigure_stdio_utf8()
+    # SHELF_LOG_LEVEL 環境変数によるログレベル制御（未設定時は現状と同一）。
+    # 不正値は無視して未設定扱い（config.py の既存フェイルソフト方針と整合）。
+    log_level = config._log_level_env("SHELF_LOG_LEVEL", logging.WARNING)
+    if log_level != logging.WARNING or os.environ.get("SHELF_LOG_LEVEL") is not None:
+        # 既定 WARNING より上げられたか、env が明示的に設定されていれば basicConfig を呼ぶ。
+        # これにより未設定時は logging 初期化を行わず、既存の「無音」状態を保つ。
+        logging.basicConfig(level=log_level, stream=sys.stderr)
     args = build_parser().parse_args(argv)
 
     if args.command == "serve":
@@ -689,7 +698,13 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 persona = nb.get("persona")
                 if persona:
-                    print(f"ペルソナ ({args.notebook}): {persona}")
+                    # _build_service()（実 FastEmbedEmbedder 等の重い依存構築）は
+                    # 表示のみの分岐で呼んではならない（fix/persona-lazy-service）。
+                    # 既存 DB 行の未 mask persona がそのまま表示されないよう、
+                    # 軽量な shelf.masking.mask を表示直前にだけ通す（ADR-0002）。
+                    from shelf.masking import mask
+
+                    print(f"ペルソナ ({args.notebook}): {mask(persona)}")
                 else:
                     print(f"ペルソナ ({args.notebook}): (未設定)")
 

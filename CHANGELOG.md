@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **fail-soft 箇所への debug ログと SHELF_LOG_LEVEL 環境変数**: 例外を握り潰して無音の箇所（summary 生成失敗・shelve 分類失敗・PDF テキスト層検出失敗）へ logger.debug() を追加。`SHELF_LOG_LEVEL` 環境変数（"DEBUG"/"INFO"/"WARNING" 等、大文字小文字許容）で logging レベルを制御可能にし、問題診断を容易にした。未設定時は現状と同一の無音状態。制御フロー変更なし。
+- **pymupdf・pymupdf4llm の下限バージョン指定**: uv.lock の実解決値（1.28.2）に合わせて `pyproject.toml` に `>=1.28.2` 下限を明示し、予期しない解決変動を防止。
+- **[tool.pytest.ini_options] 新設**: pytest テスト対象を `tests/` に限定し、SWIG 由来（pymupdf）の DeprecationWarning のみを ignore するフィルタを追加。これにより無駄な警告を除外しつつプロジェクト側の警告は検出可能に。
 - **lint・型チェックを強化**: Ruff の有効ルールへ I（isort）と B
   （flake8-bugbear）を追加し、`distill/extract.py` は共有資産との同期ノイズを
   避けるため I の対象外とした。Ruff は Dependabot #18 で更新された 0.16.1
@@ -27,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport_security=...)` のキーワード引数として渡す方式に変更。
 
 ### Fixed
+- **service.py の `_summarize_for_shelve` における UnboundLocalError の実穴を修正**:
+  title の mask 呼び出しが try ブロック内にあったため mask 自身が例外を投げると
+  フォールバック return で `masked_title` が未束縛のまま参照される
+  `UnboundLocalError` になる実穴があった（pyright: reportPossiblyUnboundVariable
+  で検出）。mask 呼び出しを try の外側へ移し、常に束縛済みにした。この結果
+  title の mask 失敗は fail-closed（例外がそのまま伝播）になる。これは同ファイル
+  内 `_resolve_description`（summary 生成失敗として fail-open に扱う既存設計）
+  とは意図的に異なる選択で、「分類プロンプトへ必ず使われる title を mask
+  できないまま処理を続けるより安全側」という判断（docstring に明記）。伝播粒度も
+  明記した: `shelve()` のディレクトリ一括投入では、この fail-closed により
+  1ファイルの title mask 失敗がバッチ全体を中断させ全ファイル未投入で終わる
+  （`ConversionError` 等の1ファイル固有エラーが per-file 収集されループ継続する
+  のとは対照的）。mask 関数自体の破損はファイル個別ではなくバッチ内全ファイルに
+  及ぶ系統的障害であるため、部分投入より全体停止を安全側として選んでいる。
 - **埋め込み件数不一致を安全に検出**: Embedder が入力テキストと異なる件数の
   embedding を返した場合、`zip(..., strict=True)` で契約違反を即座に検出する。
   再索引時は検証が完了してから旧チャンクを置換するため、失敗後も既存索引を
@@ -45,9 +62,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   直書き形式のみ。既知の制限: JSON キー形式（`"password": "..."`）は本修正の前後を通じて
   未対応のまま。また閉じクォート直後に `,` `)` `}` `;` 等の非空白が続く形（JSON5/YAML flow/Python kwarg）は
   早期閉じ誤認防止のため旧実装と同じ先頭トークンのみのマスクに留まる（露出増なし）。
+- **indexer: 再インデックス中の埋め込み契約違反で旧索引が失われる問題を修正**:
+  `index_notebook` は既存チャンクの `delete_by_source_file` を埋め込み生成・検証
+  （`zip(rows, embeddings, strict=True)`）より前に実行していたため、Embedder が
+  契約（入力 texts と同数の embedding を返す）に違反して `ValueError` になった
+  場合、新チャンクは未投入のまま旧チャンクだけが消え、該当ファイルの索引が
+  空になっていた。削除を検証成功後（upsert 直前）へ移動し、失敗時は旧索引が
+  無傷で残り再試行可能になった（embedding 過少/過多の両方向をテストで固定）。
 
 ### Security
+- **emit_mcp: claude.sh へのシェルエスケープ無し補間を修正**: `build_claude_sh_text`
+  は URL（`--url` で利用者が任意指定）と repo_root パスを素の f-string 補間で
+  実行ビット付き claude.sh へ埋め込んでいたため、`$(...)`・`"`・空白等を含む値が
+  コマンド実行時にシェル解釈される余地があった（url ガード修正時に「shlex.quote 化は
+  別タスク」として既知残課題化していたもの）。コマンド全体を argv として構築し
+  `shlex.join` で出力する形へ変更し、各値が必ず単一のリテラル引数として解釈される
+  ことをテストで固定した。
 - **要約/分類/digest プロンプトへの title 未 mask 露出を修正**: v0.5.0 のカタログ投影・永続化時 mask（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）は、取込時の要約生成プロンプト（`build_summary_prompt` の add/shelve 双方の呼び出し）・shelve 要約失敗時のフォールバック分類プロンプト（`build_classification_prompt`）・digest map/reduce プロンプトの title 引数には未適用で、converter 抽出直後の生 title・既存 DB 行の未 mask title がそれぞれ backend へ素通しになる経路が残っていた。プロンプト構築の直前で mask を適用する
+- **notebook description・persona の未 mask 露出を修正**: title と同型の穴が notebook description・persona にも残存していた。永続化時（`create_notebook` / shelve 新規 notebook 作成）は mask 未適用のまま store へ書き込まれ、投影時（`_build_catalog` のカタログ組み立て）・読み出し時（`ask`/`consult`/`digest` の専門家プロンプト構築直前）も既存 DB 行の未 mask 値をそのまま backend へ渡していた。永続化時 mask（新規行の恒久対処）と投影・読み出し時 mask（修正適用前の既存行への遡及対処）の二重防御を、title と同じ設計（[ADR-0002](docs/adr/0002-masked-invariant-for-backend-text.md)）で適用した。なお description には title の「再 add で自然更新」に相当する更新 API が無く、notebook 再作成でのみ更新される点に注意（既存の未 mask description を持つ notebook を浄化するには、投影/読み出し時 mask の二重防御が唯一の恒久対策となる）
+- **フレッシュレビュー指摘の残存露出経路を追加修正**: (must) `Shelver.plan()` が新規 notebook 作成時に working_catalog へ積む `NotebookCard.description` は分類 LLM 応答（`decision.description`）そのもので mask 未適用のまま、次ファイルの分類プロンプトへ生で流出していた。`Shelver` に mask callable を注入し working_catalog 構築時にのみ適用（永続化用の `result.created` は生のまま保持し、永続化前 mask は呼び出し元 service.py の責務のまま維持。shelving.py は無変更）。(should) `list_notebooks()` の `description`・CLI `shelf persona` 表示の `persona` も既存 DB 行を素通ししていたため、`list_notebooks()` は `self._masked` を、CLI 表示は `_build_service`（実モデル DL）を経由せず `shelf.masking.mask` を表示直前にのみ適用する形で塞いだ（fix/persona-lazy-service の「表示のみの分岐で `_build_service` を呼ばない」制約を維持）
+- **adversarial-verifier 実証済みの残存穴を追加修正**: `shelf shelve --dry-run` の JSON 出力（`created_notebooks[*].description`・`plan[*].reason`）と MCP `consult` 戻り値の `routed[*].reason` が、それぞれ plan.created（意図的に生 description を保持する shelver.py の設計）・分類/ルーティング LLM の自由記述をそのまま素通ししていた。mask 正本には既知の残存制限があり「LLM 出力に secret が混入しうる」という脅威モデルが適用されるため、いずれも `self._masked` を通す。**既知の制限として本修正の範囲外に残す事項**（詳細は SECURITY.md 既知の制限節）: (1) 修正適用前に永続化された `documents.description` の未 mask 既存行は、索引時の要約チャンク経由で backend へ流れうる（投影時二重防御の対象外。indexer は description を書き換えないため、`shelf add --desc` 指定時または `auto_summary=True` での再投入時のみ更新される。`shelf ingest` は `auto_summary=False` のため更新されない）、(2) `ShelfService(shelver=...)` の直接注入は mask 配線をバイパスする（現状呼び出し箇所ゼロの死んだ注入口・テスト専用）
+- **再検証で判明した subquery の未 mask 露出を追加修正**: MCP `consult` 戻り値の `routed[*].subquery` が未 mask のまま残っていた。`subquery` はルーティング応答の同一 JSON から `reason` と一緒に取り出す兄弟フィールドで、reason の修正時に掃引が漏れていた。クライアント出力に加えて専門家プロンプト（`_answer_with_expert` の question 引数）へも投入されるため reason より露出が広い。`_consult_target()` の読み出し点1箇所で mask した値をクライアント出力・専門家プロンプトの両方へ使う形で修正した。あわせて SECURITY.md/ADR-0002 の不変条件の記述を、実装が満たす範囲（ルーティング/分類のメタ情報フィールド）へ絞り、回答本文（answer/insights/citations）は対象外である旨を明示的に開示した。masking 依存機能が packaging 上 `distill/` の実在に依存する既知の制約（wheel 配布では動作しない）も SECURITY.md へ新規開示した
 
 ## [0.5.0] - 2026-08-02
 

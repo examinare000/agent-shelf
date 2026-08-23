@@ -1,7 +1,7 @@
 """embedder.py の純粋部分（L2正規化）のみを単体テストする。
 
 FastEmbedEmbedder 自体は ONNX モデルの実ダウンロードを伴うため、
-ここでは検証せず実データスモーク（README/報告）で確認する（設計書 §14）。
+ここでは検証せず実データスモーク（README/報告）で確認する。
 """
 from __future__ import annotations
 

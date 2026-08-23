@@ -2,9 +2,11 @@
 
 なぜ importlib で distill/extract.py を直接読み込むのか:
 mask のロジックを shelf 側で再実装すると、将来どちらかだけが更新されて
-基準が drift する（=マスク漏れ）リスクがある。extract.py は改変禁止の
-既存資産なので、モジュールとして読み込んで再エクスポートすることで
+基準が drift する（=マスク漏れ）リスクがある。extract.py は agent-recall
+由来の共有資産のため、モジュールとして読み込んで再エクスポートすることで
 「ロジックの出どころは常に1つ」を保証する（recall/recall/masking.py と同方式）。
+マスク規則の変更時は agent-recall 側との同期を検討してください（現在 drift あり・
+同期は還流時課題）。
 
 recall 側の is_human_prompt / extract_text / SKIP_PREFIXES は会話ログ専用の
 関数であり、コーパス資料（shelf）には無関係なので持ち込まない。

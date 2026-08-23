@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import overload
 from urllib.parse import urlparse
 
 from shelf import convert as _default_converter
@@ -360,6 +361,32 @@ class ShelfService:
         available = [row["name"] for row in self._store.list_notebooks()]
         return {"error": f"unknown notebook: {notebook}. available: {available}"}
 
+    @overload
+    def _masked(self, text: str) -> str: ...
+    @overload
+    def _masked(self, text: None) -> None: ...
+
+    def _masked(self, text: str | None) -> str | None:
+        """ADR-0002 の残存違反修正（description/persona/reason）専用の mask ヘルパ。
+
+        既存箇所は `self._mask(x) if self._mask is not None else x` を都度書く流儀
+        だが、その一括置換は本 ADR の修正対象箇所（description/persona/reason の
+        永続化時・投影時・クライアント向け読み取り出力）に限定し、無関係な既存箇所
+        の書き換えはスコープ外とする。
+
+        WHY @overload: 呼び出し元の一部（例: _consult_target の target.subquery、
+        RouteTarget.subquery は非 Optional の str）は None を渡し得ないと分かって
+        いるため、実装シグネチャの `str | None -> str | None` のままだと
+        `_answer_with_expert(question: str)` へ渡す際に pyright が str|None を
+        受理できず reportArgumentType になる（実行時は routing.py の isinstance
+        検証 + フォールバック構成で str が保証されているが、静的には追えない）。
+        引数の Optional 性をそのまま戻り値の Optional 性へ伝播させることで、
+        呼び出し元の型情報を落とさずに narrowing する。
+        """
+        if text is None or self._mask is None:
+            return text
+        return self._mask(text)
+
     # -- ask -----------------------------------------------------------------
 
     def ask(self, notebook: str, question: str) -> dict:
@@ -372,7 +399,7 @@ class ShelfService:
             return self._unknown_notebook_error(notebook)
 
         backend_name = nb["backend"] or self._default_backend
-        persona = nb["persona"]
+        persona = self._masked(nb["persona"])
 
         expert = self._answer_with_expert(notebook, question, persona, backend_name)
         if not expert.ok:
@@ -682,7 +709,7 @@ class ShelfService:
         return [
             {
                 "notebook": row["name"],
-                "description": row["description"],
+                "description": self._masked(row["description"]),
                 "backend": row["backend"],
                 "sources": row["documents"],
                 "chunks": row["chunks"],
@@ -700,7 +727,7 @@ class ShelfService:
         validate_notebook_name(name)
         if backend is not None:
             self._backend_factory(backend)
-        self._store.create_notebook(name, description=description, backend=backend)
+        self._store.create_notebook(name, description=self._masked(description), backend=backend)
 
     # -- description（要約）自動生成 -----------------------------------------
 
@@ -755,6 +782,7 @@ class ShelfService:
             if raw.ok:
                 summary = parse_summary(raw.text)
         except Exception:
+            _logger.debug("summary generation failed for doc_id=%s", doc_id, exc_info=True)
             summary = None
 
         if summary is not None:
@@ -1137,7 +1165,10 @@ class ShelfService:
                 if self._shelver is None:
                     backend = self._backend_factory(self._shelve_backend)
                     self._shelver = Shelver(
-                        backend, workdir=self._corpus_dir, notebook_backend=self._shelve_backend
+                        backend,
+                        workdir=self._corpus_dir,
+                        notebook_backend=self._shelve_backend,
+                        mask=self._mask,
                     )
         return self._shelver
 
@@ -1153,14 +1184,48 @@ class ShelfService:
         永続化用 description は None のまま返す（§13.8: 「stored description は
         None（既存 best-effort と同じ・source も None）」・分類はフォールバック
         テキストで継続しファイルを失わない）。
+
+        mask 失敗時の扱いは非対称: title の mask（下記 masked_title の代入）は
+        意図的に try の外側にあり、self._mask() 自身が例外を投げた場合は
+        キャッチせずそのまま呼び出し元へ伝播させる（fail-closed）。一方 summary
+        の mask（`masked = self._mask(summary) if ...`）は try 内にあり、失敗
+        すれば上記のフォールバック return で継続する（fail-open）。どちらも
+        「未 mask の値を backend/永続化へ流さない」という ADR-0002 の不変条件は
+        保つ点で共通するが、title は分類プロンプトへ必ず使われる値なので mask
+        できないなら生成自体を止める方が安全側（fail-closed）、summary は
+        そもそも生成が best-effort（失敗時は決定的フォールバックへ落とす設計が
+        既にある）ため mask 失敗もその一部として同じフォールバック経路に
+        乗せてよい、という判断の違いによる。
+
+        title mask 失敗の伝播粒度: この関数は `_prepare_shelve_candidates` の
+        ディレクトリ一括走査ループから try/except で保護されずに呼ばれるため、
+        1ファイルの title mask 失敗が `shelve()` 呼び出し全体を中断させ、その
+        バッチの全ファイルが未投入のまま終わる。同じループ内の
+        `ConversionError`/`OSError`（1ファイル固有の破損・読み取り不能）は
+        per-file に収集してループを継続するのと対照的である。この非対称は
+        意図的: mask 関数自体が壊れている場合、それは特定ファイルの問題ではなく
+        バッチ内の全ファイルに等しく及ぶ系統的障害であり、一部のファイルだけ
+        未 mask のまま部分投入するより、バッチ全体を止めて呼び出し元に気づかせる
+        方が安全側の選択となる。
         """
-        # mask 自体が失敗した場合は生 title を再利用せず、本文だけで分類を継続する。
-        masked_title: str | None = None
+        # title は converter が抽出した生値のまま渡ってくる。プロンプト構築の
+        # 直前に mask を適用する。この行は意図的に try の外側に置く: 以前は try
+        # の中にあり、self._mask(title) 自身が例外を投げると下の except で無言
+        # 破棄され、フォールバック return で masked_title が未束縛のまま参照
+        # される UnboundLocalError になっていた（pyright:
+        # reportPossiblyUnboundVariable）。
+        #
+        # WHY fail-closed（try の外に出す）: `_resolve_description`（add_source
+        # 側の同型 mask 呼び出し）は同じパターンを意図的に try の内側に置き、
+        # mask 失敗を「要約生成失敗」として fail-open に扱う（既存の
+        # best-effort 設計）。ここでの選択はそれとは異なる: title は必ず
+        # 分類プロンプトへ使われる値であり、mask できないまま黙って処理を
+        # 続けるより、大きな音で止まる方が ADR-0002（backend へ送る全テキストは
+        # mask 済み、という不変条件）に整合すると判断した。try の外に出すことで
+        # masked_title は常に束縛済みになり、mask 自身の例外は素直に呼び出し元へ
+        # 伝播する。
+        masked_title = self._mask(title) if self._mask is not None and title else title
         try:
-            # title は converter が抽出した生値のまま渡ってくる。add_source 側
-            # （_resolve_description）と同じ流儀で、プロンプト構築の直前に mask を
-            # 適用する。
-            masked_title = self._mask(title) if self._mask is not None and title else title
             raw = backend.answer(
                 build_summary_prompt(markdown, title=masked_title),
                 workdir=self._corpus_dir,
@@ -1172,7 +1237,7 @@ class ShelfService:
                     masked = self._mask(summary) if self._mask is not None else summary
                     return masked, masked
         except Exception:
-            pass
+            _logger.debug("shelve summary generation failed", exc_info=True)
         # フォールバックの classification_text も build_classification_prompt
         # 経由で classify_backend へ渡るため、成功パスと同じく masked_title を使う
         # （掃引で発見: 従来はここだけ生 title を使っており、要約生成が失敗した
@@ -1269,12 +1334,16 @@ class ShelfService:
                         "notebook": a.notebook,
                         "new_notebook": a.new_notebook,
                         "summary": a.summary,
-                        "reason": a.reason,
+                        "reason": self._masked(a.reason),
                     }
                     for a in plan.assignments
                 ],
                 "created_notebooks": [
-                    {"notebook": c.name, "description": c.description, "backend": c.backend}
+                    {
+                        "notebook": c.name,
+                        "description": self._masked(c.description),
+                        "backend": c.backend,
+                    }
                     for c in plan.created
                 ],
                 "skipped": skipped,
@@ -1284,7 +1353,7 @@ class ShelfService:
 
         for spec in plan.created:
             self._store.create_notebook(
-                spec.name, description=spec.description, backend=spec.backend
+                spec.name, description=self._masked(spec.description), backend=spec.backend
             )
 
         converted_by_origin = {c.origin: c for c in converted}
@@ -1370,8 +1439,8 @@ class ShelfService:
         return [
             NotebookCard(
                 name=row["name"],
-                description=row["description"],
-                persona=row["persona"],
+                description=self._masked(row["description"]),
+                persona=self._masked(row["persona"]),
                 doc_count=row["documents"],
                 tags=tuple(tags_by_notebook.get(row["name"], ())),
                 titles=(
@@ -1521,13 +1590,20 @@ class ShelfService:
         """
         nb = self._store.get_notebook(target.notebook) or {}
         backend_name = nb.get("backend") or self._default_backend
-        persona = nb.get("persona")
+        persona = self._masked(nb.get("persona"))
+        # subquery は reason と同一のルーティング LLM 応答 JSON から取り出す兄弟
+        # フィールドで、mask を一度も通っていない自由記述である点は同じだが、
+        # クライアント出力に加えて専門家プロンプト（_answer_with_expert の
+        # question 引数）へも投入されるぶん reason より露出が広い。読み出し点
+        # 1箇所で mask した値をクライアント出力・専門家プロンプトの両方に使う
+        # （digest の persona 修正と対称の設計）。
+        subquery = self._masked(target.subquery)
 
-        expert = self._answer_with_expert(target.notebook, target.subquery, persona, backend_name)
+        expert = self._answer_with_expert(target.notebook, subquery, persona, backend_name)
         return {
             "notebook": target.notebook,
-            "reason": target.reason,
-            "subquery": target.subquery,
+            "reason": self._masked(target.reason),
+            "subquery": subquery,
             "score": target.score,
             "backend": backend_name,
             "persona": persona,
@@ -1566,7 +1642,7 @@ class ShelfService:
         # 空なら notebook 自体の backend（さらに空ならサービス全体既定）へフォールバック
         # する（router_backend と同じ「空=呼び出し側でフォールバック」流儀）。
         backend_name = self._digest_backend or nb["backend"] or self._default_backend
-        persona = nb["persona"]
+        persona = self._masked(nb["persona"])
 
         if doc_id is not None:
             doc = self._store.get_document(doc_id)

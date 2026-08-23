@@ -559,3 +559,39 @@ class TestConfigFileLoader:
             importlib.reload(config)
             assert config.TOP_K == 10
         importlib.reload(config)
+
+
+def test_log_level_env_with_debug(monkeypatch):
+    """SHELF_LOG_LEVEL=DEBUG で logger レベルが DEBUG に設定されること。"""
+    import logging
+
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_LOG_LEVEL", "DEBUG")
+        level = config._log_level_env("SHELF_LOG_LEVEL", logging.WARNING)
+        assert level == logging.DEBUG
+
+
+def test_log_level_env_case_insensitive(monkeypatch):
+    """ログレベル指定が大文字小文字不問であること。"""
+    import logging
+
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_LOG_LEVEL", "debug")
+        level = config._log_level_env("SHELF_LOG_LEVEL", logging.WARNING)
+        assert level == logging.DEBUG
+
+
+def test_log_level_env_invalid_value_falls_back_to_default():
+    """ログレベルが不正値の場合、デフォルト値へフォールバックすること。"""
+    import logging
+
+    level = config._log_level_env("NONEXISTENT_LOG_LEVEL", logging.WARNING)
+    assert level == logging.WARNING
+
+
+def test_log_level_env_unset_returns_default():
+    """ログレベル env が未設定の場合、デフォルト値を返すこと。"""
+    import logging
+
+    level = config._log_level_env("NONEXISTENT_LOG_LEVEL_XYZ", logging.WARNING)
+    assert level == logging.WARNING
