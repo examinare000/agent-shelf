@@ -12,7 +12,6 @@ close する（未作成パスに対して Store を構築し新規スキーマ�
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -243,25 +242,27 @@ class TestCheckCorpusDir:
 
 
 class TestResolveFastembedCacheDir:
-    """fastembed.common.utils.define_cache_dir と同じ優先順位（env > 既定の
-    tempdir/fastembed_cache）を、fastembed 自体を import せずに再現する。
+    """FastEmbedEmbedder が TextEmbedding へ cache_dir を明示的に渡すようになったため、
+    doctor が報告すべき場所は config.MODEL_CACHE_DIR ただ一つになった。
     """
 
-    def test_uses_env_var_when_set(self, monkeypatch, tmp_path):
+    def test_reports_config_model_cache_dir(self):
+        from shelf import config
+
+        assert resolve_fastembed_cache_dir() == config.MODEL_CACHE_DIR
+
+    def test_ignores_fastembed_cache_path_env(self, monkeypatch, tmp_path):
+        # fastembed の define_cache_dir は cache_dir 引数を FASTEMBED_CACHE_PATH より
+        # 優先するため、この env は shelf の埋め込みキャッシュ先を変えない。doctor が
+        # 実際に使われない場所を報告してしまう事故（誤診断）を防ぐ回帰テスト。
+        from shelf import config
+
         monkeypatch.setenv("FASTEMBED_CACHE_PATH", str(tmp_path / "custom_cache"))
 
         result = resolve_fastembed_cache_dir()
 
-        assert result == tmp_path / "custom_cache"
-
-    def test_falls_back_to_tempdir_fastembed_cache_when_unset(self, monkeypatch):
-        import tempfile
-
-        monkeypatch.delenv("FASTEMBED_CACHE_PATH", raising=False)
-
-        result = resolve_fastembed_cache_dir()
-
-        assert result == Path(tempfile.gettempdir()) / "fastembed_cache"
+        assert result == config.MODEL_CACHE_DIR
+        assert result != tmp_path / "custom_cache"
 
 
 class TestCheckFastembedCache:
