@@ -54,6 +54,34 @@ def test_embed_model_env_override(monkeypatch):
     importlib.reload(config)
 
 
+def test_model_cache_dir_default_is_under_home_cache():
+    # fastembed 既定（$TMPDIR 配下）はサンドボックス内外で別パスへ解決され、起動のたびに
+    # モデルキャッシュを見失うため、~/.cache/fastembed へ固定する。
+    assert config.MODEL_CACHE_DIR == Path.home() / ".cache" / "fastembed"
+
+
+def test_model_cache_dir_is_not_affected_by_tmpdir(monkeypatch, tmp_path):
+    with monkeypatch.context() as m:
+        m.setenv("TMPDIR", str(tmp_path / "sandbox-tmp"))
+        importlib.reload(config)
+        assert config.MODEL_CACHE_DIR == Path.home() / ".cache" / "fastembed"
+    importlib.reload(config)
+
+
+def test_model_cache_dir_env_override(monkeypatch, tmp_path):
+    custom = tmp_path / "models"
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MODEL_CACHE_DIR", str(custom))
+        importlib.reload(config)
+        assert config.MODEL_CACHE_DIR == custom
+    importlib.reload(config)
+
+
+def test_model_cache_dir_is_absolute():
+    # fastembed へ文字列として渡すため、プロセスの cwd に依存しない絶対パスである必要がある。
+    assert config.MODEL_CACHE_DIR.is_absolute()
+
+
 def test_default_backend_default():
     assert config.DEFAULT_BACKEND == "codex"
 

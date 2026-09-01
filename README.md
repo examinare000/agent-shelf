@@ -234,6 +234,7 @@ shelf は大規模資料（数百頁の書籍など）から学びノートを�
 | `SHELF_DB_PATH` | `<repo>/.catalog/shelf.db` | SQLite ローカル DB パス |
 | `SHELF_CORPUS_DIR` | `<repo>/corpus` | コーパス投入ディレクトリ |
 | `SHELF_EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 埋め込みモデル |
+| `SHELF_MODEL_CACHE_DIR` | `~/.cache/fastembed` | 埋め込みモデルのキャッシュ置き場（$TMPDIR 依存を避けるため固定） |
 | `SHELF_DEFAULT_BACKEND` | `codex` | デフォルト LLM バックエンド（codex/gemini/agy/ollama） |
 | `SHELF_TOP_K` | `10` | 検索結果の上位 K 件 |
 | `SHELF_ANSWER_TIMEOUT` | `300` | LLM 応答タイムアウト（秒） |
