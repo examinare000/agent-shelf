@@ -210,8 +210,9 @@ anyio のワーカースレッドプール（既定上限 40 スレッド）へ�
 **初回起動の注意**: 埋め込みモデル（fastembed）が未キャッシュだと、`serve` は
 リスナーを bind する前にモデル DL を行うため、DL 完了までポートが開かず
 `/health` も応答しません。サービス登録の前に一度対話環境で `shelf index` /
-`shelf ask` 等を実行してキャッシュを温めておくか、`FASTEMBED_CACHE_PATH` を
-永続的な場所に設定してから登録してください。
+`shelf ask` 等を実行してキャッシュを温めておくか、`SHELF_MODEL_CACHE_DIR` を
+永続的な場所に設定してから登録してください（fastembed 本体の
+`FASTEMBED_CACHE_PATH` ではキャッシュ先は変わりません。後述の環境変数表を参照）。
 
 ## ダイジェスト生成（digest）
 
@@ -234,7 +235,7 @@ shelf は大規模資料（数百頁の書籍など）から学びノートを�
 | `SHELF_DB_PATH` | `<repo>/.catalog/shelf.db` | SQLite ローカル DB パス |
 | `SHELF_CORPUS_DIR` | `<repo>/corpus` | コーパス投入ディレクトリ |
 | `SHELF_EMBED_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 埋め込みモデル |
-| `SHELF_MODEL_CACHE_DIR` | `~/.cache/fastembed` | 埋め込みモデルのキャッシュ置き場（$TMPDIR 依存を避けるため固定） |
+| `SHELF_MODEL_CACHE_DIR` | `~/.cache/fastembed` | 埋め込みモデル（fastembed）のキャッシュ置き場。fastembed 既定の一時ディレクトリ配下は環境によって別パスへ解決されモデル DL がやり直しになり得るため、永続パスへ固定しています。相対値・`~` は絶対パスへ正規化されます |
 | `SHELF_DEFAULT_BACKEND` | `codex` | デフォルト LLM バックエンド（codex/gemini/agy/ollama） |
 | `SHELF_TOP_K` | `10` | 検索結果の上位 K 件 |
 | `SHELF_ANSWER_TIMEOUT` | `300` | LLM 応答タイムアウト（秒） |
@@ -256,7 +257,7 @@ shelf は大規模資料（数百頁の書籍など）から学びノートを�
 | `SHELF_HTTP_HOST` | `127.0.0.1` | `--http` 時の bind ホスト（`--host` 未指定時のみ使用） |
 | `SHELF_HTTP_PORT` | `8765` | `--http` 時の bind ポート（`--port` 未指定時のみ使用） |
 | `SHELF_ALLOWED_HOSTS` | `` | DNS リバインディング保護の追加許可 Host（カンマ区切り、`--allowed-host` 未指定時のみ使用） |
-| `FASTEMBED_CACHE_PATH` | OS 一時ディレクトリ配下 `fastembed_cache` | fastembed（埋め込みモデル）のキャッシュ先。`shelf` 独自の変数ではなく fastembed 本体が参照する変数です。Windows をサービスとして運用する場合、既定の一時ディレクトリはクリーンアップやサービスアカウント別 temp の影響でモデル DL がやり直しになり得るため、永続パスを明示することを推奨します |
+| `FASTEMBED_CACHE_PATH` | （shelf では無効） | fastembed 本体が参照する変数ですが、`shelf` は `TextEmbedding` へ `cache_dir` を常に明示的に渡すため、fastembed 側でこの変数より `cache_dir` 引数が優先されます。**shelf の埋め込みモデルのキャッシュ先を変えるには `SHELF_MODEL_CACHE_DIR` を使ってください** |
 
 ## アップグレード・マイグレーション（0.3.x → 0.4.0）
 

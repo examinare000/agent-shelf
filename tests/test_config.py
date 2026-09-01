@@ -57,14 +57,16 @@ def test_embed_model_env_override(monkeypatch):
 def test_model_cache_dir_default_is_under_home_cache():
     # fastembed 既定（$TMPDIR 配下）はサンドボックス内外で別パスへ解決され、起動のたびに
     # モデルキャッシュを見失うため、~/.cache/fastembed へ固定する。
-    assert config.MODEL_CACHE_DIR == Path.home() / ".cache" / "fastembed"
+    # 期待値側も resolve() するのは、HOME 自体がシンボリックリンクの環境で
+    # 正規化の有無だけを理由に落ちないようにするため（検証したいのは置き場所）。
+    assert config.MODEL_CACHE_DIR == (Path.home() / ".cache" / "fastembed").resolve()
 
 
 def test_model_cache_dir_is_not_affected_by_tmpdir(monkeypatch, tmp_path):
     with monkeypatch.context() as m:
         m.setenv("TMPDIR", str(tmp_path / "sandbox-tmp"))
         importlib.reload(config)
-        assert config.MODEL_CACHE_DIR == Path.home() / ".cache" / "fastembed"
+        assert config.MODEL_CACHE_DIR == (Path.home() / ".cache" / "fastembed").resolve()
     importlib.reload(config)
 
 
@@ -74,6 +76,26 @@ def test_model_cache_dir_env_override(monkeypatch, tmp_path):
         m.setenv("SHELF_MODEL_CACHE_DIR", str(custom))
         importlib.reload(config)
         assert config.MODEL_CACHE_DIR == custom
+    importlib.reload(config)
+
+
+def test_model_cache_dir_env_relative_value_is_normalized_to_absolute(monkeypatch, tmp_path):
+    # 相対値のままだと起動時の cwd 次第で別のキャッシュを指し、モデル再ダウンロードが
+    # 発生する（キャッシュ先を固定した目的が失われる）ため、絶対パスへ正規化する。
+    with monkeypatch.context() as m:
+        m.chdir(tmp_path)
+        m.setenv("SHELF_MODEL_CACHE_DIR", "cache")
+        importlib.reload(config)
+        assert config.MODEL_CACHE_DIR.is_absolute()
+        assert config.MODEL_CACHE_DIR == (tmp_path / "cache").resolve()
+    importlib.reload(config)
+
+
+def test_model_cache_dir_env_tilde_is_expanded(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_MODEL_CACHE_DIR", "~/.cache/shelf-models")
+        importlib.reload(config)
+        assert config.MODEL_CACHE_DIR == (Path.home() / ".cache" / "shelf-models").resolve()
     importlib.reload(config)
 
 
