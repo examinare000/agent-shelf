@@ -26,7 +26,6 @@ import は "sqlite3"/"urllib.request" の import としてカウントされな�
 """
 from __future__ import annotations
 
-import os
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -165,13 +164,13 @@ def check_corpus_dir(corpus_dir: str | Path) -> CheckResult:
 def resolve_fastembed_cache_dir() -> Path:
     """fastembed が実際にモデルを保存するキャッシュディレクトリを解決する。
 
-    fastembed.common.utils.define_cache_dir と同じ優先順位（env
-    FASTEMBED_CACHE_PATH > 既定 <tempdir>/fastembed_cache）をここで再現する。
-    fastembed 自体は本ファイルで import できない（boundaries: embedder.py 専用）ため、
-    ロジックだけを複製する（fastembed 側の既定値が変わらない限り安全な複製）。
+    FastEmbedEmbedder が TextEmbedding(cache_dir=...) を常に明示的に渡すように
+    なったため、fastembed 側の define_cache_dir は cache_dir 引数を優先し env
+    FASTEMBED_CACHE_PATH も <tempdir>/fastembed_cache も参照しない。したがって
+    doctor が報告すべき唯一の正しい場所は config.MODEL_CACHE_DIR
+    （SHELF_MODEL_CACHE_DIR で上書き可）であり、ここで再解決の重複は持たない。
     """
-    default_cache_dir = Path(tempfile.gettempdir()) / "fastembed_cache"
-    return Path(os.environ.get("FASTEMBED_CACHE_PATH", str(default_cache_dir)))
+    return config.MODEL_CACHE_DIR
 
 
 def check_fastembed_cache(cache_dir: str | Path) -> CheckResult:

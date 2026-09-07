@@ -6,10 +6,13 @@ Embedder を Protocol にして注入可能にすることで、ドメイン(She
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 from fastembed import TextEmbedding
+
+from shelf.config import MODEL_CACHE_DIR
 
 
 class Embedder(Protocol):
@@ -45,10 +48,16 @@ class FastEmbedEmbedder:
     """
 
     def __init__(
-        self, model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        self,
+        model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        cache_dir: Path | None = None,
     ) -> None:
         self.model_name = model_name
-        self._model = TextEmbedding(model_name=model_name)
+        # cache_dir を明示しないと fastembed が $TMPDIR 配下を使い、サンドボックス内外で
+        # 別パスへ解決されてキャッシュを見失う（config.MODEL_CACHE_DIR のコメント参照）。
+        self._model = TextEmbedding(
+            model_name=model_name, cache_dir=str(cache_dir or MODEL_CACHE_DIR)
+        )
         self.dim = TextEmbedding.get_embedding_size(model_name)
 
     def embed_documents(self, texts: list[str]) -> np.ndarray:

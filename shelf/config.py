@@ -112,6 +112,18 @@ CORPUS_DIR = Path(os.environ.get("SHELF_CORPUS_DIR", PACKAGE_ROOT / "corpus"))
 EMBED_MODEL = os.environ.get(
     "SHELF_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
+# fastembed のモデルキャッシュ置き場。fastembed の既定は tempfile.gettempdir() 配下
+# （$TMPDIR 依存）だが、$TMPDIR は Claude Code のサンドボックス内外で別パスへ解決される
+# ため、起動のたびにキャッシュを見失いモデル再ダウンロードを試み、ネットワーク遮断下では
+# MCP サーバが起動不能になる。~/.cache 配下は書き込みが許可され消えないので、ここに固定する。
+# expanduser().resolve(): SHELF_MODEL_CACHE_DIR に "cache" のような相対値や "~/..." が
+# 入ると、起動時の cwd や HOME 展開の有無で別ディレクトリを指してしまい、固定した意味が
+# 失われるため、ここで絶対パスへ正規化してから TextEmbedding へ渡す。
+MODEL_CACHE_DIR = (
+    Path(os.environ.get("SHELF_MODEL_CACHE_DIR", Path.home() / ".cache" / "fastembed"))
+    .expanduser()
+    .resolve()
+)
 DEFAULT_BACKEND = os.environ.get("SHELF_DEFAULT_BACKEND", "codex")
 TOP_K = _int_env("SHELF_TOP_K", 10)
 ANSWER_TIMEOUT = _int_env("SHELF_ANSWER_TIMEOUT", 300)
