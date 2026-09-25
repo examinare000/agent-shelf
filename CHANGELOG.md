@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport_security=...)` のキーワード引数として渡す方式に変更。
 
 ### Fixed
+- **埋め込みモデルのキャッシュ先を `~/.cache/fastembed` に固定**: fastembed 既定の
+  キャッシュ先は `$TMPDIR` 配下で、Claude Code のサンドボックス内外で別パスへ解決される
+  ため、起動のたびにモデル再ダウンロードを試み、ネットワーク遮断下では MCP サーバが
+  起動不能になっていた。新設の `SHELF_MODEL_CACHE_DIR`（相対値・`~` は絶対パスへ正規化）で
+  上書きできる。`FASTEMBED_CACHE_PATH` は shelf では効かなくなり、`shelf doctor` も
+  実際のキャッシュ先を報告するようにした。
 - **service.py の `_summarize_for_shelve` における UnboundLocalError の実穴を修正**:
   title の mask 呼び出しが try ブロック内にあったため mask 自身が例外を投げると
   フォールバック return で `masked_title` が未束縛のまま参照される
