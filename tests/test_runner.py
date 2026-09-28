@@ -4,7 +4,7 @@ runner.py のテスト: subprocess 実行の一本化。
 実プロセスは sys.executable -c "..." ベースの決定論コマンドのみ使用する
 （Windows CI に /bin/echo 等の POSIX バイナリが存在しないため）。
 検証: stdout capture / stdin 渡し / 非0 returncode / timeout で timed_out=True
-かつ所要時間が timeout+2秒以内 / 存在しないコマンド→127 / workdir が効く。
+かつ所要時間が後始末予算（実装定数から導出）以内 / 存在しないコマンド→127 / workdir が効く。
 """
 from __future__ import annotations
 
@@ -17,7 +17,26 @@ from pathlib import Path
 
 import pytest
 
-from shelf.engines.runner import RunResult, run_command, summarize_stderr
+from shelf.engines.runner import (
+    _POST_TIMEOUT_DRAIN_TIMEOUT,
+    _WINDOWS_TASKKILL_TIMEOUT,
+    RunResult,
+    run_command,
+    summarize_stderr,
+)
+
+
+def _timeout_cleanup_budget(timeout: int) -> float:
+    """timeout 超過時に run_command が返るまでの許容秒数を実装の定数から導く。
+
+    POSIX は killpg が即時なので timeout + 出力回収 + 余裕 2 秒。Windows は
+    taskkill /T が CI 負荷下で上限いっぱい（5 秒）かかった実測があるため、
+    その上限も加える（PR #39 の windows-latest 3.13 で 6.26 秒を観測）。
+    """
+    budget = timeout + _POST_TIMEOUT_DRAIN_TIMEOUT + 2
+    if os.name == "nt":
+        budget += _WINDOWS_TASKKILL_TIMEOUT
+    return budget
 
 
 class TestRunCommandBasic:
@@ -71,8 +90,9 @@ class TestRunCommandTimeout:
 
 
         assert result.timed_out is True
-        # timeout は秒単位なので、実際の経過時間は timeout + 若干のマージン
-        assert elapsed < 3, f"timeout processing took {elapsed}s (should be <3s)"
+        # timeout 後の後始末に必要な時間は実装の定数から導く（環境依存の固定値を置かない）
+        budget = _timeout_cleanup_budget(1)
+        assert elapsed < budget, f"timeout processing took {elapsed}s (should be <{budget}s)"
 
     def test_timeout_kills_subprocess(self):
         """timeout 後、子プロセスが確実に殺されている（joinで即座に返る）。"""
@@ -84,8 +104,9 @@ class TestRunCommandTimeout:
         elapsed = time.time() - start
 
         assert result.timed_out is True
-        # timeout+2秒以内に返ってくることを確認（子プロセス生存なら 100 秒かかる）
-        assert elapsed < 4, f"elapsed {elapsed}s > timeout+2s"
+        # 後始末予算内に返ってくることを確認（子プロセス生存なら 100 秒かかる）
+        budget = _timeout_cleanup_budget(1)
+        assert elapsed < budget, f"elapsed {elapsed}s > {budget}s"
 
 
 class TestRunCommandErrors:
