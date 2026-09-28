@@ -15,6 +15,12 @@ from pathlib import Path
 
 _STDERR_SUMMARY_MAX_LEN = 120
 
+# timeout 超過後の後始末に許す上限秒。Windows の taskkill /T は CI ランナー負荷下で
+# 数秒かかることがあり（実測: windows-latest で約 5 秒）、テストが「timeout+2 秒」を
+# 前提にすると環境依存で赤くなる。テスト側はこの定数から所要時間の上限を導く。
+_WINDOWS_TASKKILL_TIMEOUT = 5
+_POST_TIMEOUT_DRAIN_TIMEOUT = 1
+
 
 def summarize_stderr(stderr: str) -> str:
     """stderr 先頭1行を診断用に安全な要約にする(120字切詰・改行除去)。
@@ -132,7 +138,7 @@ def run_command(
                     result = subprocess.run(
                         ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                         capture_output=True,
-                        timeout=5,
+                        timeout=_WINDOWS_TASKKILL_TIMEOUT,
                     )
                     if result.returncode != 0:
                         proc.kill()
@@ -152,7 +158,7 @@ def run_command(
 
             # タイムアウト後の残り出力を回収
             try:
-                stdout, stderr = proc.communicate(timeout=1)
+                stdout, stderr = proc.communicate(timeout=_POST_TIMEOUT_DRAIN_TIMEOUT)
             except subprocess.TimeoutExpired:
                 stdout, stderr = "", ""
 
