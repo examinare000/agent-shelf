@@ -45,6 +45,17 @@ class TestBuildRoutingPrompt:
 
         assert "スピンとは何ですか" in prompt
 
+    def test_catalog_precedes_question_to_keep_prefix_stable(self):
+        """質問は末尾に置く。固定部(指示+カタログ)を安定した先頭プレフィックスに
+        することで、Ollama の KV プレフィックスキャッシュが質問ごとに無効化されない。
+        """
+        card = _card(name="quantum-mechanics")
+
+        prompt = build_routing_prompt("スピンとは何ですか", [card])
+
+        assert prompt.index("quantum-mechanics") < prompt.index("スピンとは何ですか")
+        assert prompt.endswith("質問: スピンとは何ですか")
+
     def test_includes_notebook_name_and_doc_count(self):
         card = _card(name="quantum-mechanics", doc_count=5)
 
