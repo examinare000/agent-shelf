@@ -133,6 +133,13 @@ DEEP_DIVE = _bool_env("SHELF_DEEP_DIVE", False)
 OLLAMA_URL = os.environ.get("SHELF_OLLAMA_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL = os.environ.get("SHELF_OLLAMA_MODEL", "qwen3:8b")
 
+# Ollama へモデルをアンロードさせずに保持させる時間。Ollama は既定5分でモデルを
+# アンロードするが、実運用の consult 呼び出し間隔は通常5分を超えるため、
+# ほぼ毎回 ~15s のモデル再ロードを踏んでいることが実機計測で判明した
+# (コールド consult 24.4s / ウォーム 9.1s)。既定を60分へ延ばしてロード頻度を下げる。
+# 空文字列を指定した場合は Ollama 自身の既定挙動へ委ねる（脱出ハッチ）。
+OLLAMA_KEEP_ALIVE = os.environ.get("SHELF_OLLAMA_KEEP_ALIVE", "60m")
+
 # 司書（Librarian）のルーティング推論専用バックエンド名。空文字列 = 未指定を意味し、
 # service 側で `config.ROUTER_BACKEND or config.DEFAULT_BACKEND` として解決する
 # 前提（設計書 §6-D）。専門家と司書で別バックエンドを使う運用（例: 司書は軽量・速い

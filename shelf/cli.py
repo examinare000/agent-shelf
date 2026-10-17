@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -281,6 +282,53 @@ def _build_service() -> ShelfService:
         shelve_backend=config.SHELVE_BACKEND,
         max_file_mb=config.MAX_FILE_MB,
     )
+
+
+def _preload_ollama_if_configured(service: ShelfService) -> None:
+    """serve 起動時、司書バックエンド・既定バックエンド・notebook 個別バックエンドの
+    いずれかが ollama の場合のみモデルプリロードを非同期スレッドで1発発火する
+    （起動をブロックしない）。
+
+    Ollama を使わない構成（既定 codex 等）では何もしない。preload 自体が
+    fail-soft（例外を握りつぶし bool を返すのみ）のため、Ollama 不在でも
+    serve は正常起動する。
+
+    グローバルバックエンド判定（config.ROUTER_BACKEND or config.DEFAULT_BACKEND）が
+    ollama でなくても、service.list_notebooks() で任意の notebook が
+    backend='ollama' を持つ場合に発火する（notebook 単位の backend 上書き対応、
+    最適化 fail-soft なので過検知は許容）。list_notebooks() が例外を送出した場合も
+    無視してプリロードをスキップし、serve 起動は正常継続する。
+
+    engines.ollama の import はここでのみ行う
+    （_build_service と同じ「重い/外部依存を伴う import は使用箇所まで遅延する」作法）。
+    """
+    try:
+        if not _uses_ollama(service):
+            return
+
+        from shelf.engines.ollama import preload
+
+        threading.Thread(
+            target=preload,
+            args=(config.OLLAMA_URL, config.OLLAMA_MODEL, config.OLLAMA_KEEP_ALIVE),
+            daemon=True,
+        ).start()
+    except Exception:
+        # preload は純粋な最適化であり、import・スレッド生成の失敗を含め、どんな
+        # 理由でも serve の起動を止めてはならない。
+        pass
+
+
+def _uses_ollama(service: ShelfService) -> bool:
+    """グローバル(司書/既定)または notebook 個別のバックエンドに ollama が含まれるか。"""
+    if (config.ROUTER_BACKEND or config.DEFAULT_BACKEND) == "ollama":
+        return True
+    try:
+        return any(nb.get("backend") == "ollama" for nb in service.list_notebooks())
+    except Exception:
+        # 列挙失敗は preload を諦めるだけにとどめる（preload は最適化で、serve 起動を
+        # ブロックしてはならない）。
+        return False
 
 
 def _print_notebooks(service: ShelfService) -> None:
@@ -596,7 +644,9 @@ def main(argv: list[str] | None = None) -> None:
             env_port=config.HTTP_PORT,
             env_allowed_hosts=config.ALLOWED_HOSTS,
         )
-        server = create_server(_build_service())
+        service = _build_service()
+        _preload_ollama_if_configured(service)
+        server = create_server(service)
         if settings.http:
             # Tailscale VPN 内での bind を前提とし、認証は VPN 境界に委ねる
             # (design doc §1)。エンドポイントは mcp SDK の既定 "/mcp"。

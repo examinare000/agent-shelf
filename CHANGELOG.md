@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Ollama の keep_alive と serve 起動時の先読みロード**: `SHELF_OLLAMA_KEEP_ALIVE`（既定 `60m`、空文字で無効）を Ollama リクエストに載せ、router / 既定 / notebook のいずれかの backend が ollama の場合は `serve` 開始時に daemon スレッドでモデルを先読みする。先読み失敗は serve を止めない。実運用でのモデル再ロード待ち（約 15 秒）を解消する。
+
 ### Changed
 - **fail-soft 箇所への debug ログと SHELF_LOG_LEVEL 環境変数**: 例外を握り潰して無音の箇所（summary 生成失敗・shelve 分類失敗・PDF テキスト層検出失敗）へ logger.debug() を追加。`SHELF_LOG_LEVEL` 環境変数（"DEBUG"/"INFO"/"WARNING" 等、大文字小文字許容）で logging レベルを制御可能にし、問題診断を容易にした。未設定時は現状と同一の無音状態。制御フロー変更なし。
 - **pymupdf・pymupdf4llm の下限バージョン指定**: uv.lock の実解決値（1.28.2）に合わせて `pyproject.toml` に `>=1.28.2` 下限を明示し、予期しない解決変動を防止。

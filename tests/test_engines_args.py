@@ -11,6 +11,7 @@ import json
 
 import pytest
 
+from shelf import config
 from shelf.engines import agy as agy_module
 from shelf.engines import codex as codex_module
 from shelf.engines import create_backend
@@ -240,6 +241,29 @@ class TestBuildPayload:
 
         assert isinstance(payload, dict)
 
+    def test_keep_alive_default_is_omitted(self):
+        """keep_alive 省略時（未指定）は既定 None としてキーを含めない
+        （呼び出し元 OllamaBackend が常に明示的に渡す設計だが、純粋関数単体としても
+        安全なデフォルトにしておく）。
+        """
+        payload = build_payload("prompt", "qwen3:8b", None)
+
+        assert "keep_alive" not in payload
+
+    def test_keep_alive_given_sets_key(self):
+        """keep_alive が空でない文字列で指定された場合、payload にそのまま渡す。"""
+        payload = build_payload("prompt", "qwen3:8b", None, keep_alive="60m")
+
+        assert payload["keep_alive"] == "60m"
+
+    def test_keep_alive_empty_string_omits_key(self):
+        """keep_alive が空文字列（Ollama 既定へ委ねる脱出ハッチ）の場合、
+        キー自体を省いて Ollama 側の既定挙動に任せる。
+        """
+        payload = build_payload("prompt", "qwen3:8b", None, keep_alive="")
+
+        assert "keep_alive" not in payload
+
 
 class _FakeHTTPResponse:
     """urllib.request.urlopen の戻り値（with 文で使うコンテキストマネージャ）を模す。"""
@@ -295,8 +319,31 @@ class TestOllamaBackendAnswer:
 
         backend.answer("hello", tmp_path, schema=schema)
 
-        assert captured["data"] == build_payload("hello", "qwen3:8b", schema)
+        assert captured["data"] == build_payload(
+            "hello", "qwen3:8b", schema, keep_alive=config.OLLAMA_KEEP_ALIVE
+        )
         assert captured["timeout"] == 42
+
+    def test_answer_sends_keep_alive_from_config(self, monkeypatch, tmp_path):
+        """モデルアンロードによる再ロードレイテンシを避けるため、answer() は
+        config.OLLAMA_KEEP_ALIVE を payload に載せて送る。
+        """
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["data"] = json.loads(req.data.decode("utf-8"))
+            body = json.dumps({"message": {"content": "ok"}}).encode("utf-8")
+            return _FakeHTTPResponse(body)
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+        monkeypatch.setattr(ollama_module.config, "OLLAMA_KEEP_ALIVE", "30m")
+        backend = ollama_module.OllamaBackend(
+            timeout=5, url="http://127.0.0.1:11434", model="qwen3:8b"
+        )
+
+        backend.answer("hello", tmp_path, schema=None)
+
+        assert captured["data"]["keep_alive"] == "30m"
 
     def test_connection_error_returns_safe_failure(self, monkeypatch, tmp_path):
         def fake_urlopen(req, timeout=None):
@@ -414,6 +461,83 @@ class TestIsReachable:
 
         assert captured["url"] == "http://127.0.0.1:11434/api/tags"
         assert captured["timeout"] == 2.5
+
+
+class TestPreload:
+    """engines/ollama.preload（serve 起動時のモデルプリロード用モジュール関数）のテスト。
+    urllib.request.urlopen をモンキーパッチし、実ネットワーク・実 Ollama デーモンには
+    一切触れない（TestOllamaBackendAnswer と同じ作法）。
+    """
+
+    def test_sends_model_and_empty_messages(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["data"] = json.loads(req.data.decode("utf-8"))
+            captured["timeout"] = timeout
+            return _FakeHTTPResponse(b'{"message": {"content": ""}}')
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        ollama_module.preload("http://127.0.0.1:11434", "qwen3:8b", "60m", timeout=5)
+
+        assert captured["data"]["model"] == "qwen3:8b"
+        assert captured["data"]["messages"] == []
+        assert captured["data"]["stream"] is False
+        assert captured["timeout"] == 5
+
+    def test_sends_keep_alive_when_non_empty(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["data"] = json.loads(req.data.decode("utf-8"))
+            return _FakeHTTPResponse(b'{"message": {"content": ""}}')
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        ollama_module.preload("http://127.0.0.1:11434", "qwen3:8b", "60m", timeout=5)
+
+        assert captured["data"]["keep_alive"] == "60m"
+
+    def test_omits_keep_alive_when_empty(self, monkeypatch):
+        """空文字列（Ollama 既定へ委ねる脱出ハッチ）の場合、キー自体を省く
+        （build_payload の空文字列の扱いと一貫させる）。
+        """
+        captured: dict = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["data"] = json.loads(req.data.decode("utf-8"))
+            return _FakeHTTPResponse(b'{"message": {"content": ""}}')
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        ollama_module.preload("http://127.0.0.1:11434", "qwen3:8b", "", timeout=5)
+
+        assert "keep_alive" not in captured["data"]
+
+    def test_returns_true_on_success(self, monkeypatch):
+        def fake_urlopen(req, timeout=None):
+            return _FakeHTTPResponse(b'{"message": {"content": ""}}')
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        result = ollama_module.preload("http://127.0.0.1:11434", "qwen3:8b", "60m", timeout=5)
+
+        assert result is True
+
+    def test_returns_false_and_swallows_exception_on_failure(self, monkeypatch):
+        """Ollama 不在・接続失敗等は起動をブロックしてはならないため、例外を
+        送出せず False を返す（fail-soft）。
+        """
+
+        def fake_urlopen(req, timeout=None):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(ollama_module, "urlopen", fake_urlopen)
+
+        result = ollama_module.preload("http://127.0.0.1:11434", "qwen3:8b", "60m", timeout=5)
+
+        assert result is False
 
 
 class TestCreateBackend:
