@@ -3,8 +3,8 @@
 drift ガード（import 経路の健全性）に加えて、distill/extract.py の mask()
 が持つ 5 つの regex（sk-/ghp_系/AKIA/汎用 password 等/JWT）の実挙動を
 positive/negative ケースで固定する。extract.py は agent-recall 由来の共有
-資産であり、ここではパターンの追加・修正は行わず、現行の挙動をそのまま
-テストとして記録する（=仕様のスナップショット）。
+資産であり、パターン変更は共有正本の同期として行い、ここでは現行の挙動を
+そのままテストとして記録する（=仕様のスナップショット）。
 
 PII（メール・電話・住所）はマスク対象外（蔵書コーパスでは誤マスクの害が
 大きい）。パターン追加や規則変更時は agent-recall 側との同期を検討してください。
@@ -45,6 +45,13 @@ class TestPositiveCases:
                 "<REDACTED-KEY>",
                 id="sk-openai-style-embedded-in-sentence",
             ),
+            # Anthropic 系キーはハイフン/アンダースコアを含む。英数字のみのクラスだと
+            # 12 文字連続条件を満たせずマスク漏れになる（Red で確認済みの回帰防止）。
+            pytest.param(
+                "key: sk-ant-api03-ABCDEFGHIJ_klmnopqrst-0123456789",
+                "<REDACTED-KEY>",
+                id="sk-ant-api03-with-hyphen-and-underscore",
+            ),
             pytest.param(
                 "ghp_1234567890ABCDEFGHIJ", "<REDACTED-TOKEN>", id="ghp-personal-token"
             ),
@@ -73,6 +80,14 @@ class TestPositiveCases:
     def test_masks_secret(self, text: str, expected_marker: str) -> None:
         assert expected_marker in mask(text)
 
+    def test_sk_ant_key_is_fully_redacted(self) -> None:
+        """sk-ant-... の鍵本体が出力に1文字も残らない(部分マスクで漏れない)。"""
+        result = mask("key: sk-ant-api03-ABCDEFGHIJ_klmnopqrst-0123456789 end")
+
+        assert "api03" not in result
+        assert "0123456789" not in result
+        assert result.endswith(" end")
+
 
 class TestNegativeCases:
     """マスク対象ではない文字列が変更されない（過剰マスクされない）ことを確認する。
@@ -87,6 +102,13 @@ class TestNegativeCases:
         [
             pytest.param("this is a risk-free investment", id="sk-substring-midword-risk-free"),
             pytest.param("sk-short", id="sk-prefix-too-short"),
+            # 語頭の sk- のみ対象。複合語の途中(task-/risk-/disk-)は 12 文字以上
+            # 続いても鍵ではないため、本文を壊さない。
+            pytest.param("<task-notification>", id="sk-substring-midword-task-notification"),
+            pytest.param(
+                "risk-assessment-framework", id="sk-substring-midword-risk-assessment"
+            ),
+            pytest.param("disk-usage-statistics", id="sk-substring-midword-disk-usage"),
             pytest.param("ghp_short", id="ghp-suffix-too-short"),
             pytest.param(
                 "akia1234567890ab",

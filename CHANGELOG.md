@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport_security=...)` のキーワード引数として渡す方式に変更。
 
 ### Fixed
+- **`sk-ant-...` 形式の鍵がマスクされない**: `distill/extract.py` の `sk-` 鍵パターンにハイフン・アンダースコアを許可し `sk-[A-Za-z0-9_-]{12,}` へ拡張（共有マスク正本の同期）。語頭の `sk-` に限定し、`task-`・`risk-` 等の複合語への誤マスクを防ぐ。
 - **埋め込みモデルのキャッシュ先を `~/.cache/fastembed` に固定**: fastembed 既定の
   キャッシュ先は `$TMPDIR` 配下で、Claude Code のサンドボックス内外で別パスへ解決される
   ため、起動のたびにモデル再ダウンロードを試み、ネットワーク遮断下では MCP サーバが
