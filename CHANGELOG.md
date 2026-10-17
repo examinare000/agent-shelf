@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-17
+
 ### Added
 - **Ollama の keep_alive と serve 起動時の先読みロード**: `SHELF_OLLAMA_KEEP_ALIVE`（既定 `60m`、空文字で無効）を Ollama リクエストに載せ、router / 既定 / notebook のいずれかの backend が ollama の場合は `serve` 開始時に daemon スレッドでモデルを先読みする。先読み失敗は serve を止めない。実運用でのモデル再ロード待ち（約 15 秒）を解消する。
 
