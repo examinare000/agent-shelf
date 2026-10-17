@@ -53,7 +53,14 @@ _JSON_FORMAT_HINT = (
 
 
 def build_routing_prompt(question: str, catalog: Sequence[NotebookCard]) -> str:
-    """質問文 + notebook カタログから司書ルーティング用プロンプトを組み立てる。"""
+    """質問文 + notebook カタログから司書ルーティング用プロンプトを組み立てる。
+
+    固定部（指示ブロック+notebook一覧）を先頭、可変部（質問）を末尾に置く順序とする。
+    質問を先頭付近に置くと、Ollama の KV プレフィックスキャッシュが質問文言ごとに
+    無効化され、カタログ部分の再計算コストがレイテンシへ乗る。固定部を安定した
+    プレフィックスにすることでキャッシュを効かせられるほか、指示追従の観点でも
+    質問を末尾に置くのが定石。
+    """
     instructions = [
         "あなたは資料室の司書です。以下の notebook 一覧から、質問に答えるために"
         "参照すべき notebook を選んでください。",
@@ -64,7 +71,7 @@ def build_routing_prompt(question: str, catalog: Sequence[NotebookCard]) -> str:
 
     catalog_block = "\n\n".join(_format_card(card) for card in catalog)
 
-    return "\n".join(instructions) + f"\n\n質問: {question}\n\nnotebook一覧:\n{catalog_block}"
+    return "\n".join(instructions) + f"\n\nnotebook一覧:\n{catalog_block}\n\n質問: {question}"
 
 
 def _format_card(card: NotebookCard) -> str:

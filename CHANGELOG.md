@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Ollama の keep_alive と serve 起動時の先読みロード**: `SHELF_OLLAMA_KEEP_ALIVE`（既定 `60m`、空文字で無効）を Ollama リクエストに載せ、router / 既定 / notebook のいずれかの backend が ollama の場合は `serve` 開始時に daemon スレッドでモデルを先読みする。先読み失敗は serve を止めない。実運用でのモデル再ロード待ち（約 15 秒）を解消する。
+
 ### Changed
+- **司書プロンプトの質問を catalog の後ろへ移動**: prompt の先頭をカタログで固定し、Ollama の KV prefix cache を効かせる。
 - **fail-soft 箇所への debug ログと SHELF_LOG_LEVEL 環境変数**: 例外を握り潰して無音の箇所（summary 生成失敗・shelve 分類失敗・PDF テキスト層検出失敗）へ logger.debug() を追加。`SHELF_LOG_LEVEL` 環境変数（"DEBUG"/"INFO"/"WARNING" 等、大文字小文字許容）で logging レベルを制御可能にし、問題診断を容易にした。未設定時は現状と同一の無音状態。制御フロー変更なし。
 - **pymupdf・pymupdf4llm の下限バージョン指定**: uv.lock の実解決値（1.28.2）に合わせて `pyproject.toml` に `>=1.28.2` 下限を明示し、予期しない解決変動を防止。
 - **[tool.pytest.ini_options] 新設**: pytest テスト対象を `tests/` に限定し、SWIG 由来（pymupdf）の DeprecationWarning のみを ignore するフィルタを追加。これにより無駄な警告を除外しつつプロジェクト側の警告は検出可能に。
@@ -30,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport_security=...)` のキーワード引数として渡す方式に変更。
 
 ### Fixed
+- **`sk-ant-...` 形式の鍵がマスクされない**: `distill/extract.py` の `sk-` 鍵パターンにハイフン・アンダースコアを許可し `sk-[A-Za-z0-9_-]{12,}` へ拡張（共有マスク正本の同期）。語頭の `sk-` に限定し、`task-`・`risk-` 等の複合語への誤マスクを防ぐ。
 - **埋め込みモデルのキャッシュ先を `~/.cache/fastembed` に固定**: fastembed 既定の
   キャッシュ先は `$TMPDIR` 配下で、Claude Code のサンドボックス内外で別パスへ解決される
   ため、起動のたびにモデル再ダウンロードを試み、ネットワーク遮断下では MCP サーバが

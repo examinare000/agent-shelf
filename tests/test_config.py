@@ -202,6 +202,30 @@ def test_ollama_model_env_override(monkeypatch):
     importlib.reload(config)
 
 
+def test_ollama_keep_alive_default_is_60m():
+    # Ollama 既定の5分アンロードだと実運用（consult間隔は通常5分超）でほぼ毎回
+    # モデル再ロード(~15s)を踏む実測があるため、既定を60分に延長する。
+    assert config.OLLAMA_KEEP_ALIVE == "60m"
+
+
+def test_ollama_keep_alive_env_override(monkeypatch):
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_OLLAMA_KEEP_ALIVE", "10m")
+        importlib.reload(config)
+        assert config.OLLAMA_KEEP_ALIVE == "10m"
+    importlib.reload(config)
+
+
+def test_ollama_keep_alive_empty_string_is_allowed_as_escape_hatch(monkeypatch):
+    # 空文字列は Ollama 既定の keep_alive 挙動へ委ねる脱出ハッチとして許容する
+    # (build_payload 側で空文字列なら keep_alive キー自体を省く)。
+    with monkeypatch.context() as m:
+        m.setenv("SHELF_OLLAMA_KEEP_ALIVE", "")
+        importlib.reload(config)
+        assert config.OLLAMA_KEEP_ALIVE == ""
+    importlib.reload(config)
+
+
 def test_router_backend_default_is_empty():
     # 未設定時は空文字列。service 側で `config.ROUTER_BACKEND or DEFAULT_BACKEND` として
     # 解決される前提（設計書 §6-D）のため、既定は「未指定」を表す空文字列にする。

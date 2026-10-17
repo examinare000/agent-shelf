@@ -31,7 +31,11 @@ SKIP_PREFIXES = (
 )
 # 機微情報マスク（簡易）
 SECRET_RES = [
-    (re.compile(r'(sk-[A-Za-z0-9]{12,})'), '<REDACTED-KEY>'),
+    # Anthropic系キー(`sk-ant-api03-...`)はハイフン/アンダースコアを含むため、
+    # 英数字のみのクラスだと12文字連続条件を満たせずマスク漏れになる。ただしクラスを
+    # 広げると `task-notification` `risk-assessment-framework` のような複合語の途中の
+    # `sk-` まで拾うため、語頭の `sk-` のみ対象とする(直前が英数字なら不一致)。
+    (re.compile(r'((?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{12,})'), '<REDACTED-KEY>'),
     (re.compile(r'(gh[pousr]_[A-Za-z0-9]{20,})'), '<REDACTED-TOKEN>'),
     (re.compile(r'(AKIA[0-9A-Z]{12,})'), '<REDACTED-AWS>'),
     # 値パターンはダブル/シングルクォート文字列全体（内部の \" \' エスケープを

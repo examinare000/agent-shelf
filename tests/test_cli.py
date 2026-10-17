@@ -793,6 +793,153 @@ class TestServeDispatch:
         signature.bind_partial(**kwargs)
 
 
+class _FakeThread:
+    """threading.Thread の代役。実スレッドを起動せず、コンストラクタ引数と
+    start() 呼び出しの有無だけを記録する(_FakeMcpServer と同じ「代役で配線だけ検証」作法)。
+    """
+
+    instances: list[_FakeThread] = []
+
+    def __init__(self, *, target, args=(), daemon=None):
+        self.target = target
+        self.args = args
+        self.daemon = daemon
+        self.started = False
+        _FakeThread.instances.append(self)
+
+    def start(self) -> None:
+        self.started = True
+
+
+class _NoNotebooksService:
+    def list_notebooks(self):
+        return []
+
+
+class TestServeOllamaPreload:
+    """serve 起動時、司書/既定/notebook 個別のバックエンドが ollama の場合のみ
+    モデルプリロードを非同期スレッドで1発発火することを検証する（実ネットワーク・
+    実スレッドには一切触れない。TestServeDispatch と同じ「create_server を fake に
+    差し替え」作法）。
+    """
+
+    def setup_method(self) -> None:
+        _FakeThread.instances.clear()
+
+    def _serve(self, monkeypatch, service, router: str, default: str) -> _FakeMcpServer:
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: service)
+        monkeypatch.setattr(cli, "create_server", lambda s: fake_server)
+        monkeypatch.setattr(cli.config, "ROUTER_BACKEND", router)
+        monkeypatch.setattr(cli.config, "DEFAULT_BACKEND", default)
+        monkeypatch.setattr(cli.threading, "Thread", _FakeThread)
+        cli.main(["serve"])
+        return fake_server
+
+    def test_no_thread_started_when_neither_backend_is_ollama(self, monkeypatch):
+        self._serve(monkeypatch, _NoNotebooksService(), router="", default="codex")
+
+        assert _FakeThread.instances == []
+
+    def test_daemon_thread_started_when_router_backend_is_ollama(self, monkeypatch):
+        self._serve(monkeypatch, _NoNotebooksService(), router="ollama", default="codex")
+
+        assert len(_FakeThread.instances) == 1
+        assert _FakeThread.instances[0].started is True
+        assert _FakeThread.instances[0].daemon is True
+
+    def test_thread_started_when_default_backend_is_ollama_and_router_unset(self, monkeypatch):
+        self._serve(monkeypatch, _NoNotebooksService(), router="", default="ollama")
+
+        assert len(_FakeThread.instances) == 1
+
+    def test_thread_target_and_args_match_ollama_preload_and_config(self, monkeypatch):
+        from shelf.engines import ollama as ollama_module
+
+        monkeypatch.setattr(cli.config, "OLLAMA_URL", "http://127.0.0.1:11434")
+        monkeypatch.setattr(cli.config, "OLLAMA_MODEL", "qwen3:8b")
+        monkeypatch.setattr(cli.config, "OLLAMA_KEEP_ALIVE", "60m")
+
+        self._serve(monkeypatch, _NoNotebooksService(), router="ollama", default="codex")
+
+        thread = _FakeThread.instances[0]
+        assert thread.target is ollama_module.preload
+        assert thread.args == ("http://127.0.0.1:11434", "qwen3:8b", "60m")
+
+    def test_thread_started_when_notebook_backend_is_ollama_globally_codex(self, monkeypatch):
+        """グローバルバックエンドが ollama でなくても、いずれかの notebook が
+        backend='ollama' ならプリロードを発火する（notebook 単位の backend 上書き対応）。
+        """
+
+        class _Service:
+            def list_notebooks(self):
+                return [
+                    {"notebook": "nb1", "backend": "codex"},
+                    {"notebook": "nb2", "backend": "ollama"},
+                ]
+
+        self._serve(monkeypatch, _Service(), router="", default="codex")
+
+        assert len(_FakeThread.instances) == 1
+        assert _FakeThread.instances[0].daemon is True
+
+    def test_serve_still_runs_when_listing_notebooks_fails(self, monkeypatch):
+        """プリロードは最適化にすぎないため、notebook 列挙が失敗しても serve は
+        スレッドを起こさず通常どおり起動する（fail-soft）。
+        """
+
+        class _BrokenService:
+            def list_notebooks(self):
+                raise RuntimeError("db unavailable")
+
+        fake_server = self._serve(monkeypatch, _BrokenService(), router="", default="codex")
+
+        assert _FakeThread.instances == []
+        assert fake_server.run_calls == ["stdio"]
+
+    def test_serve_still_runs_when_preload_itself_fails(self, monkeypatch):
+        """Ollama 不在で preload が False を返しても serve は止まらない。"""
+        from shelf.engines import ollama as ollama_module
+
+        def failing_urlopen(req, timeout=None):
+            raise OSError("connection refused")
+
+        monkeypatch.setattr(ollama_module, "urlopen", failing_urlopen)
+        # preload が実際に呼ばれ、例外ではなく False を返したことを記録する
+        preload_results: list[bool] = []
+        real_preload = ollama_module.preload
+
+        def recording_preload(*args, **kwargs):
+            result = real_preload(*args, **kwargs)
+            preload_results.append(result)
+            return result
+
+        monkeypatch.setattr(ollama_module, "preload", recording_preload)
+        fake_server = _FakeMcpServer()
+        monkeypatch.setattr(cli, "_build_service", lambda: _NoNotebooksService())
+        monkeypatch.setattr(cli, "create_server", lambda s: fake_server)
+        monkeypatch.setattr(cli.config, "ROUTER_BACKEND", "ollama")
+
+        # 実スレッドを起動し、preload の失敗がメインの serve に波及しないことを確認する
+        threads: list = []
+        real_thread = cli.threading.Thread
+
+        def spy_thread(**kwargs):
+            t = real_thread(**kwargs)
+            threads.append(t)
+            return t
+
+        monkeypatch.setattr(cli.threading, "Thread", spy_thread)
+
+        cli.main(["serve"])
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(threads) == 1
+        assert preload_results == [False]
+        assert fake_server.run_calls == ["stdio"]
+
+
 class TestConsultDispatch:
     """consult コマンドの main() が service.consult へ question を正しく
     橋渡しすることを、_build_service を fake に差し替えて検証する

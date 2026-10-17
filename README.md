@@ -242,6 +242,7 @@ shelf は大規模資料（数百頁の書籍など）から学びノートを�
 | `SHELF_DEEP_DIVE` | `false` | 深掘り検索有効化（true/1） |
 | `SHELF_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama デーモン接続先 |
 | `SHELF_OLLAMA_MODEL` | `qwen3:8b` | Ollama で使うモデル |
+| `SHELF_OLLAMA_KEEP_ALIVE` | `60m` | Ollama がモデルをメモリに保持する時間（空文字で Ollama 既定へ委ねる）。ollama を使う構成では `serve` 起動時に先読みロードする |
 | `SHELF_ROUTER_BACKEND` | `` | 司書（ルーティング推論）専用バックエンド（未指定時は SHELF_DEFAULT_BACKEND を使用） |
 | `SHELF_ROUTE_TOP_N` | `1` | ルーティングで選択する notebook 数（コード側の上限 2 でクランプ） |
 | `SHELF_ROUTE_FALLBACK` | `` | ルーティング失敗時の方針（`all` = 全 notebook、空 = 対象ゼロ） |
