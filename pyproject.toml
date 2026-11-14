@@ -8,7 +8,7 @@ dependencies = [
     "anyio>=4.16.0",
     "fastembed>=0.9.1",
     "numpy>=1.26",
-    "pymupdf4llm>=2.0",
+    "pymupdf4llm>=2.1",
     "pymupdf>=2.0",
     "markitdown[docx,xlsx,xls,pptx]",
 ]
