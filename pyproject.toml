@@ -1,8 +1,8 @@
 [project]
 name = "shelf"
-version = "0.6.0"
+version = "0.7.0"
 description = "書籍・資料コーパスへの委譲QA（ローカル検索+サブスクCLI合成）MCPサーバ"
-requires-python = ">=3.11"
+requires-python = ">=3.14,<3.15"
 dependencies = [
     "mcp>=2.3.0",
     "anyio>=4.16.0",
@@ -25,7 +25,7 @@ packages = ["shelf"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py314"
 
 # ruff 0.16.0 でデフォルトの有効ルールが拡大されたため、従来のデフォルトを明示して固定する。
 # I（isort）/B（bugbear）は CI/lint 強化タスクで採用済み。他の新ルール群の採用は別タスクで判断する。
@@ -49,6 +49,7 @@ filterwarnings = [
 # include を shelf/ に絞る: tests/ は FakeLibrarian 等 Protocol の構造的型付けに
 # 由来する既知のノイズが多く、CI の型チェック対象は本体コードに限定する。
 [tool.pyright]
+pythonVersion = "3.14"
 venvPath = "."
 venv = ".venv"
 include = ["shelf"]
