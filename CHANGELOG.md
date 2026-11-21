@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-21
+
 ### Changed
-- **pymupdf を 2.0 系へ更新**: pymupdf4llm の実装は pymupdf 2.x 本体に統合され、pymupdf4llm 2.0 は pip の更新不具合を避けるための空パッケージになった（単独で上げると `import pymupdf4llm` が失敗する）。両者の下限を `>=2.0` に揃え、pymupdf-layout も 2.0 へ追従した。
-- **開発依存の更新**: Ruff 0.17.1。uv.lock の filelock 4.2.1・opentelemetry-api 1.45.1 も Dependabot の提案に合わせて更新。
+- **Python 3.14 系へ移行**: 対応範囲を 3.14 系に変更し、開発環境と CI を揃えた。3.11〜3.13 は対象外となる。3.15 は ONNX Runtime の対応を待つ。
+- **Pillow を 13.0.0 に更新**: Pillow 13 に対応した fastembed 0.9.1 と組み合わせる。
+- **pymupdf を 2.x 系へ更新**: pymupdf4llm の実装は pymupdf 2.x 本体に統合され、pymupdf4llm 2.0 以降は pip の更新不具合を避けるための空パッケージになった。pymupdf の下限を `>=2.1`、pymupdf4llm の下限を `>=2.0` とし、pymupdf-layout も 2.1 に更新した。
+- **依存の更新**: Ruff 0.17.5、filelock 4.2.1、opentelemetry-api 1.45.2 などを更新した。
 
 ## [0.6.0] - 2026-10-17
 

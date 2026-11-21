@@ -18,7 +18,7 @@ shelf は、あなたの蔵書・資料コーパスをローカルで検索し�
 
 ### 前提条件
 
-- Python 3.11 以上
+- Python 3.14 系
 - [uv](https://github.com/astral-sh/uv)（パッケージマネージャ）
 
 ### インストール
