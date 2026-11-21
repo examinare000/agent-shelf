@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-21
+
+### Changed
+- **依存パッケージを更新**: Python 3.14 の環境で依存関係を再解決し、Soup Sieve 4.1.3、ONNX Runtime 1.32.0、MarkItDown 0.1.9 などに更新した。
+
 ## [0.7.0] - 2026-11-21
 
 ### Changed
